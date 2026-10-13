@@ -221,7 +221,13 @@ def test_all_ci_paths_use_the_same_pinned_image_stack():
         assert "needs.build.outputs.image" in workflow["jobs"][job]["with"]["image"]
     for name in ("ppu-pin-ut.yaml", "e2e-ppu.yaml"):
         triggers = yaml.safe_load((WORKFLOW.parent / name).read_text())[True]
-        for trigger in triggers.values():
+        input_triggers = [
+            trigger
+            for trigger in triggers.values()
+            if isinstance(trigger, dict) and "inputs" in trigger
+        ]
+        assert input_triggers
+        for trigger in input_triggers:
             assert trigger["inputs"]["image"]["default"] == image
 
 
