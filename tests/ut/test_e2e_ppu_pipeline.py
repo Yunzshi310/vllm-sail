@@ -29,24 +29,65 @@ def _load_select():
 def test_models_catalog_is_valid_json_with_required_fields() -> None:
     catalog = json.loads(MODELS.read_text())
     assert isinstance(catalog, list) and catalog
-    required = {"key", "checkpoint", "served_name", "board", "tp"}
+    required = {"key", "model_id", "served_name", "board", "tp"}
     for entry in catalog:
         assert required <= set(entry), entry
     keys = [entry["key"] for entry in catalog]
     assert len(keys) == len(set(keys)), "model keys must be unique"
 
 
-def test_default_matrix_targets_qwen_on_810e() -> None:
+def test_catalog_carries_current_accuracy_models() -> None:
     catalog = json.loads(MODELS.read_text())
-    qwen = next(e for e in catalog if e["key"] == "qwen3.8-27b")
-    # Checkpoints are read from /nas_aisw/datasets, the internal NAS root
-    # recorded in the model catalog sheet.
-    assert qwen["checkpoint"] == (
-        "/nas_aisw/datasets/checkpoints/LLM/Qwen/v3.8/Qwen3.8-27B"
-    )
-    # The built wheels (arch ppu_15;ppu_10) are only verified on 810E.
-    assert qwen["board"] == "OAM-810E"
-    assert int(qwen["tp"]) == 2
+    by_key = {entry["key"]: entry for entry in catalog}
+    assert set(by_key) == {
+        "deepseek-v4-int8",
+        "deepseek-v4-mxfp4",
+        "minimax-m3-fp8",
+        "qwen3.8-flash-next",
+    }
+    expected = {
+        "minimax-m3-fp8": (
+            "T-HEAD/MiniMax-M3-"
+            "Quant-W-FP8-PerChannel-A-FP8-PerToken",
+            "ZW-M890P",
+            8,
+        ),
+        "qwen3.8-flash-next": (
+            "Qwen/Qwen3.8-Flash-Next",
+            "ZW-M890P",
+            8,
+        ),
+    }
+    for key, (model_id, board, tp) in expected.items():
+        entry = by_key[key]
+        assert entry["model_id"] == model_id
+        assert entry["served_name"] == model_id.rsplit("/", 1)[-1]
+        assert entry["board"] == board
+        assert int(entry["tp"]) == tp
+        assert entry["offline_test_path"].endswith("test_model_accuracy.py")
+        assert entry["offline_marker"] == "model_e2e"
+
+
+def test_catalog_carries_both_deepseek_v4_quantizations() -> None:
+    """DeepSeek V4 ships two authoritative quantizations; both are catalogued.
+
+    They share the accuracy test file, so single-model dispatch narrows by
+    model key. The mxfp4+fp8-channel tree needs fp8 and therefore an 890P
+    board; the W8A8-int8 tree is the 810E path.
+    """
+    catalog = json.loads(MODELS.read_text())
+    by_key = {entry["key"]: entry for entry in catalog}
+    assert "deepseek-v4-int8" in by_key and "deepseek-v4-mxfp4" in by_key
+    int8, mxfp4 = by_key["deepseek-v4-int8"], by_key["deepseek-v4-mxfp4"]
+    assert int8["model_id"].endswith("Quant-W-INT8-PerChannel-A-INT8-PerToken")
+    assert mxfp4["model_id"].endswith("Quant-W-FP8-PerChannel-A-FP8-PerToken")
+    assert int8["model_id"] != mxfp4["model_id"]
+    assert int8["offline_test_path"] == mxfp4["offline_test_path"]
+    assert int8["offline_test_path"].endswith("test_model_accuracy.py")
+    assert mxfp4["board"] == "ZW-M890P" and int(mxfp4["tp"]) == 8
+    # Golden identity is the model_id itself (org/name); they must stay distinct
+    # or one variant could be compared against the other's baseline.
+    assert int8["model_id"].split("/")[-1] != mxfp4["model_id"].split("/")[-1]
 
 
 # --- matrix selector ----------------------------------------------------------
@@ -62,17 +103,40 @@ def test_selector_default_returns_every_model() -> None:
 def test_selector_filters_to_requested_keys() -> None:
     select = _load_select()
     catalog = [
-        {"key": "a", "checkpoint": "/x", "served_name": "a", "board": "b", "tp": 1},
-        {"key": "b", "checkpoint": "/y", "served_name": "b", "board": "b", "tp": 1},
+        {"key": "a", "model_id": "org/a", "served_name": "a", "board": "b", "tp": 1},
+        {"key": "b", "model_id": "org/b", "served_name": "b", "board": "b", "tp": 1},
     ]
     matrix = select.build_matrix(catalog, " b , a ")
     assert [m["key"] for m in matrix["include"]] == ["b", "a"]
 
 
+def test_accuracy_matrix_uses_filtered_catalog_and_eval_keys() -> None:
+    select = _load_select()
+    catalog = json.loads(MODELS.read_text())
+    matrix = select.build_matrix(
+        catalog, "deepseek-v4-mxfp4,minimax-m3-fp8"
+    )
+    accuracy = select.build_accuracy_matrix(matrix)
+    assert accuracy == {
+        "include": [
+            {
+                "model_key": "deepseek_v4_mxfp4",
+                "board": "ZW-M890P",
+                "ppu_count": 8,
+            },
+            {
+                "model_key": "minimax-m3-fp8",
+                "board": "ZW-M890P",
+                "ppu_count": 8,
+            },
+        ]
+    }
+
+
 def test_selector_rejects_unknown_key() -> None:
     select = _load_select()
     catalog = [
-        {"key": "a", "checkpoint": "/x", "served_name": "a", "board": "b", "tp": 1},
+        {"key": "a", "model_id": "org/a", "served_name": "a", "board": "b", "tp": 1},
     ]
     try:
         select.build_matrix(catalog, "does-not-exist")
@@ -91,6 +155,55 @@ def test_selector_cli_emits_github_output_matrix(tmp_path: Path) -> None:
     line = next(ln for ln in result.stdout.splitlines() if ln.startswith("matrix="))
     payload = json.loads(line[len("matrix=") :])
     assert "include" in payload and payload["include"]
+
+
+def test_selector_cli_scalar_outputs_guard_single_model_dispatch() -> None:
+    """Scalar CLI outputs must narrow correctly for the offline model lane.
+
+    Single-model dispatch exports VLLM_SAIL_MODEL_ROOT from ``model_root``, so
+    ``offline_test_path`` must be one model's test file -- a directory would
+    collect every model test and run (and with update_golden, re-golden) all
+    of them against the single override checkpoint. The nightly (empty input)
+    multi-model matrix must instead leave ``model_root`` empty and keep the
+    directory default so each test resolves its own hard-coded checkpoint.
+    """
+
+    def _scalars(models: str) -> dict:
+        result = subprocess.run(
+            ["python3", str(SELECT), models],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+        out = {}
+        for ln in result.stdout.splitlines():
+            key, sep, value = ln.partition("=")
+            if sep and key != "matrix":
+                out[key] = value
+        return out
+
+    # Nightly default: 4-model matrix (3 model families, DeepSeek V4 twice for
+    # its two quantizations), no global override, directory path.
+    nightly = _scalars("")
+    assert nightly["model_root"] == ""
+    assert nightly["offline_test_path"] == "tests/e2e/models"
+    assert nightly["offline_marker"] == "model_e2e"
+
+    # Single-model dispatch: own test file + non-empty model_id override.
+    catalog = json.loads(MODELS.read_text())
+    expected = {entry["key"]: entry for entry in catalog}
+    qwen = _scalars("qwen3.8-flash-next")
+    assert qwen["offline_test_path"].endswith(".py")
+    assert "test_model_accuracy" in qwen["offline_test_path"]
+    assert qwen["model_root"] == expected["qwen3.8-flash-next"]["model_id"]
+    assert qwen["model_root"]
+
+    # Every catalog key narrows to its own file and model_id.
+    for key, entry in expected.items():
+        out = _scalars(key)
+        assert out["offline_test_path"] == entry["offline_test_path"], key
+        assert out["offline_test_path"].endswith(".py"), key
+        assert out["model_root"] == entry["model_id"], key
 
 
 # --- pod smoke script ---------------------------------------------------------
@@ -156,7 +269,7 @@ def test_e2e_workflow_is_reusable_and_manual_and_uses_cpu_runner() -> None:
     assert "actions: read" in text
 
 
-def test_e2e_workflow_only_exposes_model_smoke() -> None:
+def test_e2e_workflow_exposes_smoke_and_accuracy_jobs() -> None:
     text = WORKFLOW.read_text()
     workflow = yaml.safe_load(text)
     trigger = workflow.get("on", workflow.get(True))
@@ -174,9 +287,26 @@ def test_e2e_workflow_only_exposes_model_smoke() -> None:
         "pr_head_sha",
         "wheel_source_sha",
     }
-    assert set(workflow["jobs"]) == {"prepare", "e2e"}
+    assert set(workflow["jobs"]) == {"prepare", "e2e", "accuracy"}
     assert "if" not in workflow["jobs"]["prepare"]
     assert workflow["jobs"]["e2e"]["needs"] == "prepare"
+    accuracy = workflow["jobs"]["accuracy"]
+    assert accuracy["needs"] == "prepare"
+    assert workflow["jobs"]["prepare"]["outputs"]["accuracy_matrix"] == (
+        "${{ steps.select.outputs.accuracy_matrix }}"
+    )
+    assert accuracy["strategy"]["matrix"] == (
+        "${{ fromJson(needs.prepare.outputs.accuracy_matrix) }}"
+    )
+    accuracy_step = next(
+        step
+        for step in accuracy["steps"]
+        if step["name"] == "Run GSM8K accuracy E2E"
+    )
+    accuracy_command = accuracy_step["with"]["command"]
+    assert "CUDA_VISIBLE_DEVICES" in accuracy_command
+    assert "NVIDIA_VISIBLE_DEVICES" in accuracy_command
+    assert "VLLM_PORT" in accuracy_command
     for marker in (
         "device_probe_only",
         "probe_suite",
@@ -193,10 +323,13 @@ def test_e2e_workflow_only_exposes_model_smoke() -> None:
 
 def test_e2e_workflow_pulls_wheels_by_run_id() -> None:
     text = WORKFLOW.read_text()
+    # workflow_call/workflow_dispatch still accept the build_run_id input.
     assert "build_run_id:" in text
     assert "actions/download-artifact@v4" in text
-    assert "run-id: ${{ inputs.build_run_id }}" in text
-    assert "ppu-wheels-${{ inputs.build_run_id }}" in text
+    # PR3 keeps the required caller input contract. Both smoke and accuracy
+    # download the exact wheel artifact selected by the caller.
+    assert text.count("run-id: ${{ inputs.build_run_id }}") == 2
+    assert text.count("ppu-wheels-${{ inputs.build_run_id }}") == 2
 
 
 def test_e2e_workflow_keeps_python_frontend_and_privileged() -> None:

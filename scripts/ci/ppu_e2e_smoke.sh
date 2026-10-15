@@ -35,6 +35,10 @@ SERVE_HOST="127.0.0.1"
 READY_TIMEOUT_SECS="${READY_TIMEOUT_SECS:-1200}"
 SERVE_LOG="/tmp/vllm_serve.log"
 
+# HuggingFace Hub: resolve model_id to local cache; never contact the hub.
+export HF_HOME="${HF_HOME:-/ppuswhome/jingxi.zzy/hf_cache}"
+export HF_HUB_OFFLINE=1
+
 # The internal HTTP(S) proxies do not route to the loopback serve endpoint.
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY || true
 
@@ -79,6 +83,17 @@ PY
 
 log "collect_env"
 python -c "from vllm_sail import collect_env; collect_env()"
+
+log "resolve model path"
+# Resolve HF model ID to local snapshot path if MODEL_PATH is not a directory
+if [ -n "${MODEL_PATH}" ] && [ ! -d "${MODEL_PATH}" ]; then
+    resolved=$(python -c "
+from huggingface_hub import snapshot_download
+print(snapshot_download('${MODEL_PATH}', local_files_only=True))
+" 2>/dev/null) || { echo "ERROR: Cannot resolve model_id '${MODEL_PATH}' from HF cache"; exit 1; }
+    echo "Resolved model_id '${MODEL_PATH}' -> '${resolved}'"
+    export MODEL_PATH="${resolved}"
+fi
 
 log "checkpoint"
 test -d "${MODEL_PATH}" || { echo "checkpoint dir missing: ${MODEL_PATH}"; exit 1; }
