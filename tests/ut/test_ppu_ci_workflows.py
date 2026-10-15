@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
+import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -56,7 +58,7 @@ def test_controller_filters_comments_serializes_all_commands_and_reports_failure
     job = config["jobs"]["command"]
     assert "github.event.issue.pull_request" in job["if"]
     assert "github.event.comment.user.type == 'User'" in job["if"]
-    assert "startsWith(github.event.comment.body, '/ci')" in job["if"]
+    assert "contains(github.event.comment.body, '/ci')" in job["if"]
     assert job["concurrency"] == {
         "group": "ppu-ci-command-${{ github.event.issue.number }}",
         "cancel-in-progress": False,
@@ -156,7 +158,10 @@ def test_every_pr_checkout_verifies_the_requested_sha_before_execution(name, job
         index = job["steps"].index(checkout)
         verify = job["steps"][index + 1]
         assert verify["env"]["EXPECTED_SHA"] == EXPECTED_SHA
-        assert 'test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"' in verify["run"]
+        assert (
+            'test "$(git -c safe.directory="$PWD" rev-parse HEAD)" = "$EXPECTED_SHA"'
+            == verify["run"]
+        )
         guard = next(
             step
             for step in job["steps"]
@@ -164,6 +169,57 @@ def test_every_pr_checkout_verifies_the_requested_sha_before_execution(name, job
         )
         assert job["steps"].index(guard) < index
         assert "process.env.ACTIONS_CACHE_MODE !== 'none'" in guard["with"]["script"]
+
+
+@pytest.mark.parametrize(
+    "name,job_id",
+    [
+        ("build-ppu-wheels.yaml", "build"),
+        ("ppu-pin-ut.yaml", "pin-unit-tests"),
+        ("e2e-ppu.yaml", "prepare"),
+        ("e2e-ppu.yaml", "e2e"),
+    ],
+)
+def test_sha_verification_allows_different_owner_but_rejects_wrong_sha(
+    name, job_id, tmp_path
+):
+    subprocess.run(["git", "init", str(tmp_path)], check=True, capture_output=True)
+    sha = "a" * 40
+    (tmp_path / ".git" / "HEAD").write_text(sha + "\n")
+    env = {
+        **os.environ,
+        "LC_ALL": "C",
+        "GIT_TEST_ASSUME_DIFFERENT_OWNER": "1",
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "safe.directory",
+        "GIT_CONFIG_VALUE_0": "",
+        "EXPECTED_SHA": sha,
+    }
+    untrusted = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert untrusted.returncode != 0
+    assert "dubious ownership" in untrusted.stderr
+    job = workflow(name)["jobs"][job_id]
+    command = next(
+        step["run"]
+        for step in job["steps"]
+        if step.get("name") == "Verify checked-out revision"
+    )
+    for expected, returncode in ((sha, 0), ("b" * 40, 1)):
+        result = subprocess.run(
+            ["sh", "-e", "-c", command],
+            cwd=tmp_path,
+            env={**env, "EXPECTED_SHA": expected},
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == returncode, result.stderr
+        assert not result.stderr
 
 
 def test_build_conditions_preserve_automatic_and_manual_routes():
@@ -226,7 +282,7 @@ def test_pr_wheel_verification_uses_explicit_sha_and_is_not_skippable():
     assert '--sail-commit "${EXPECTED_SHA}"' in verify["run"]
 
 
-def test_retry_reuses_wheel_name_but_not_diagnostic_names():
+def test_retry_reuses_build_artifacts_but_keeps_pin_diagnostics_per_attempt():
     build = workflow("build-ppu-wheels.yaml")["jobs"]
     for job_id in ("build", "ops-build"):
         uploads = {
@@ -236,8 +292,7 @@ def test_retry_reuses_wheel_name_but_not_diagnostic_names():
         }
         assert uploads["ppu-wheels-${{ github.run_id }}"]["overwrite"] is True
         assert (
-            "ppu-build-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}"
-            in uploads
+            uploads["ppu-build-diagnostics-${{ github.run_id }}"]["overwrite"] is True
         )
     pin = workflow("ppu-pin-ut.yaml")["jobs"]["pin-unit-tests"]
     upload = next(
@@ -260,13 +315,16 @@ def test_cpu_checks_still_run_automatically_with_read_only_checkout():
             assert checkout["with"]["persist-credentials"] is False
 
 
-def test_ops_diagnostic_consumers_match_the_producing_attempt():
+def test_ops_partial_retry_downloads_diagnostics_from_successful_previous_attempt():
     build = workflow("build-ppu-wheels.yaml")["jobs"]
     producer = next(
         step["with"]["name"]
         for step in build["ops-build"]["steps"]
         if step.get("uses") == "actions/upload-artifact@v4"
         and step["with"]["name"].startswith("ppu-build-diagnostics-")
+    )
+    uploaded = producer.replace("${{ github.run_id }}", "100").replace(
+        "${{ github.run_attempt }}", "1"
     )
     consumers = [
         build["select-ops-tests"],
@@ -279,4 +337,9 @@ def test_ops_diagnostic_consumers_match_the_producing_attempt():
             if step.get("uses") == "actions/download-artifact@v4"
             and step["with"].get("name", "").startswith("ppu-build-diagnostics-")
         )
-        assert name.replace("inputs.build_run_id", "github.run_id") == producer
+        downloaded = (
+            name.replace("${{ github.run_id }}", "100")
+            .replace("${{ inputs.build_run_id }}", "100")
+            .replace("${{ github.run_attempt }}", "2")
+        )
+        assert downloaded == uploaded

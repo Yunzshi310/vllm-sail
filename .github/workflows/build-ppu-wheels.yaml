@@ -104,7 +104,7 @@ jobs:
       - name: Verify checked-out revision
         env:
           EXPECTED_SHA: ${{ inputs.pr_head_sha || github.sha }}
-        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+        run: test "$(git -c safe.directory="$PWD" rev-parse HEAD)" = "$EXPECTED_SHA"
 
       - name: Record build image for downstream tests
         id: image
@@ -127,7 +127,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ppu-build-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          name: ppu-build-diagnostics-${{ github.run_id }}
+          overwrite: true
           path: |
             artifacts/logs/**
             artifacts/build-manifest.txt
@@ -217,7 +218,8 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: ppu-build-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          name: ppu-build-diagnostics-${{ github.run_id }}
+          overwrite: true
           path: |
             artifacts/logs/**
             artifacts/build-manifest.txt
@@ -247,7 +249,7 @@ jobs:
           path: ops-wheels
       - uses: actions/download-artifact@v4
         with:
-          name: ppu-build-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          name: ppu-build-diagnostics-${{ github.run_id }}
           path: ops-build-diagnostics
       - name: Validate artifacts and generate the full test selection
         id: select

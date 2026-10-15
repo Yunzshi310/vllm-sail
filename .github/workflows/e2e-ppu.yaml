@@ -96,7 +96,7 @@ jobs:
       - name: Verify checked-out revision
         env:
           EXPECTED_SHA: ${{ inputs.pr_head_sha || github.sha }}
-        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+        run: test "$(git -c safe.directory="$PWD" rev-parse HEAD)" = "$EXPECTED_SHA"
 
       - name: Select models
         id: select
@@ -153,7 +153,7 @@ jobs:
       - name: Verify checked-out revision
         env:
           EXPECTED_SHA: ${{ inputs.pr_head_sha || github.sha }}
-        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+        run: test "$(git -c safe.directory="$PWD" rev-parse HEAD)" = "$EXPECTED_SHA"
 
       - name: Download CI-built wheels
         uses: actions/download-artifact@v4

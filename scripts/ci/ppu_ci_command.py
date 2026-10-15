@@ -268,15 +268,13 @@ class Controller:
                 if action == "help":
                     raise Rejected(HELP)
                 pr = self.api("GET", f"/pulls/{number}")
-                writer = self.authorize(pr, login)
+                self.authorize(pr, login)
                 if action == "/ci cancel":
-                    text = self.cancel(pr)
+                    text = self.cancel(pr, login)
                 elif action == "/ci retry":
                     text = self.retry(pr, login)
                 else:
-                    text = self.run(
-                        pr, login, cid, writer, action.endswith("--allow-stale")
-                    )
+                    text = self.run(pr, login, cid, action.endswith("--allow-stale"))
             except Rejected as exc:
                 text, reaction = str(exc), "-1"
             self.reply(number, cid, text)
@@ -285,17 +283,13 @@ class Controller:
             self.react(cid, "confused")
             raise
 
-    def run(self, pr, login, cid, writer, allow_stale):
+    def run(self, pr, login, cid, allow_stale):
         sha = pr["head"]["sha"]
         runs = self.find_runs(pr, sha)
         active = next((r for r in runs if r["status"] in ACTIVE), None)
         if active:
             return f"PPU CI already running: {active['html_url']}"
         completed = next((r for r in runs if r["status"] == "completed"), None)
-        if completed and not writer:
-            raise Rejected(
-                f"This head was already tested: {completed['html_url']}. Use /ci retry or ask a maintainer."
-            )
         base = urllib.parse.quote(pr["base"]["ref"], safe="")
         behind = self.api("GET", f"/compare/{base}...{sha}")["behind_by"]
         if behind and not allow_stale:
@@ -338,11 +332,13 @@ class Controller:
             + f"Dispatch accepted; run link pending: {self.url}/actions/workflows/{WORKFLOW}"
         )
 
-    def cancel(self, pr):
+    def cancel(self, pr, login):
         links = []
         for run in self.find_runs(pr):
             if run["status"] in ACTIVE:
                 self.api("POST", f"/actions/runs/{run['id']}/cancel")
+                sha = TITLE.fullmatch(run["display_title"])[2]
+                self.status(sha, "error", f"Cancelled by @{login}")
                 links.append(run["html_url"])
         return (
             f"Cancellation requested for {len(links)} runs: " + " ".join(links)

@@ -466,6 +466,21 @@ def test_completed_run_blocks_nonwriters_including_trusted_list(login):
     assert "already tested" in reply(gh).lower()
     assert reactions(gh) == ["eyes", "-1"]
     assert not gh.writes(DISPATCH)
+    assert len([c for c in gh.calls if c[1] == ROOT + "/pulls/7"]) == 2
+
+
+def test_newly_granted_write_permission_can_retest_completed_head():
+    control, gh, _ = command_setup(existing=[run()])
+    gh.add(
+        "GET",
+        ROOT + "/collaborators/author/permission",
+        {"permission": "read"},
+        {"permission": "write"},
+    )
+    control.command()
+    assert gh.writes(DISPATCH)
+    assert states(gh) == ["pending"]
+    assert reactions(gh)[-1] == "rocket"
 
 
 def test_successful_dispatch_uses_default_ref_and_exact_inputs():
@@ -573,22 +588,61 @@ def test_reaction_api_failures_are_best_effort():
     assert "none" in reply(gh).lower()
 
 
-def test_cancel_all_active_heads_without_writing_status():
+def test_cancel_all_active_heads_writes_terminal_status_on_each_title_sha():
     control, gh, _ = command_setup(
         "/ci cancel",
+        login="maintainer",
+        value="write",
         existing=[
             run(101, status="in_progress"),
             run(102, sha=OLD, status="queued"),
             run(103),
         ],
     )
+    gh.add("POST", ROOT + f"/statuses/{OLD}", {})
     for ident in (101, 102):
         gh.add("POST", ROOT + f"/actions/runs/{ident}/cancel", None)
     control.command()
     assert len(gh.writes("/cancel")) == 2
     assert "2" in reply(gh)
     assert run(101)["html_url"] in reply(gh) and run(102)["html_url"] in reply(gh)
+    statuses = [c for c in gh.calls if "/statuses/" in c[1]]
+    assert {c[1] for c in statuses} == {
+        ROOT + f"/statuses/{SHA}",
+        ROOT + f"/statuses/{OLD}",
+    }
+    assert len(statuses) == 2
+    for ident, sha in ((101, SHA), (102, OLD)):
+        status = gh.writes(f"/statuses/{sha}")[0]
+        assert status[2] == {
+            "state": "error",
+            "context": "PPU CI",
+            "description": "Cancelled by @maintainer",
+            "target_url": control.execution_url,
+        }
+        cancel = gh.writes(f"/actions/runs/{ident}/cancel")[0]
+        assert gh.calls.index(cancel) < gh.calls.index(status)
+
+
+@pytest.mark.parametrize("code", [403, 409, 500])
+def test_rejected_cancellation_does_not_write_cancelled_status(code):
+    control, gh, _ = command_setup("/ci cancel", existing=[run(status="queued")])
+    gh.add("POST", ROOT + "/actions/runs/100/cancel", http_error(code))
+    with pytest.raises(HTTPError):
+        control.command()
     assert not states(gh)
+    assert reactions(gh)[-1] == "confused"
+
+
+def test_cancellation_status_failure_is_not_reported_as_success():
+    control, gh, _ = command_setup("/ci cancel", existing=[run(status="queued")])
+    gh.add("POST", ROOT + "/actions/runs/100/cancel", None)
+    gh.add("POST", ROOT + f"/statuses/{SHA}", http_error(403))
+    with pytest.raises(HTTPError):
+        control.command()
+    assert states(gh) == ["error"]
+    assert not gh.writes(COMMENTS)
+    assert reactions(gh)[-1] == "confused"
 
 
 def retry_setup(existing=None, jobs=None, artifacts=None):

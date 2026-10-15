@@ -99,7 +99,9 @@ CI, only repository writers can request another full run; others should use
 `/ci retry` for failures. Successful builds are reused by partial retries while
 their wheel artifacts remain available (14-day retention). If they have expired,
 request a new build from a repository writer or push a new commit. Repository
-writers may also use GitHub's native Re-run controls.
+writers may also use GitHub's native Re-run controls. Retry results update the
+`PPU CI` status and the bot's original `/ci run` reply, not the `/ci retry`
+acknowledgement.
 
 The on-demand workflow is dispatched from the default branch and reports the
 `PPU CI` commit status on the tested head, with links and attempt numbers. PR
