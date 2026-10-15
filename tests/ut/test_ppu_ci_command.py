@@ -450,9 +450,11 @@ def test_unrelated_comment_does_not_call_github():
     assert gh.calls == []
 
 
-@pytest.mark.parametrize("status", ["queued", "in_progress"])
+@pytest.mark.parametrize(
+    "status", ["queued", "in_progress", "pending", "waiting", "requested"]
+)
 def test_run_already_active(status):
-    control, gh, _ = command_setup(existing=[run(status=status)])
+    control, gh, _ = command_setup(existing=[run(status=status, conclusion=None)])
     control.command()
     assert "already running" in reply(gh).lower()
     assert run()["html_url"] in reply(gh)
@@ -591,14 +593,17 @@ def test_reaction_api_failures_are_best_effort():
     assert "none" in reply(gh).lower()
 
 
-def test_cancel_all_active_heads_writes_terminal_status_on_each_title_sha():
+@pytest.mark.parametrize(
+    "status", ["queued", "in_progress", "pending", "waiting", "requested"]
+)
+def test_cancel_all_active_heads_writes_terminal_status_on_each_title_sha(status):
     control, gh, _ = command_setup(
         "/ci cancel",
         login="maintainer",
         value="write",
         existing=[
-            run(101, status="in_progress"),
-            run(102, sha=OLD, status="queued"),
+            run(101, status=status, conclusion=None),
+            run(102, sha=OLD, status=status, conclusion=None),
             run(103),
         ],
     )
@@ -662,16 +667,28 @@ def retry_setup(existing=None, jobs=None, artifacts=None):
     [
         ([], "/ci run"),
         ([run(sha=OLD)], "/ci run"),
-        ([run(status="queued")], "already running"),
-        ([run(status="in_progress")], "already running"),
         ([run(conclusion="success")], "nothing to rerun"),
     ],
 )
-def test_retry_absent_active_success_current_head_only(existing, hint):
+def test_retry_absent_or_successful_current_head(existing, hint):
     control, gh, _ = command_setup("/ci retry", existing=existing)
     control.command()
     assert hint in reply(gh).lower()
     assert not states(gh)
+    assert not gh.writes(DISPATCH)
+
+
+@pytest.mark.parametrize(
+    "status", ["queued", "in_progress", "pending", "waiting", "requested"]
+)
+def test_retry_active_run_does_not_rerun_or_change_status(status):
+    control, gh, _ = retry_setup(existing=[run(status=status, conclusion=None)])
+    control.command()
+    assert "already running" in reply(gh).lower()
+    assert run()["html_url"] in reply(gh)
+    assert not states(gh)
+    assert not gh.writes("/rerun-failed-jobs")
+    assert not gh.writes("/rerun")
     assert not gh.writes(DISPATCH)
 
 
