@@ -85,7 +85,7 @@ class FakeGitHub:
         return [c for c in self.calls if c[0] != "GET" and c[1].endswith(ending)]
 
 
-def setup(event=None, env=None):
+def make_controller(event=None, env=None):
     gh = FakeGitHub()
     sleeps = []
     control = module().Controller(
@@ -157,21 +157,21 @@ def test_ignore_noncommands_and_ineligible_events(change):
 
 @pytest.mark.parametrize("value", ["write", "maintain", "admin"])
 def test_live_write_permission_allows_drafts(value):
-    control, gh, _ = setup()
+    control, gh, _ = make_controller()
     permission(gh, value=value)
     assert control.authorize({**PR, "draft": True}, "author") is True
 
 
 @pytest.mark.parametrize("login", ["trusted", "OTHER", "ThIrD"])
 def test_trusted_list_is_case_insensitive_but_not_write(login):
-    control, gh, _ = setup()
+    control, gh, _ = make_controller()
     permission(gh, login)
     assert control.authorize({**PR, "draft": True}, login) is False
 
 
 @pytest.mark.parametrize("label", ["ready", "ready-run-all-tests"])
 def test_author_with_ready_label(label):
-    control, gh, _ = setup()
+    control, gh, _ = make_controller()
     permission(gh)
     assert control.authorize({**PR, "labels": [{"name": label}]}, "author") is False
 
@@ -186,7 +186,7 @@ def test_author_with_ready_label(label):
     ],
 )
 def test_authorization_universal_and_delegation_guards(change, login):
-    control, gh, _ = setup()
+    control, gh, _ = make_controller()
     permission(gh, login)
     with pytest.raises(module().Rejected):
         control.authorize({**PR, **change}, login)
@@ -221,7 +221,7 @@ def test_authorization_universal_and_delegation_guards(change, login):
     ],
 )
 def test_aggregate_and_latest_meaningful_trusted_review(aggregate, reviews, allowed):
-    control, gh, _ = setup()
+    control, gh, _ = make_controller()
     for login in ("author", "trusted", "writer", "outsider"):
         permission(gh, login, "write" if login == "writer" else "read")
     gh.add(
@@ -241,7 +241,7 @@ def test_aggregate_and_latest_meaningful_trusted_review(aggregate, reviews, allo
 
 
 def test_permission_404_means_none_other_errors_propagate():
-    control, gh, _ = setup()
+    control, gh, _ = make_controller()
     path = ROOT + "/collaborators/author/permission"
     gh.add("GET", path, http_error(404), http_error(403))
     assert control.authorize(PR, "author") is False
@@ -322,7 +322,7 @@ def runs(gh, *responses, page=1):
 def command_setup(body="/ci run", login="author", value="read", existing=None):
     event = copy.deepcopy(EVENT)
     event["comment"].update(body=body, user={"login": login, "type": "User"})
-    control, gh, sleeps = setup(event)
+    control, gh, sleeps = make_controller(event)
     gh.page(REACTIONS, []).page(COMMENTS, [])
     gh.add("POST", ROOT + REACTIONS, {})
     gh.add("POST", ROOT + COMMENTS, {"id": 60})
@@ -360,7 +360,7 @@ def reactions(gh):
     ],
 )
 def test_run_discovery_filters_title_path_branch_repository(extra):
-    control, gh, _ = setup()
+    control, gh, _ = make_controller()
     runs(gh, [run(200, **extra), run(99), run(101), run(105, sha=OLD)])
     assert [r["id"] for r in control.find_runs(PR, SHA)] == [101, 99]
     assert [r["id"] for r in control.find_runs(PR)] == [105, 101, 99]
@@ -368,7 +368,7 @@ def test_run_discovery_filters_title_path_branch_repository(extra):
 
 
 def test_find_runs_paginates_at_most_ten_pages_and_defaults_via_repository():
-    control, gh, _ = setup({**EVENT, "repository": {}})
+    control, gh, _ = make_controller({**EVENT, "repository": {}})
     gh.add("GET", ROOT, {"default_branch": "main"})
     for page in range(1, 11):
         runs(gh, [run(page * 100 + i) for i in range(100)], page=page)
@@ -771,7 +771,7 @@ INPUTS = {"pr_number": "7", "head_sha": SHA, "requester": "author", "comment_id"
 
 
 def executor_setup(inputs=None, needs=None):
-    control, gh, sleeps = setup(
+    control, gh, sleeps = make_controller(
         {"inputs": INPUTS if inputs is None else inputs},
         {
             "NEEDS": json.dumps(
@@ -932,7 +932,7 @@ def test_notify_filters_event_author_and_labels(change, notify):
         "pull_request": PR,
         **change,
     }
-    control, gh, _ = setup(event)
+    control, gh, _ = make_controller(event)
     permission(gh)
     permission(gh, "TRUSTED")
     gh.page(COMMENTS, [])
@@ -950,7 +950,7 @@ def test_notify_filters_event_author_and_labels(change, notify):
 
 @pytest.mark.parametrize("user,sent", [(BOT, False), (USER, True)])
 def test_notify_bot_marker_deduplication(user, sent):
-    control, gh, _ = setup(
+    control, gh, _ = make_controller(
         {"action": "labeled", "label": {"name": "ready"}, "pull_request": PR}
     )
     permission(gh)
@@ -961,7 +961,7 @@ def test_notify_bot_marker_deduplication(user, sent):
 
 
 def test_notify_skips_actual_writer():
-    control, gh, _ = setup(
+    control, gh, _ = make_controller(
         {"action": "labeled", "label": {"name": "ready"}, "pull_request": PR}
     )
     permission(gh, value="write")
@@ -988,7 +988,7 @@ def test_cli_modes_use_injected_client_and_environment(tmp_path, mode):
     if mode in {"validate", "report"}:
         control, gh, _ = executor_setup()
     else:
-        control, gh, _ = setup({"action": "ignored"})
+        control, gh, _ = make_controller({"action": "ignored"})
     event_path = tmp_path / "event.json"
     event_path.write_text(json.dumps(control.event))
     env = {**control.env, "GITHUB_EVENT_PATH": str(event_path)}
@@ -1025,7 +1025,7 @@ def test_cli_module_starts_without_torch_or_vllm(tmp_path):
 
 
 def test_review_latest_is_submission_time_not_review_creation_id():
-    control, gh, _ = setup()
+    control, gh, _ = make_controller()
     permission(gh)
     gh.add(
         "POST",
@@ -1060,7 +1060,7 @@ def test_dispatch_poll_stops_after_slow_lookup_and_still_accepts(monkeypatch):
 
 
 def test_review_approval_and_comment_are_paginated():
-    control, gh, _ = setup()
+    control, gh, _ = make_controller()
     permission(gh)
     gh.add(
         "POST",
