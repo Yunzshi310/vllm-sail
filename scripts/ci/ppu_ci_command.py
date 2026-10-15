@@ -17,7 +17,6 @@ HELP = "Commands: " + ", ".join(f"`{command}`" for command in COMMANDS)
 READY = {"ready", "ready-run-all-tests"}
 WRITE = {"write", "maintain", "admin"}
 WORKFLOW = "ppu-pr-ci.yaml"
-ACTIVE = {"queued", "in_progress"}
 LOGIN = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?"
 TITLE = re.compile(
     rf"PPU PR #([1-9][0-9]*) @ ([0-9a-f]{{40}}) by ({LOGIN}) \(comment ([1-9][0-9]*)\)"
@@ -286,7 +285,7 @@ class Controller:
     def run(self, pr, login, cid, allow_stale):
         sha = pr["head"]["sha"]
         runs = self.find_runs(pr, sha)
-        active = next((r for r in runs if r["status"] in ACTIVE), None)
+        active = next((r for r in runs if r["status"] != "completed"), None)
         if active:
             return f"PPU CI already running: {active['html_url']}"
         completed = next((r for r in runs if r["status"] == "completed"), None)
@@ -336,7 +335,7 @@ class Controller:
     def cancel(self, pr, login):
         links = []
         for run in self.find_runs(pr):
-            if run["status"] in ACTIVE:
+            if run["status"] != "completed":
                 self.api("POST", f"/actions/runs/{run['id']}/cancel")
                 sha = TITLE.fullmatch(run["display_title"])[2]
                 self.status(sha, "error", f"Cancelled by @{login}")
@@ -352,7 +351,7 @@ class Controller:
         if not runs:
             raise Rejected("No run for this head; use /ci run.")
         run = runs[0]
-        if run["status"] in ACTIVE:
+        if run["status"] != "completed":
             return f"PPU CI already running: {run['html_url']}"
         if run["conclusion"] == "success":
             return f"Nothing to rerun: {run['html_url']}"
