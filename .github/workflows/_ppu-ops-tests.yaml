@@ -79,7 +79,7 @@ jobs:
           github-token: ${{ github.token }}
       - uses: actions/download-artifact@v4
         with:
-          name: ppu-build-diagnostics-${{ inputs.build_run_id }}
+          name: ppu-build-diagnostics-${{ inputs.build_run_id }}-${{ github.run_attempt }}
           path: /tmp/ops-build
           run-id: ${{ inputs.build_run_id }}
           github-token: ${{ github.token }}
@@ -162,7 +162,7 @@ jobs:
           github-token: ${{ github.token }}
       - uses: actions/download-artifact@v4
         with:
-          name: ppu-build-diagnostics-${{ inputs.build_run_id }}
+          name: ppu-build-diagnostics-${{ inputs.build_run_id }}-${{ github.run_attempt }}
           path: /tmp/ops-build
           run-id: ${{ inputs.build_run_id }}
           github-token: ${{ github.token }}

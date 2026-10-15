@@ -101,7 +101,7 @@ def test_build_workflow_uses_script_and_retains_artifacts() -> None:
         }
         assert set(uploads) == {
             "ppu-wheels-${{ github.run_id }}",
-            "ppu-build-diagnostics-${{ github.run_id }}",
+            "ppu-build-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}",
         }
         assert all(config["retention-days"] == 14 for config in uploads.values())
         assert (
