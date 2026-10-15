@@ -302,7 +302,8 @@ class Controller:
         writer = self.authorize(fresh, login)
         if completed and not writer:
             raise Rejected(
-                "Already tested; write permission is required to dispatch again."
+                f"Already tested: {completed['html_url']}. Use `/ci retry` for failed "
+                "jobs or push a new commit; write permission is required to dispatch again."
             )
         self.launch(
             sha,

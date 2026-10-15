@@ -464,6 +464,9 @@ def test_completed_run_blocks_nonwriters_including_trusted_list(login):
     control, gh, _ = command_setup(login=login, existing=[run()])
     control.command()
     assert "already tested" in reply(gh).lower()
+    assert run()["html_url"] in reply(gh)
+    assert "/ci retry" in reply(gh)
+    assert "new commit" in reply(gh)
     assert reactions(gh) == ["eyes", "-1"]
     assert not gh.writes(DISPATCH)
     assert len([c for c in gh.calls if c[1] == ROOT + "/pulls/7"]) == 2
