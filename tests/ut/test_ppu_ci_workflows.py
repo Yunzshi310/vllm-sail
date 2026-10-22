@@ -58,6 +58,22 @@ def test_control_jobs_only_execute_trusted_code(name, job_id, ref):
         )
 
 
+@pytest.mark.parametrize(
+    "filename,job_ids",
+    [
+        ("build-ppu-wheels.yaml", ("build", "ops-build")),
+        ("ppu-pin-ut.yaml", ("pin-unit-tests",)),
+        ("e2e-ppu.yaml", ("prepare", "e2e")),
+        ("_ppu-ops-tests.yaml", ("ops-tests",)),
+        ("upstream-reuse.yaml", ("resolve-build", "nightly-ppu-reuse")),
+    ],
+)
+def test_ppu_control_jobs_use_the_community_runner(filename, job_ids):
+    jobs = workflow(filename)["jobs"]
+    for job_id in job_ids:
+        assert jobs[job_id]["runs-on"] == "8-ppu-m890p"
+
+
 def test_controller_filters_comments_serializes_all_commands_and_reports_failure():
     config = workflow("run-ci-command.yml")
     assert config[True] == {"issue_comment": {"types": ["created"]}}

@@ -137,16 +137,16 @@ def test_smoke_script_fails_when_serve_dies_early() -> None:
 # --- workflow -----------------------------------------------------------------
 
 
-def test_e2e_workflow_is_reusable_and_manual_and_uses_cpu_runner() -> None:
+def test_e2e_workflow_is_reusable_and_manual_and_uses_community_runner() -> None:
     text = WORKFLOW.read_text()
     assert "workflow_dispatch:" in text
     # PR orchestration calls the same workflow as manual smoke runs.
     assert "workflow_call:" in text
     assert "pull_request:" not in text
     assert "push:" not in text
-    # ppu-scheduler-action itself runs on the CPU runner scale set and dispatches
-    # a PPU pod; the workflow must not try to run on PPU directly.
-    assert "runs-on: k8s-runner-group-cpu-thead" in text
+    # ppu-scheduler-action runs from the community self-hosted runner and
+    # dispatches the isolated PPU workload.
+    assert "runs-on: 8-ppu-m890p" in text
     assert "t-head/ppu-scheduler-action@main" in text
     # board is data-driven from the matrix (the literal OAM-810E lives in the
     # catalog and is asserted by test_default_matrix_targets_qwen_on_810e).
@@ -209,12 +209,11 @@ def test_e2e_workflow_keeps_python_frontend_and_privileged() -> None:
     assert "scripts/ci/ppu_e2e_smoke.sh" in text
 
 
-def test_e2e_workflow_gives_every_cpu_runner_job_a_container() -> None:
+def test_e2e_workflow_gives_every_community_runner_job_a_container() -> None:
     text = WORKFLOW.read_text()
-    # k8s-runner-group-cpu-thead rejects container-less jobs ("Jobs without a
-    # job container are forbidden on this runner"), so every job on that runner
-    # must declare a container image.
-    runner_jobs = text.count("runs-on: k8s-runner-group-cpu-thead")
+    # Keep every community-runner control job inside a pinned container so the
+    # checkout, artifact and scheduler environment remains reproducible.
+    runner_jobs = text.count("runs-on: 8-ppu-m890p")
     container_decls = sum(
         1 for line in text.splitlines() if line.strip() == "container:"
     )
