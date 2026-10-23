@@ -17,6 +17,17 @@ HELP = "Commands: " + ", ".join(f"`{command}`" for command in COMMANDS)
 READY = {"ready", "ready-run-all-tests"}
 WRITE = {"write", "maintain", "admin"}
 WORKFLOW = "ppu-pr-ci.yaml"
+SKIP_PPU_PREFIXES = ("docs/", ".github/ISSUE_TEMPLATE/")
+SKIP_PPU_FILES = {
+    ".github/pull_request_template.md",
+    ".gitignore",
+    ".pre-commit-config.yaml",
+    "AGENTS.md",
+    "CONTRIBUTING.md",
+    "LICENSE",
+    "README.md",
+    "codecov.yml",
+}
 LOGIN = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?"
 TITLE = re.compile(
     rf"PPU PR #([1-9][0-9]*) @ ([0-9a-f]{{40}}) by ({LOGIN}) \(comment ([1-9][0-9]*)\)"
@@ -187,13 +198,62 @@ class Controller:
     def execution_url(self):
         return f"{self.url}/actions/runs/{self.env['GITHUB_RUN_ID']}/attempts/{self.env.get('GITHUB_RUN_ATTEMPT', '1')}"
 
+    def skips_ppu(self, pr):
+        """Return true only for a small, complete allowlist of non-executable files."""
+        changed = pr.get("changed_files")
+        if not isinstance(changed, int) or not 0 < changed <= 300:
+            return False
+        files = list(self.pages(f"/pulls/{pr['number']}/files", limit=3))
+        if len(files) != changed:
+            return False
+        paths = []
+        for file in files:
+            filename = file.get("filename")
+            if not isinstance(filename, str):
+                return False
+            paths.append(filename)
+            if file.get("status") == "renamed":
+                previous = file.get("previous_filename")
+                if not isinstance(previous, str):
+                    return False
+                paths.append(previous)
+        return all(
+            path in SKIP_PPU_FILES or path.startswith(SKIP_PPU_PREFIXES)
+            for path in paths
+        )
+
     def reusable_wheels(self, sha):
-        # Same trusted workflow revision pins build settings and runtime images.
+        # Full reuse needs safe source ancestry. Otherwise the build verifies
+        # this trusted artifact as a native donor and falls back on mismatch.
+        no_wheel_prefixes = (
+            "docs/",
+            "tests/",
+            "benchmarks/",
+            ".github/workflows/",
+            "scripts/",
+            "tools/",
+        )
+        no_wheel_files = {
+            "AGENTS.md",
+            "CONTRIBUTING.md",
+            "LICENSE",
+            "MANIFEST.in",
+            "README.md",
+            "requirements/dev.txt",
+            ".gitignore",
+            ".pre-commit-config.yaml",
+        }
+        rebuild_files = {
+            ".github/workflows/_ppu-build.yaml",
+            "scripts/ci/build_ppu_wheels.sh",
+            "scripts/ci/ppu_image_stack.py",
+            "scripts/ci/ppu_wheel_manifest.py",
+        }
         for run in self.find_runs()[:20]:
             if (
                 run.get("status") != "completed"
                 or run.get("conclusion") != "success"
-                or run.get("head_sha") != self.env["GITHUB_SHA"]
+                or not re.fullmatch(r"[0-9a-f]{40}", run.get("head_sha") or "")
                 or not 0 < run["id"] < int(self.env["GITHUB_RUN_ID"])
             ):
                 continue
@@ -203,29 +263,35 @@ class Controller:
             ):
                 continue  # Reuse-only executors are not wheel producers.
             source = TITLE.fullmatch(run["display_title"])[2]
-            if source != sha:
-                diff = self.api("GET", f"/compare/{source}...{sha}")
-                files = diff["files"]
-                if (
-                    diff["status"] not in {"ahead", "identical"}
-                    or diff["merge_base_commit"]["sha"] != source
-                    or not isinstance(files, list)
-                    or len(files) >= 300
-                ):
-                    continue
-                # Wheel-only allowlist: unknown inputs and either rename end rebuild.
+            same_workflow = run["head_sha"] == self.env["GITHUB_SHA"]
+            if source == sha and same_workflow:
+                return "full", str(run["id"]), source
+            diff = self.api("GET", f"/compare/{source}...{sha}")
+            files = diff.get("files")
+            if (
+                diff.get("status") in {"ahead", "identical"}
+                and (diff.get("merge_base_commit") or {}).get("sha") == source
+                and isinstance(files, list)
+                and len(files) < 300
+            ):
                 paths = []
                 for file in files:
+                    if (
+                        file.get("status") == "renamed"
+                        and "previous_filename" not in file
+                    ):
+                        return "native", str(run["id"]), sha
                     paths.append(file["filename"])
-                    if file.get("status") == "renamed" or "previous_filename" in file:
+                    if "previous_filename" in file:
                         paths.append(file["previous_filename"])
-                if any(
-                    not path.startswith(("docs/", "tests/", ".github/workflows/"))
-                    and path != "scripts/ci/ppu_ci_command.py"
+                if same_workflow and all(
+                    path not in rebuild_files
+                    and (path in no_wheel_files or path.startswith(no_wheel_prefixes))
                     for path in paths
                 ):
-                    continue
-            return str(run["id"]), source
+                    return "full", str(run["id"]), source
+            return "native", str(run["id"]), sha
+        return "none", "", ""
 
     def find_runs(self, pr=None, head_sha=None):
         query = (
@@ -464,16 +530,21 @@ class Controller:
             "pending",
             f"Running (attempt {self.env.get('GITHUB_RUN_ATTEMPT', '1')})",
         )
-        build, source = best_effort(
-            lambda: self.reusable_wheels(inputs["head_sha"])
-        ) or ("", "")
-        print(
-            f"Wheel reuse: run={build}, source={source}"
-            if build
-            else "Wheel reuse unavailable: full build"
-        )
+        skip = best_effort(lambda: self.skips_ppu(pr)) is True
+        mode, build, source = ("skip", "", "")
+        if not skip:
+            mode, build, source = best_effort(
+                lambda: self.reusable_wheels(inputs["head_sha"])
+            ) or ("none", "", "")
+        print(f"Wheel reuse: mode={mode}, run={build}, source={source}")
+        existing = build if mode == "full" else ""
+        native = build if mode == "native" else ""
         with open(self.env["GITHUB_OUTPUT"], "a") as output:
-            output.write(f"existing_build_run_id={build}\nwheel_source_sha={source}\n")
+            output.write(
+                f"skip_ppu={'true' if skip else 'false'}\n"
+                f"existing_build_run_id={existing}\n"
+                f"native_reuse_run_id={native}\nwheel_source_sha={source}\n"
+            )
 
     def report(self):
         inputs = self.inputs()
@@ -481,7 +552,10 @@ class Controller:
         results = {
             stage: needs.get(stage, {}).get("result") for stage in ("validate", "ppu")
         }
+        skipped = needs.get("validate", {}).get("outputs", {}).get("skip_ppu") == "true"
         state, description = "success", "Passed"
+        if skipped and all(result == "success" for result in results.values()):
+            description = "Skipped (no PPU-impacting changes)"
         if "cancelled" in results.values():
             state, description = "error", "Cancelled"
         elif any(result != "success" for result in results.values()):

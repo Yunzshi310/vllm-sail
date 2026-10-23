@@ -713,3 +713,17 @@ def test_runtime_scripts_capture_same_image_stack_before_installing_wheels(scrip
     verify = text.index('ppu_image_stack.py" verify')
     assert capture < install < verify
     assert "--constraints" in text[capture:install]
+
+
+def test_native_repack_is_verified_and_falls_back_to_full_build() -> None:
+    text = SCRIPT.read_text()
+    fingerprint = text.index('ppu_wheel_manifest.py" \\\n        fingerprint')
+    verify = text.index('ppu_wheel_manifest.py" verify')
+    extract = text.index('ppu_wheel_manifest.py" extract-native')
+    prebuilt = text.index('export VLLM_SAIL_PREBUILT_EXT_DIR="${PREBUILT_EXT_DIR}"')
+    package = text.index("python setup.py bdist_wheel")
+    assert fingerprint < verify < extract < prebuilt < package
+    assert "if ((NATIVE_REUSE == 0)); then" in text
+    assert 'git init "${VLLM_SRC}"' in text
+    assert "fingerprint missing or changed; compiling" in text
+    assert "artifact failed verification; compiling" in text
