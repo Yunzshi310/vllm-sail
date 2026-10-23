@@ -1327,7 +1327,7 @@ def test_stdlib_only_python310_syntax_and_physical_line_budget():
     from pathlib import Path
 
     source = Path(module().__file__).read_text()
-    assert len(source.splitlines()) <= 625
+    assert len(source.splitlines()) <= 650
     tree = ast.parse(source, feature_version=(3, 10))
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -1557,20 +1557,20 @@ def test_validate_reuses_complete_wheels_for_non_package_changes(
         ("AGENTS.md", "full"),
         ("CONTRIBUTING.md", "full"),
         ("requirements/dev.txt", "full"),
-        ("scripts/ci/build_ppu_wheels.sh", "native"),
-        ("scripts/ci/ppu_image_stack.py", "native"),
-        ("scripts/ci/ppu_wheel_manifest.py", "native"),
-        ("setup.py", "native"),
-        ("pyproject.toml", "native"),
-        ("CMakeLists.txt", "native"),
-        ("csrc/kernel.cu", "native"),
+        ("scripts/ci/build_ppu_wheels.sh", "none"),
+        ("scripts/ci/ppu_image_stack.py", "none"),
+        ("scripts/ci/ppu_wheel_manifest.py", "none"),
+        ("setup.py", "none"),
+        ("pyproject.toml", "none"),
+        ("CMakeLists.txt", "none"),
+        ("csrc/kernel.cu", "none"),
         ("vllm_sail/file.py", "native"),
-        ("plugin/hooks.py", "native"),
-        ("cmake/build.cmake", "native"),
-        (".github/vllm-main-verified.commit", "native"),
-        ("unknown/file", "native"),
+        ("plugin/hooks.py", "none"),
+        ("cmake/build.cmake", "none"),
+        (".github/vllm-main-verified.commit", "none"),
+        ("unknown/file", "none"),
         ("scripts/ci/ppu_ci_command.py.bak", "full"),
-        (".github/workflows/_ppu-build.yaml", "native"),
+        (".github/workflows/_ppu-build.yaml", "none"),
     ],
 )
 @pytest.mark.parametrize("rename", [False, True])
@@ -1607,13 +1607,11 @@ def test_package_changes_use_a_verified_native_donor(path, mode, rename, github_
         },
     ],
 )
-def test_unusable_truncated_or_nonancestor_compare_uses_native_donor(
+def test_unusable_truncated_or_nonancestor_compare_rejects_donor(
     compare, github_output
 ):
     control, gh = reuse_setup(compare=compare)
-    assert validate_pair(control, gh, github_output) == reuse_result(
-        "native", source=SHA
-    )
+    assert validate_pair(control, gh, github_output) == reuse_result("none")
 
 
 def test_malformed_compare_falls_back_to_full_build(github_output):
@@ -1681,8 +1679,8 @@ def test_other_pr_needs_actual_immutable_source_equivalence(
         files=[{"filename": "csrc/new.cu" if code_changed else "tests/new.py"}],
     )
     pair = validate_pair(control, gh, github_output)
-    mode = "full" if same_source or not code_changed else "native"
-    expected_source = SHA if mode == "native" else source
+    mode = "full" if same_source or not code_changed else "none"
+    expected_source = source
     assert pair == reuse_result(mode, source=expected_source)
 
 

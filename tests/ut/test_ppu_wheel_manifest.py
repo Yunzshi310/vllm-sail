@@ -181,6 +181,15 @@ def test_native_fingerprint_only_changes_for_native_inputs(tmp_path: Path) -> No
         )
         == first
     )
+    assert (
+        manifest.native_fingerprint(
+            source,
+            build_image="image@sha256:one",
+            pytorch_sail_arch="ppu_15;ppu_10",
+            vllm_sail_hg_flags="-O3",
+        )
+        != first
+    )
     native_file = next((source / "csrc").rglob("*.hg"))
     native_file.write_text(native_file.read_text() + "\n// changed\n")
     assert (
@@ -247,3 +256,25 @@ def test_create_accepts_verified_upstream_commit_for_native_repack(
     data = manifest.verify(tmp_path, vllm_commit=commit)
     assert data["native_reuse"]["extensions"]
     assert len(data["native_reuse"]["fingerprint"]) == 64
+
+
+def test_verify_rejects_null_native_metadata_and_empty_extensions(
+    tmp_path: Path,
+) -> None:
+    make_wheels(tmp_path)
+    data = record(tmp_path)
+    data["native_reuse"] = None
+    (tmp_path / manifest.MANIFEST).write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="metadata must be an object"):
+        manifest.verify(tmp_path)
+
+    sail = next(tmp_path.rglob("vllm_sail-*.whl"))
+    replacement = tmp_path / "replacement.whl"
+    with zipfile.ZipFile(sail) as source, zipfile.ZipFile(replacement, "w") as target:
+        for name in source.namelist():
+            target.writestr(
+                name, b"" if name == "vllm_sail/_C.abi3.so" else source.read(name)
+            )
+    replacement.replace(sail)
+    with pytest.raises(ValueError, match="empty native extension"):
+        manifest.wheel_records(tmp_path)

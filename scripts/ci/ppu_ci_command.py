@@ -198,7 +198,7 @@ class Controller:
     def execution_url(self):
         return f"{self.url}/actions/runs/{self.env['GITHUB_RUN_ID']}/attempts/{self.env.get('GITHUB_RUN_ATTEMPT', '1')}"
 
-    def skips_ppu(self, pr):
+    def skips_ppu(self, pr, head_sha):
         """Return true only for a small, complete allowlist of non-executable files."""
         changed = pr.get("changed_files")
         if not isinstance(changed, int) or not 0 < changed <= 300:
@@ -217,14 +217,13 @@ class Controller:
                 if not isinstance(previous, str):
                     return False
                 paths.append(previous)
-        return all(
+        unchanged = self.api("GET", f"/pulls/{pr['number']}")["head"]["sha"] == head_sha
+        return unchanged and all(
             path in SKIP_PPU_FILES or path.startswith(SKIP_PPU_PREFIXES)
             for path in paths
         )
 
     def reusable_wheels(self, sha):
-        # Full reuse needs safe source ancestry. Otherwise the build verifies
-        # this trusted artifact as a native donor and falls back on mismatch.
         no_wheel_prefixes = (
             "docs/",
             "tests/",
@@ -243,12 +242,38 @@ class Controller:
             ".gitignore",
             ".pre-commit-config.yaml",
         }
+        rebuild_prefixes = ("cmake/", "csrc/")
         rebuild_files = {
+            ".github/vllm-main-verified.commit",
             ".github/workflows/_ppu-build.yaml",
+            "CMakeLists.txt",
+            "pyproject.toml",
+            "requirements/build.txt",
+            "setup.py",
             "scripts/ci/build_ppu_wheels.sh",
             "scripts/ci/ppu_image_stack.py",
             "scripts/ci/ppu_wheel_manifest.py",
+            "vllm_sail/native/manifest.py",
+            "vllm_sail/native/plugin_manifest.py",
+            "vllm_sail/native/resources.py",
+            "vllm_sail/native/toolchain.py",
         }
+        repack_files = {"requirements/ppu.txt", "requirements/profiling.txt"}
+
+        def no_wheel(path):
+            return path in no_wheel_files or path.startswith(no_wheel_prefixes)
+
+        def native_safe(path):
+            return (
+                (
+                    no_wheel(path)
+                    or path in repack_files
+                    or path.startswith("vllm_sail/")
+                )
+                and path not in rebuild_files
+                and not path.startswith(rebuild_prefixes)
+            )
+
         for run in self.find_runs()[:20]:
             if (
                 run.get("status") != "completed"
@@ -261,36 +286,39 @@ class Controller:
                 a["name"] == f"ppu-wheels-{run['id']}" and a.get("expired") is False
                 for a in self.pages(f"/actions/runs/{run['id']}/artifacts", "artifacts")
             ):
-                continue  # Reuse-only executors are not wheel producers.
+                continue
             source = TITLE.fullmatch(run["display_title"])[2]
             same_workflow = run["head_sha"] == self.env["GITHUB_SHA"]
             if source == sha and same_workflow:
                 return "full", str(run["id"]), source
             diff = self.api("GET", f"/compare/{source}...{sha}")
             files = diff.get("files")
-            if (
+            if not (
                 diff.get("status") in {"ahead", "identical"}
                 and (diff.get("merge_base_commit") or {}).get("sha") == source
                 and isinstance(files, list)
                 and len(files) < 300
             ):
-                paths = []
-                for file in files:
-                    if (
-                        file.get("status") == "renamed"
-                        and "previous_filename" not in file
-                    ):
-                        return "native", str(run["id"]), sha
-                    paths.append(file["filename"])
-                    if "previous_filename" in file:
-                        paths.append(file["previous_filename"])
-                if same_workflow and all(
-                    path not in rebuild_files
-                    and (path in no_wheel_files or path.startswith(no_wheel_prefixes))
-                    for path in paths
-                ):
-                    return "full", str(run["id"]), source
-            return "native", str(run["id"]), sha
+                continue
+            paths = []
+            for file in files:
+                if not isinstance(file.get("filename"), str):
+                    paths = []
+                    break
+                paths.append(file["filename"])
+                if file.get("status") == "renamed":
+                    if not isinstance(file.get("previous_filename"), str):
+                        paths = []
+                        break
+                    paths.append(file["previous_filename"])
+            if files and not paths:
+                continue
+            if same_workflow and all(
+                no_wheel(path) and path not in rebuild_files for path in paths
+            ):
+                return "full", str(run["id"]), source
+            if all(native_safe(path) for path in paths):
+                return "native", str(run["id"]), sha
         return "none", "", ""
 
     def find_runs(self, pr=None, head_sha=None):
@@ -530,7 +558,7 @@ class Controller:
             "pending",
             f"Running (attempt {self.env.get('GITHUB_RUN_ATTEMPT', '1')})",
         )
-        skip = best_effort(lambda: self.skips_ppu(pr)) is True
+        skip = best_effort(lambda: self.skips_ppu(pr, inputs["head_sha"])) is True
         mode, build, source = ("skip", "", "")
         if not skip:
             mode, build, source = best_effort(

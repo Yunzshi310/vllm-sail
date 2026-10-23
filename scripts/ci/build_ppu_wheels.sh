@@ -117,41 +117,52 @@ PREBUILT_EXT_DIR="${WORK_DIR}/prebuilt-extensions"
 NATIVE_REUSE_DIR="${VLLM_SAIL_NATIVE_REUSE_DIR:-}"
 NATIVE_REUSE=0
 
-# A native-reuse artifact is only a hint from the trusted controller. Verify its
-# wheels, upstream revision and complete native-input fingerprint inside the
-# build container. Missing legacy metadata or any mismatch falls back to a full
-# compile instead of making the CI run fail.
-if [[ -n "${NATIVE_REUSE_DIR}" && -d "${NATIVE_REUSE_DIR}" && "${VLLM_REF}" =~ ^[0-9a-f]{40}$ ]]; then
+# A native-reuse artifact is only a hint from the trusted controller. Every
+# donor operation is guarded so malformed or legacy artifacts fall back to a
+# full compile instead of failing the CI run.
+fingerprint_args=(
+    --build-image "${VLLM_SAIL_BUILD_IMAGE:-}"
+    --pytorch-sail-arch "${PYTORCH_SAIL_ARCH}"
+    --cmake-build-type "${CMAKE_BUILD_TYPE:-Release}"
+    --cmake-hgcc-dir "${CMAKE_HGCC_DIR:-}"
+    --vllm-sail-hg-flags "${VLLM_SAIL_HG_FLAGS:-}"
+    --vllm-sail-hg-std "${VLLM_SAIL_HG_STD:-20}"
+)
+prepare_native_reuse() {
+    python "${ROOT_DIR}/scripts/ci/ppu_wheel_manifest.py" verify \
+        "${NATIVE_REUSE_DIR}" --vllm-commit "${VLLM_REF}" >/dev/null || return 1
+    local current_fingerprint donor_fingerprint
     current_fingerprint="$(python "${ROOT_DIR}/scripts/ci/ppu_wheel_manifest.py" \
-        fingerprint "${ROOT_DIR}" --build-image "${VLLM_SAIL_BUILD_IMAGE:-}" \
-        --pytorch-sail-arch "${PYTORCH_SAIL_ARCH}")"
-    if python "${ROOT_DIR}/scripts/ci/ppu_wheel_manifest.py" verify \
-            "${NATIVE_REUSE_DIR}" --vllm-commit "${VLLM_REF}" >/dev/null; then
-        donor_fingerprint="$(python - "${NATIVE_REUSE_DIR}/wheel-manifest.json" <<'PY'
+        fingerprint "${ROOT_DIR}" "${fingerprint_args[@]}")" || return 1
+    donor_fingerprint="$(python - "${NATIVE_REUSE_DIR}/wheel-manifest.json" <<'PY'
 import json
 import sys
 
-print(json.load(open(sys.argv[1])).get("native_reuse", {}).get("fingerprint", ""))
+native = json.load(open(sys.argv[1])).get("native_reuse")
+if not isinstance(native, dict):
+    raise SystemExit(1)
+print(native.get("fingerprint", ""))
 PY
-        )"
-        if [[ -n "${donor_fingerprint}" && "${donor_fingerprint}" == "${current_fingerprint}" ]]; then
-            python "${ROOT_DIR}/scripts/ci/ppu_wheel_manifest.py" extract-native \
-                "${NATIVE_REUSE_DIR}" --output "${PREBUILT_EXT_DIR}" >/dev/null
-            mapfile -t donor_vllm_wheels < <(
-                find "${NATIVE_REUSE_DIR}" -type f -name 'vllm-*.whl' -print
-            )
-            if ((${#donor_vllm_wheels[@]} == 1)); then
-                cp "${donor_vllm_wheels[0]}" "${VLLM_WHEEL_DIR}/"
-                NATIVE_REUSE=1
-                printf 'reuse_mode=native\nreuse_source=%s\n' \
-                    "${NATIVE_REUSE_DIR}" >>"${MANIFEST}"
-                echo "Native fingerprint matched; reusing vLLM wheel and SAIL extensions"
-            fi
-        else
-            echo "Native reuse unavailable: fingerprint missing or changed; compiling"
-        fi
+    )" || return 1
+    [[ -n "${donor_fingerprint}" && "${donor_fingerprint}" == "${current_fingerprint}" ]] || return 1
+    rm -rf "${PREBUILT_EXT_DIR}"
+    python "${ROOT_DIR}/scripts/ci/ppu_wheel_manifest.py" extract-native \
+        "${NATIVE_REUSE_DIR}" --output "${PREBUILT_EXT_DIR}" >/dev/null || return 1
+    mapfile -t donor_vllm_wheels < <(
+        find "${NATIVE_REUSE_DIR}" -type f -name 'vllm-*.whl' -print
+    )
+    ((${#donor_vllm_wheels[@]} == 1)) || return 1
+    cp "${donor_vllm_wheels[0]}" "${VLLM_WHEEL_DIR}/" || return 1
+}
+if [[ -n "${NATIVE_REUSE_DIR}" && -d "${NATIVE_REUSE_DIR}" && "${VLLM_REF}" =~ ^[0-9a-f]{40}$ ]]; then
+    if prepare_native_reuse; then
+        NATIVE_REUSE=1
+        printf 'reuse_mode=native\nreuse_source=%s\n' \
+            "${NATIVE_REUSE_DIR}" >>"${MANIFEST}"
+        echo "Native fingerprint matched; reusing vLLM wheel and SAIL extensions"
     else
-        echo "Native reuse artifact failed verification; compiling"
+        rm -rf "${PREBUILT_EXT_DIR}" "${VLLM_WHEEL_DIR:?}/"*
+        echo "Native reuse unavailable or invalid; compiling"
     fi
 fi
 
@@ -275,8 +286,7 @@ else
 fi
 python "${ROOT_DIR}/scripts/ci/ppu_wheel_manifest.py" create \
     "${ARTIFACT_DIR}/wheels" "${manifest_vllm_args[@]}" \
-    --sail-source "${ROOT_DIR}" --build-image "${VLLM_SAIL_BUILD_IMAGE:-}" \
-    --pytorch-sail-arch "${PYTORCH_SAIL_ARCH}"
+    --sail-source "${ROOT_DIR}" "${fingerprint_args[@]}"
 
 mapfile -t sail_wheels < <(
     find "${SAIL_WHEEL_DIR}" -maxdepth 1 -type f -name '*.whl' -print

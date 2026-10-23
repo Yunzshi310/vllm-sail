@@ -16,6 +16,7 @@ MANIFEST = "wheel-manifest.json"
 NATIVE_MODULES = ("_C", "_moe_C", "_upstream_C", "_upstream_moe_C")
 NATIVE_INPUTS = (
     ".github/vllm-main-verified.commit",
+    ".github/workflows/_ppu-build.yaml",
     "CMakeLists.txt",
     "cmake",
     "csrc",
@@ -57,7 +58,10 @@ def _native_members(archive: zipfile.ZipFile) -> dict[str, str]:
             raise ValueError(
                 f"SAIL wheel must contain exactly one {module}, found {len(matches)}"
             )
-        found[module] = matches[0]
+        member = matches[0]
+        if archive.getinfo(member).file_size == 0:
+            raise ValueError(f"SAIL wheel contains empty native extension: {module}")
+        found[module] = member
     return found
 
 
@@ -118,11 +122,29 @@ def _native_files(source: Path):
 
 
 def native_fingerprint(
-    source: Path, *, build_image: str = "", pytorch_sail_arch: str = ""
+    source: Path,
+    *,
+    build_image: str = "",
+    pytorch_sail_arch: str = "",
+    cmake_build_type: str = "Release",
+    cmake_hgcc_dir: str = "",
+    vllm_sail_hg_flags: str = "",
+    vllm_sail_hg_std: str = "20",
 ) -> str:
-    """Hash every input that can change the compiled native extensions."""
+    """Hash every input and build setting that can change native extensions."""
     digest = hashlib.sha256()
-    for value in ("vllm-sail-native-v1", build_image, pytorch_sail_arch):
+    settings = {
+        "build_image": build_image,
+        "cmake_build_type": cmake_build_type,
+        "cmake_hgcc_dir": cmake_hgcc_dir,
+        "pytorch_sail_arch": pytorch_sail_arch,
+        "vllm_sail_hg_flags": vllm_sail_hg_flags,
+        "vllm_sail_hg_std": vllm_sail_hg_std,
+    }
+    digest.update(b"vllm-sail-native-v2\0")
+    for name, value in sorted(settings.items()):
+        digest.update(name.encode())
+        digest.update(b"=")
         digest.update(value.encode())
         digest.update(b"\0")
     for relative, path in sorted(_native_files(source)):
@@ -150,8 +172,10 @@ def verify(
             raise ValueError(
                 f"{name} source commit differs from required revision {expected}"
             )
-    native = manifest.get("native_reuse")
-    if native is not None:
+    if "native_reuse" in manifest:
+        native = manifest["native_reuse"]
+        if not isinstance(native, dict):
+            raise ValueError("native reuse metadata must be an object")
         wheel = directory / manifest["wheels"]["vllm-sail"]["file"]
         if native.get("extensions") != native_extension_records(wheel):
             raise ValueError("native extension hashes differ from build manifest")
@@ -208,6 +232,10 @@ def main() -> None:
     parser.add_argument("--sail-commit", help="require this plugin source commit")
     parser.add_argument("--build-image", default="")
     parser.add_argument("--pytorch-sail-arch", default="")
+    parser.add_argument("--cmake-build-type", default="Release")
+    parser.add_argument("--cmake-hgcc-dir", default="")
+    parser.add_argument("--vllm-sail-hg-flags", default="")
+    parser.add_argument("--vllm-sail-hg-std", default="20")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     if args.command == "verify":
@@ -219,6 +247,10 @@ def main() -> None:
             args.directory,
             build_image=args.build_image,
             pytorch_sail_arch=args.pytorch_sail_arch,
+            cmake_build_type=args.cmake_build_type,
+            cmake_hgcc_dir=args.cmake_hgcc_dir,
+            vllm_sail_hg_flags=args.vllm_sail_hg_flags,
+            vllm_sail_hg_std=args.vllm_sail_hg_std,
         )
     elif args.command == "extract-native":
         if args.output is None:
@@ -249,6 +281,10 @@ def main() -> None:
                     args.sail_source,
                     build_image=args.build_image,
                     pytorch_sail_arch=args.pytorch_sail_arch,
+                    cmake_build_type=args.cmake_build_type,
+                    cmake_hgcc_dir=args.cmake_hgcc_dir,
+                    vllm_sail_hg_flags=args.vllm_sail_hg_flags,
+                    vllm_sail_hg_std=args.vllm_sail_hg_std,
                 ),
                 "extensions": native_extension_records(sail_wheel),
             },
