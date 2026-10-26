@@ -27,7 +27,7 @@ on:
       hf_home:
         description: Host Hugging Face cache root
         type: string
-        default: /ppuswhome/jingxi.zzy/hf_cache
+        default: ""
       gsm8k_dataset_path:
         description: Host GSM8K dataset directory
         type: string
@@ -151,7 +151,7 @@ jobs:
           PPU_CI_DEVICE_COUNT: ${{ matrix.model.ppu_count }}
           PPU_CI_REQUIRE_PR_ARTIFACT: ${{ inputs.pr_mode }}
           PPU_CI_WHEEL_SOURCE_SHA: ${{ inputs.wheel_source_sha || inputs.pr_head_sha || github.sha }}
-          HF_HOME: ${{ inputs.hf_home }}
+          PPU_CI_HF_HOME: ${{ inputs.hf_home }}
           HF_HUB_OFFLINE: "1"
           GSM8K_DATASET_PATH: ${{ inputs.gsm8k_dataset_path }}
           MODEL_KEY: ${{ matrix.model.model_key }}
