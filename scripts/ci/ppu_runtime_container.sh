@@ -117,7 +117,8 @@ case "${mode}" in
         )
         ;;
     model-test)
-        : "${MODEL_ID:?MODEL_ID is required for model-test}"
+        MODEL_ID=${MODEL_ID:-${MODEL_PATH:-}}
+        : "${MODEL_ID:?MODEL_ID or legacy MODEL_PATH is required for model-test}"
         : "${HF_HOME:?HF_HOME is required for model-test}"
         : "${SERVED_NAME:?SERVED_NAME is required for model-test}"
         : "${TP_SIZE:?TP_SIZE is required for model-test}"

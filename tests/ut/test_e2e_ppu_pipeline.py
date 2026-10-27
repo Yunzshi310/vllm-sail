@@ -82,6 +82,8 @@ def test_qwen_smoke_catalog_targets_both_boards(key: str, board: str) -> None:
     qwen = {entry["key"]: entry for entry in _catalog()}[key]
     assert qwen["model_id"] == "Qwen/Qwen3.8-27B"
     assert qwen["board"] == board
+    selected = _load_select().build_matrix(_catalog(), key)["include"][0]
+    assert selected["checkpoint"] == selected["model_id"]
     assert int(qwen["tp"]) == 2
     assert qwen["served_name"] == "qwen3.8-27b"
     assert qwen["extra_serve_flags"] == "--trust-remote-code"
