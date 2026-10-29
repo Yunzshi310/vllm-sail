@@ -9,6 +9,8 @@
 #
 # Environment contract (injected by ppu_runtime_container.sh):
 #   MODEL_KEY          model config key (e.g. deepseek_v4_int8)
+#   MODEL_ID           Hugging Face model id this key resolves to; checked
+#                      against the offline cache before the server starts
 #   WHEELS_DIR         directory holding the downloaded *.whl artifacts
 #   RESULTS_DIR        absolute output dir for xml/logs/golden
 #   UPDATE_GOLDEN      "1" to pass --update-golden (default: "0")
@@ -24,12 +26,17 @@ ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 export HF_HOME="${HF_HOME:?HF_HOME must be set to the Hugging Face cache directory}"
 export HF_HUB_OFFLINE=1
 
+# ``datasets`` builds an Arrow cache under ``${HF_HOME}/datasets``, but HF_HOME is
+# a read-only view of the NAS cache here, so point it at writable scratch space.
+export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-/tmp/hf_datasets}"
+
 # Prevent image defaults from masking the installed version or changing frontend.
 unset VLLM_VERSION 2>/dev/null || true
 export VLLM_USE_RUST_FRONTEND=0 VLLM_USE_RUST_BENCH=0
 
 export GSM8K_DATASET_PATH="${GSM8K_DATASET_PATH:?GSM8K_DATASET_PATH must be set}"
 MODEL_KEY="${MODEL_KEY:?MODEL_KEY is required}"
+MODEL_ID="${MODEL_ID:?MODEL_ID is required}"
 WHEELS_DIR="${WHEELS_DIR:?WHEELS_DIR is required}"
 RESULTS_DIR="${RESULTS_DIR:?RESULTS_DIR is required}"
 UPDATE_GOLDEN="${UPDATE_GOLDEN:-0}"
@@ -55,12 +62,16 @@ echo "GOLDEN_SEED_DIR=${GOLDEN_SEED_DIR:-/source/tests/e2e/models/_golden}"
 python -c 'import sys; print("python", sys.version)'
 
 # ------------------------------------------------------------------
-log "prepare SAIL PyTorch stack"
+# `capture` records the stack the image already ships. `prepare` would fetch a
+# torch tarball from the internal artifactory and swap it in, but that endpoint
+# answers 401 from the runners and the image torch is what the smoke lane
+# serves models with, so there is nothing to replace.
+log "capture SAIL PyTorch stack"
 WHEELS_DIR="$(cd -- "${WHEELS_DIR}" && pwd)"
 python "${ROOT_DIR}/scripts/ci/ppu_wheel_manifest.py" verify "${WHEELS_DIR}"
 
 export PIP_CONSTRAINT="${RESULTS_DIR}/image-constraints.txt"
-python "${ROOT_DIR}/scripts/ci/ppu_image_stack.py" prepare \
+python "${ROOT_DIR}/scripts/ci/ppu_image_stack.py" capture \
     --sdk /usr/local/PPU_SDK --output "${RESULTS_DIR}/image-stack.json" \
     --constraints "${PIP_CONSTRAINT}"
 
@@ -83,7 +94,7 @@ PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ \
 
 # Install accuracy evaluation dependencies (not in dev.txt, needs a real device)
 PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ \
-    python -m pip install "evalscope>=0.6,<1.0"
+    python -m pip install "evalscope==1.14.1"
 
 # Verify evalscope is importable
 python -c "from evalscope import TaskConfig, run_task; print('evalscope OK')"
@@ -108,6 +119,20 @@ print("Capability:", current_platform.get_device_capability())
 print("vLLM:", vllm.__version__)
 print("vLLM SAIL:", vllm_sail.__version__)
 PY
+
+# ------------------------------------------------------------------
+# The offline cache is a view tree over a separate checkpoint export. Verify
+# the repo is there before vLLM starts: a missing snapshot otherwise surfaces
+# as a bare LocalEntryNotFoundError twelve minutes into engine startup.
+log "resolve model path"
+MODEL_PATH=$(python - "${MODEL_ID}" <<'PY'
+import sys
+from huggingface_hub import snapshot_download
+
+print(snapshot_download(repo_id=sys.argv[1], local_files_only=True))
+PY
+) || { echo "ERROR: Cannot resolve model_id '${MODEL_ID}' from HF cache"; exit 1; }
+echo "Resolved model_id '${MODEL_ID}' -> '${MODEL_PATH}'"
 
 # ------------------------------------------------------------------
 log "run accuracy eval: ${MODEL_KEY}"
