@@ -614,20 +614,25 @@ def test_sibling_cases_over_one_weight_share_the_contract() -> None:
     assert len(contracts) == 1
 
 
-def test_golden_coverage_names_the_weight_without_a_baseline() -> None:
-    """Every accuracy weight has a golden except the one with no reference.
-
-    GLM-5.3-Flash is deliberately absent: the shared GSM8K summary has no row
-    for it, so the case runs on the threshold gate and uploads a
-    pending-review artifact until a real number exists.
-    """
+def test_accuracy_catalog_checkpoints_have_goldens() -> None:
     covered = {
         json.loads(path.read_text())["model"] for path in GOLDEN.glob("accuracy_*.json")
     }
     catalog_keys = {
         entry["model_key"] for entry in _catalog() if entry["category"] == "accuracy"
     }
-    assert covered == catalog_keys - {"glm_5_3_flash_mxfp4"}
+    assert covered == catalog_keys
+
+
+def test_glm_flash_890p_golden_uses_a_logical_dataset_id() -> None:
+    record = json.loads((GOLDEN / "accuracy_glm_5_3_flash_mxfp4_890p.json").read_text())
+    assert record["dataset"]["dataset_id"] == "gsm8k@2026-11"
+    assert record["dataset"]["num_expected"] == 1319
+    assert record["tolerance"] == {"mode": "band", "abs": 0.02}
+    assert (
+        round(record["score"] * record["dataset"]["num_expected"])
+        == record["score_num"]
+    )
 
 
 def test_accuracy_matrix_rejects_entry_without_model_key() -> None:
