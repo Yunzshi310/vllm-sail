@@ -141,18 +141,16 @@ jobs:
               sys.exit(0)
 
           catalog = json.loads(select.CATALOG.read_text())
+          scheduled_recipes = os.environ["SCHEDULED_RECIPE_ENABLED"] == "true"
           try:
               selected = select.build_accuracy_matrix(catalog, requested)["include"]
+              if scheduled_recipes:
+                  legacy_cases = select.scheduled_legacy_accuracy_cases(selected)
+              else:
+                  # Use catalog case IDs as keys to distinguish serving variants.
+                  legacy_cases = [entry["case_id"] for entry in selected]
           except ValueError as error:
-              # A typo in the dispatch input must fail the run, not crash it.
               sys.exit(str(error))
-          # The reusable call takes catalog keys, so hand it the case id: it is
-          # the catalog key and the only label that stays unique when two cases
-          # exercise one checkpoint with different serve arguments.
-          legacy_cases = [entry["case_id"] for entry in selected]
-          scheduled_recipes = os.environ["SCHEDULED_RECIPE_ENABLED"] == "true"
-          if scheduled_recipes:
-              legacy_cases = select.scheduled_legacy_accuracy_cases(selected)
           if not legacy_cases and not scheduled_recipes:
               sys.exit(f"no accuracy model selected by MODELS={requested!r}")
 

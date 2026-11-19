@@ -365,7 +365,7 @@ def test_pr_pipeline_structure():
         "default": False,
     }
     assert inputs["skip_device_tests"] == {
-        "description": "Build wheels only, without pin-UT, fast sanity or upstream-reuse lanes",
+        "description": "Build wheels only, without pin-UT, model checks or upstream-reuse lanes",
         "type": "boolean",
         "default": False,
     }
@@ -382,6 +382,7 @@ def test_pr_pipeline_structure():
         "runtime-image",
         "build",
         "pin-unit-tests",
+        "model-tests",
         "recipe-sanity",
         "upstream-reuse",
         "gate",
@@ -413,6 +414,7 @@ def test_pr_pipeline_structure():
         "runtime-image",
         "build",
         "pin-unit-tests",
+        "model-tests",
         "recipe-sanity",
         "upstream-reuse",
     ]
@@ -430,6 +432,7 @@ def test_pr_pipeline_structure():
     assert "smoke" not in gate["run"]
     for job_id, name, target in (
         ("pin-unit-tests", "PPU pin UT", "_ppu-pin-ut.yaml"),
+        ("model-tests", "PPU model tests", "_ppu-model-tests.yaml"),
         ("recipe-sanity", "PPU recipe fast sanity", "_ppu-recipe-fast-sanity.yaml"),
         ("upstream-reuse", "PPU upstream reuse", "_ppu-upstream-reuse.yaml"),
     ):
@@ -464,6 +467,7 @@ def test_docs_only_call_uses_hosted_gate_without_ppu_jobs():
         "runtime-image",
         "build",
         "pin-unit-tests",
+        "model-tests",
         "recipe-sanity",
         "upstream-reuse",
     ):
@@ -483,6 +487,7 @@ def test_docs_only_call_uses_hosted_gate_without_ppu_jobs():
                         "runtime-image",
                         "build",
                         "pin-unit-tests",
+                        "model-tests",
                         "recipe-sanity",
                         "upstream-reuse",
                     )
@@ -513,7 +518,7 @@ def test_skip_device_tests_guards_the_device_lanes():
     }
     # Building wheels for a lane that tests elsewhere must not also allocate
     # the pin-UT and Fast Sanity hosts.
-    for job_id in ("pin-unit-tests", "recipe-sanity", "upstream-reuse"):
+    for job_id in ("pin-unit-tests", "model-tests", "recipe-sanity", "upstream-reuse"):
         assert not expression(jobs[job_id]["if"], context)
     assert expression(jobs["build"]["if"], context)
     assert expression(jobs["gate"]["if"], context)
@@ -532,6 +537,7 @@ def test_gate_honours_skip_device_tests(skip_device_tests, returncode):
                 "runtime-image": {"result": "success"},
                 "build": {"result": "success"},
                 "pin-unit-tests": {"result": "skipped"},
+                "model-tests": {"result": "skipped"},
                 "recipe-sanity": {"result": "skipped"},
                 "upstream-reuse": {"result": "skipped"},
             }
@@ -894,6 +900,7 @@ def test_removing_ci_preview_cancels_active_preview_without_starting_jobs():
     [
         ("build", "_ppu-build.yaml", ["build"]),
         ("pin-unit-tests", "_ppu-pin-ut.yaml", ["pin-unit-tests"]),
+        ("model-tests", "_ppu-model-tests.yaml", ["prepare", "e2e"]),
         ("recipe-sanity", "_ppu-recipe-fast-sanity.yaml", ["prepare", "sanity"]),
         ("upstream-reuse", "_ppu-upstream-reuse.yaml", ["upstream-reuse"]),
     ],
@@ -1265,7 +1272,10 @@ def test_gate_executes_fail_closed_truth_table(
             monkeypatch.setenv(
                 key, str(resolved).lower() if isinstance(resolved, bool) else resolved
             )
-    results = {"runtime-image": {"result": "success"}}
+    results = {
+        "runtime-image": {"result": "success"},
+        "model-tests": {"result": "skipped"},
+    }
     results.update(
         zip(
             (
@@ -1382,22 +1392,27 @@ def test_recipe_capability_probes_candidate_checkout(build_jobs, tmp_path, missi
     assert bool(expression(build_jobs["recipe-sanity"]["if"], context)) == (
         missing is None
     )
+    assert bool(expression(build_jobs["model-tests"]["if"], context)) == (
+        missing is not None
+    )
 
 
 @pytest.mark.parametrize(
-    "outputs,outcome,passed",
+    "outputs,outcome,legacy_outcome,expected_error",
     [
-        ({"recipe_sanity": "false"}, "skipped", True),
-        ({"recipe_sanity": "false"}, "failure", False),
-        ({"recipe_sanity": "true"}, "success", True),
-        ({"recipe_sanity": "true"}, "skipped", False),
-        ({"recipe_sanity": "true"}, "failure", False),
-        ({"recipe_sanity": ""}, "skipped", False),
-        ({}, "skipped", False),
+        ({"recipe_sanity": "false"}, "skipped", "success", None),
+        ({"recipe_sanity": "false"}, "skipped", "skipped", "model-tests"),
+        ({"recipe_sanity": "false"}, "skipped", "failure", "model-tests"),
+        ({"recipe_sanity": "false"}, "failure", "success", "recipe-sanity"),
+        ({"recipe_sanity": "true"}, "success", "skipped", None),
+        ({"recipe_sanity": "true"}, "skipped", "skipped", "recipe-sanity"),
+        ({"recipe_sanity": "true"}, "failure", "skipped", "recipe-sanity"),
+        ({"recipe_sanity": ""}, "skipped", "skipped", "recipe-sanity"),
+        ({}, "skipped", "skipped", "recipe-sanity"),
     ],
 )
 def test_recipe_gate_accepts_skip_only_for_unsupported_source(
-    build_jobs, outputs, outcome, passed
+    build_jobs, outputs, outcome, legacy_outcome, expected_error
 ):
     script = build_jobs["gate"]["steps"][0]["run"].replace(
         "python - <<'PYTHON'", f"{sys.executable} - <<'PYTHON'"
@@ -1405,6 +1420,7 @@ def test_recipe_gate_accepts_skip_only_for_unsupported_source(
     results = {key: {"result": "success"} for key in build_jobs["gate"]["needs"]}
     results["runtime-image"]["outputs"] = outputs
     results["recipe-sanity"]["result"] = outcome
+    results["model-tests"]["result"] = legacy_outcome
     result = subprocess.run(
         ["bash", "-e", "-c", script],
         env={
@@ -1419,11 +1435,11 @@ def test_recipe_gate_accepts_skip_only_for_unsupported_source(
         capture_output=True,
         text=True,
     )
-    assert (result.returncode == 0) is passed, result.stderr
-    if passed and outcome == "skipped":
+    assert (result.returncode == 0) == (expected_error is None), result.stderr
+    if expected_error is None and outcome == "skipped":
         assert "source does not support Recipe Fast Sanity" in result.stdout
-    if not passed:
-        assert f"recipe-sanity did not succeed: {outcome}" in result.stderr
+    if expected_error:
+        assert f"{expected_error} did not succeed" in result.stderr
 
 
 @pytest.mark.parametrize("supported", ["true", "false", None])
@@ -1443,6 +1459,7 @@ def test_upstream_reuse_lane_requires_the_entry_script(build_jobs, supported):
     )
     # Only the reuse lane depends on the entry script.
     context["vars.PPU_RECIPE_PUBLIC_ENABLED"] = "true"
+    context["needs.runtime-image.outputs.recipe_sanity"] = "true"
     for job_id in ("pin-unit-tests", "recipe-sanity"):
         assert expression(build_jobs[job_id]["if"], context)
 
@@ -1467,6 +1484,7 @@ def test_gate_accepts_skipped_reuse_only_without_the_entry_script(
     results = {
         "runtime-image": {"result": "success", "outputs": outputs},
         "build": {"result": "success"},
+        "model-tests": {"result": "skipped"},
         "recipe-sanity": {"result": "success"},
     }
     results.update(
@@ -1694,8 +1712,14 @@ def test_accuracy_nightly_routes_selected_models(
             entry["key"] for entry in catalog if entry["category"] == "accuracy"
         ]
         if event == "schedule" and recipe_enabled:
-            expected.remove("glm-5.3-mxfp4-tp4")
-            expected.remove("deepseek-v4-mxfp4")
+            claimed = {
+                case_id
+                for path in (ROOT / "tests/ppu/policy/models").glob("*.yaml")
+                for case_id in yaml.safe_load(path.read_text()).get(
+                    "replaces_legacy_cases", []
+                )
+            }
+            expected = [case_id for case_id in expected if case_id not in claimed]
         assert [
             entry["model"] for entry in json.loads(legacy_matrix)["include"]
         ] == expected
