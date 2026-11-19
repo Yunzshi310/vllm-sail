@@ -145,6 +145,8 @@ def test_scheduled_recipe_rejects_invalid_policy_claims(
 
     monkeypatch.setattr(ppu_recipe, "REPO_ROOT", tmp_path)
     policy_dir = tmp_path / "tests/ppu/policy/models"
+    # Isolate the TP policy's layout mismatch from the real DP+EP claim.
+    (policy_dir / "deepseek-v4-flash-dp-ep.yaml").unlink()
     path = policy_dir / "deepseek-v4-flash.yaml"
     policy = yaml.safe_load(path.read_text())
     policy["replaces_legacy_cases"] = [claim]
@@ -156,23 +158,31 @@ def test_scheduled_recipe_rejects_invalid_policy_claims(
         select.scheduled_legacy_accuracy_cases(selected)
 
 
-def test_scheduled_recipe_replaces_qwen_tp4_but_keeps_dp_ep() -> None:
-    """The TP4 recipe claims only its own legacy case.
-
-    The 8-card DP+EP case keeps running on the legacy lane until its own
-    preset lands, so the nightly must not drop it early.
-    """
+def test_scheduled_recipe_dp_ep_removes_only_its_two_legacy_cases(
+    tmp_path, monkeypatch
+) -> None:
     select = _load_select()
     selected = select.build_accuracy_matrix(_catalog(), "")["include"]
     remaining = select.scheduled_legacy_accuracy_cases(selected)
-    assert "qwen3.8-flash-next-tp4" not in remaining
-    assert "qwen3.8-flash-next-dp-ep" in remaining
+
+    shutil.copytree(ROOT / "tests/ppu", tmp_path / "tests/ppu")
+    policy_dir = tmp_path / "tests/ppu/policy/models"
+    (policy_dir / "deepseek-v4-flash-dp-ep.yaml").unlink()
+    (policy_dir / "qwen3.8-flash-next-dp-ep.yaml").unlink()
+    monkeypatch.setattr(select, "REPO_ROOT", tmp_path)
+    import ppu_recipe
+
+    monkeypatch.setattr(ppu_recipe, "REPO_ROOT", tmp_path)
+    before_dp_ep = select.scheduled_legacy_accuracy_cases(selected)
+    retired = {"deepseek-v4-mxfp4-dp-ep", "qwen3.8-flash-next-dp-ep"}
+    assert retired <= set(before_dp_ep)
+    assert remaining == [key for key in before_dp_ep if key not in retired]
 
 
 def test_scheduled_recipe_restores_qwen_tp4_when_the_policy_is_removed(
     tmp_path, monkeypatch
 ) -> None:
-    """Disabling the recipe must fall back to the full legacy schedule."""
+    """Removing the TP4 policy restores its own legacy case."""
     select = _load_select()
     shutil.copytree(ROOT / "tests/ppu", tmp_path / "tests/ppu")
     (tmp_path / "tests/ppu/policy/models/qwen3.8-flash-next.yaml").unlink()
@@ -184,7 +194,7 @@ def test_scheduled_recipe_restores_qwen_tp4_when_the_policy_is_removed(
     selected = select.build_accuracy_matrix(_catalog(), "")["include"]
     remaining = select.scheduled_legacy_accuracy_cases(selected)
     assert "qwen3.8-flash-next-tp4" in remaining
-    assert "qwen3.8-flash-next-dp-ep" in remaining
+    assert "qwen3.8-flash-next-dp-ep" not in remaining
 
 
 @pytest.mark.parametrize(

@@ -17,7 +17,8 @@ ppu:
     - tool_calling
     - reasoning
     - spec_decoding
-  external_env: []
+  external_env:
+    - HGGC_EMBEDDED_COPY_THRESHOLD
 model:
   model_id: Qwen/Qwen3.8-Flash-Next
   base_args:
@@ -64,11 +65,29 @@ hardware_overrides:
   zhenwu_m890:
     extra_args: []
     extra_env: {}
-presets: {}
+presets:
+  dp_ep_low_latency:
+    hardware: zhenwu_m890
+    remove_args:
+      - --tensor-parallel-size
+    args:
+      - --data-parallel-size
+      - "8"
+      - --enable-expert-parallel
+      - --all2all-backend
+      - deepep_low_latency
+      - --engram-config
+      - '{"cpu_offload": true, "embedding_across_dp": true}'
+      - --gpu-memory-utilization
+      - "0.9"
+    env:
+      VLLM_PLE_CPU_OFFLOAD: "1"
+      HGGC_EMBEDDED_COPY_THRESHOLD: "0x10000"
+      VLLM_ENGINE_READY_TIMEOUT_S: "6000"
 notes: >-
   Default baseline matches the qwen3.8-flash-next-tp4 catalog entry (TP4 on 4
   Zhenwu M890 cards with qwen3_xml tool-call and qwen3 reasoning parsers, MTP
   speculative decoding with 3 draft tokens, and the ppu-deep-gemm MoE
-  backend). Prefix caching is injected by the executor from the test policy,
-  not hardcoded here. The dp_ep_low_latency preset for the 8-card DP+EP case
-  is tracked separately and will replace qwen3.8-flash-next-dp-ep.
+  backend). Prefix caching is injected by the executor from the test policy.
+  The dp_ep_low_latency preset uses eight Zhenwu M890 cards with DP8 and
+  expert parallelism.

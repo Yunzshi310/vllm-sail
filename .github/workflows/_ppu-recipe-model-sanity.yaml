@@ -158,6 +158,7 @@ jobs:
           RECIPE_PATH: ${{ matrix.model.recipe_path }}
           POLICY_PATH: ${{ matrix.model.policy_path }}
           TIER: model_sanity
+          PRESET: ${{ matrix.model.preset || '' }}
           PPU_CI_QUEUE_S: ${{ steps.runtime.outputs.queue_s }}
         run: |
           umask 077
