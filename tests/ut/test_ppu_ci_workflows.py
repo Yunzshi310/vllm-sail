@@ -2068,6 +2068,18 @@ def test_recipe_retention_and_publication(
     [
         ("fast_sanity", None, None, "runtime_setup_failed"),
         (
+            "fast_sanity",
+            "fast_full",
+            "CUDA out of memory while initializing synthetic-private-weights",
+            "server_startup_out_of_memory",
+        ),
+        (
+            "fast_sanity",
+            "fast_2l",
+            "MoE backend for synthetic-private-layer is unsupported",
+            "server_startup_moe_backend",
+        ),
+        (
             "model_sanity",
             "model_sanity",
             "The size of tensor a (2) must match the size of tensor b (4)"
