@@ -81,6 +81,7 @@ jobs:
       GIT_CONFIG_NOSYSTEM: "1"
     outputs:
       upstream_reuse: ${{ steps.reuse.outputs.supported }}
+      recipe_sanity: ${{ steps.recipe.outputs.supported }}
     steps:
       - name: Prepare isolated runtime preflight checkout
         id: workspace
@@ -115,6 +116,29 @@ jobs:
           SOURCE_DIR: ${{ steps.workspace.outputs.source }}
         run: |
           if [[ -f "${SOURCE_DIR}/scripts/ci/ppu_upstream_reuse.sh" ]]; then
+            echo supported=true >> "$GITHUB_OUTPUT"
+          else
+            echo supported=false >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Detect Recipe Fast Sanity support
+        id: recipe
+        env:
+          SOURCE_DIR: ${{ steps.workspace.outputs.source }}
+        run: |
+          ci_dir="${SOURCE_DIR}/scripts/ci"
+          # Inspect the selector's dispatch branch without executing candidate code.
+          if [[ -f "$ci_dir/ppu_e2e_recipe_sanity.sh" &&
+                -f "$ci_dir/ppu_recipe.py" &&
+                -f "$ci_dir/ppu_recipe_runner.py" &&
+                -f "$ci_dir/ppu_recipe_retention.py" &&
+                -f "$ci_dir/ppu_runtime_container.sh" &&
+                -f "$ci_dir/ppu_e2e_select.py" &&
+                -d "${SOURCE_DIR}/tests/ppu/recipes" &&
+                -d "${SOURCE_DIR}/tests/ppu/policy/models" ]] &&
+             grep -Eq '^[[:space:]]*recipe-sanity\)' "$ci_dir/ppu_runtime_container.sh" &&
+             grep -Eq "^[[:space:]]*(if|elif)[[:space:]]+.*argv\\[0\\][[:space:]]*==[[:space:]]*['\"]--recipes['\"][[:space:]]*:" \
+               "$ci_dir/ppu_e2e_select.py"; then
             echo supported=true >> "$GITHUB_OUTPUT"
           else
             echo supported=false >> "$GITHUB_OUTPUT"
@@ -172,6 +196,7 @@ jobs:
       (vars.PPU_RECIPE_PUBLIC_ENABLED == '' || vars.PPU_RECIPE_PUBLIC_ENABLED == 'true') &&
       !inputs.skip_device_tests &&
       needs.runtime-image.result == 'success' &&
+      needs.runtime-image.outputs.recipe_sanity == 'true' &&
       (github.event_name != 'pull_request' ||
       ((((github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
       github.event.label.name == 'ci-preview')) &&
@@ -264,6 +289,10 @@ jobs:
           if build != "success" and not (build == "skipped" and reuse):
               raise SystemExit(f"build did not succeed or use validated wheels: {build}")
           skip_device_tests = os.environ["SKIP_DEVICE_TESTS"] == "true"
+          recipe_sanity_supported = (
+              results["runtime-image"].get("outputs", {}).get("recipe_sanity")
+              != "false"
+          )
           upstream_reuse_supported = (
               results["runtime-image"].get("outputs", {}).get("upstream_reuse")
               != "false"
@@ -278,6 +307,9 @@ jobs:
                   and result == "skipped"
               ):
                   print("upstream-reuse skipped: source has no scripts/ci/ppu_upstream_reuse.sh")
+                  continue
+              if job == "recipe-sanity" and not recipe_sanity_supported and result == "skipped":
+                  print("recipe-sanity skipped: source does not support Recipe Fast Sanity")
                   continue
               if result != "success":
                   raise SystemExit(f"{job} did not succeed: {result}")

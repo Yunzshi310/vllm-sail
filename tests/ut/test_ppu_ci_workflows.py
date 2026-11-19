@@ -390,7 +390,8 @@ def test_pr_pipeline_structure():
     assert runtime["runs-on"] == "8-ppu-m890p"
     assert "!inputs.skip_ppu" in runtime["if"]
     assert runtime["outputs"] == {
-        "upstream_reuse": "${{ steps.reuse.outputs.supported }}"
+        "upstream_reuse": "${{ steps.reuse.outputs.supported }}",
+        "recipe_sanity": "${{ steps.recipe.outputs.supported }}",
     }
     resolve = next(
         step
@@ -1227,6 +1228,7 @@ def test_consumers_require_build_or_valid_reuse(build_jobs, build, run_id, sourc
         "inputs.wheel_source_sha": source,
         "needs.runtime-image.result": "success",
         "needs.runtime-image.outputs.upstream_reuse": "true",
+        "needs.runtime-image.outputs.recipe_sanity": "true",
         "needs.build.result": build,
         "vars.PPU_RECIPE_PUBLIC_ENABLED": "true",
     }
@@ -1315,6 +1317,115 @@ def test_runtime_preflight_detects_the_upstream_reuse_entry_script(
     assert output.read_text() == f"supported={str(present).lower()}\n"
 
 
+@pytest.mark.parametrize(
+    "missing",
+    [
+        None,
+        "scripts/ci/ppu_e2e_recipe_sanity.sh",
+        "scripts/ci/ppu_recipe.py",
+        "scripts/ci/ppu_recipe_runner.py",
+        "scripts/ci/ppu_recipe_retention.py",
+        "scripts/ci/ppu_e2e_select.py",
+        "tests/ppu/recipes",
+        "tests/ppu/policy/models",
+        "selector dispatch",
+        "runtime dispatch",
+    ],
+)
+def test_recipe_capability_probes_candidate_checkout(build_jobs, tmp_path, missing):
+    step = next(
+        step
+        for step in build_jobs["runtime-image"]["steps"]
+        if step.get("id") == "recipe"
+    )
+    assert step["env"] == {"SOURCE_DIR": "${{ steps.workspace.outputs.source }}"}
+    for directory in ("scripts/ci", "tests/ppu/recipes", "tests/ppu/policy/models"):
+        if directory != missing:
+            (tmp_path / directory).mkdir(parents=True)
+    for script in (
+        "ppu_e2e_recipe_sanity.sh",
+        "ppu_recipe.py",
+        "ppu_recipe_runner.py",
+        "ppu_recipe_retention.py",
+        "ppu_e2e_select.py",
+        "ppu_runtime_container.sh",
+    ):
+        relative = Path("scripts/ci") / script
+        if str(relative) == missing:
+            continue
+        candidate = (ROOT / relative).read_text()
+        if script == "ppu_e2e_select.py" and missing == "selector dispatch":
+            candidate = '# A future version may support "--recipes"\n'
+        if script == "ppu_runtime_container.sh" and missing == "runtime dispatch":
+            candidate = "# An older runtime with no recipe-sanity mode.\n"
+        (tmp_path / relative).write_text(candidate)
+
+    output = tmp_path / "github-output"
+    result = subprocess.run(
+        ["bash", "-e", "-c", step["run"]],
+        env={**os.environ, "SOURCE_DIR": str(tmp_path), "GITHUB_OUTPUT": str(output)},
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    supported = str(missing is None).lower()
+    assert output.read_text() == f"supported={supported}\n"
+    context = {
+        "vars.PPU_RECIPE_PUBLIC_ENABLED": "true",
+        "github.event_name": "workflow_dispatch",
+        "inputs.existing_build_run_id": "",
+        "inputs.wheel_source_sha": "",
+        "needs.runtime-image.result": "success",
+        "needs.runtime-image.outputs.recipe_sanity": supported,
+        "needs.build.result": "success",
+    }
+    assert bool(expression(build_jobs["recipe-sanity"]["if"], context)) == (
+        missing is None
+    )
+
+
+@pytest.mark.parametrize(
+    "outputs,outcome,passed",
+    [
+        ({"recipe_sanity": "false"}, "skipped", True),
+        ({"recipe_sanity": "false"}, "failure", False),
+        ({"recipe_sanity": "true"}, "success", True),
+        ({"recipe_sanity": "true"}, "skipped", False),
+        ({"recipe_sanity": "true"}, "failure", False),
+        ({"recipe_sanity": ""}, "skipped", False),
+        ({}, "skipped", False),
+    ],
+)
+def test_recipe_gate_accepts_skip_only_for_unsupported_source(
+    build_jobs, outputs, outcome, passed
+):
+    script = build_jobs["gate"]["steps"][0]["run"].replace(
+        "python - <<'PYTHON'", f"{sys.executable} - <<'PYTHON'"
+    )
+    results = {key: {"result": "success"} for key in build_jobs["gate"]["needs"]}
+    results["runtime-image"]["outputs"] = outputs
+    results["recipe-sanity"]["result"] = outcome
+    result = subprocess.run(
+        ["bash", "-e", "-c", script],
+        env={
+            **os.environ,
+            "JOB_RESULTS": json.dumps(results),
+            "SKIP_PPU": "false",
+            "SKIP_DEVICE_TESTS": "false",
+            "RECIPE_PUBLIC_ENABLED": "true",
+            "EXISTING_BUILD_RUN_ID": "",
+            "WHEEL_SOURCE_SHA": "",
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert (result.returncode == 0) is passed, result.stderr
+    if passed and outcome == "skipped":
+        assert "source does not support Recipe Fast Sanity" in result.stdout
+    if not passed:
+        assert f"recipe-sanity did not succeed: {outcome}" in result.stderr
+
+
 @pytest.mark.parametrize("supported", ["true", "false", None])
 def test_upstream_reuse_lane_requires_the_entry_script(build_jobs, supported):
     context = {
@@ -1386,6 +1497,7 @@ def test_recipe_public_flag_controls_callers_and_gate(build_jobs, enabled):
         "inputs.existing_build_run_id": "",
         "inputs.wheel_source_sha": "",
         "needs.runtime-image.result": "success",
+        "needs.runtime-image.outputs.recipe_sanity": "true",
         "needs.build.result": "success",
         "needs.select.result": "success",
         "needs.select.outputs.recipe_models": "glm-5.3",
