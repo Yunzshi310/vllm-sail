@@ -71,6 +71,8 @@ presets:
     select:
       features:
         spec_decoding: false
+    args:
+      - --enforce-eager
   dp_ep_low_latency:
     hardware: zhenwu_m890
     remove_args:

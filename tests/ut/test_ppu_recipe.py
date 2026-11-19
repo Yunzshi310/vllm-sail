@@ -62,6 +62,7 @@ def _sample_vllm_parser() -> argparse.ArgumentParser:
     parser.add_argument("--moe-backend")
     parser.add_argument("--compilation-config")
     parser.add_argument("--engram-config")
+    parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--seed", type=int)
     parser.add_argument("--enable-prefix-caching", action="store_true")
     parser.add_argument("--no-enable-prefix-caching", action="store_true")
@@ -263,6 +264,7 @@ def test_resolve_qwen38_flash_next_matches_catalog_and_sampling_contract() -> No
     assert "--load-format" in resolved_fs["flags"]
     assert "dummy" in resolved_fs["flags"]
     assert resolved_fs["preset"] == "fast_sanity"
+    assert "--enforce-eager" in resolved_fs["flags"]
     assert resolved_fs["ppu_count"] == 4
     assert "--speculative-config" not in resolved_fs["flags"]
     idx_ov = resolved_fs["flags"].index("--hf-overrides")
