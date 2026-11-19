@@ -83,6 +83,8 @@ jobs:
     name: Select accuracy models
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      SELECT_RECIPES: ${{ vars.PPU_RECIPE_PUBLIC_ENABLED == 'true' && (github.event_name == 'schedule' || startsWith(inputs.models, 'recipe:')) }}
     outputs:
       matrix: ${{ steps.select.outputs.matrix }}
       recipe_models: ${{ steps.select.outputs.recipe_models }}
@@ -91,6 +93,15 @@ jobs:
         uses: actions/checkout@v4
         with:
           persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        if: env.SELECT_RECIPES == 'true'
+        with:
+          python-version: "3.12"
+
+      - name: Install Recipe selector dependency
+        if: env.SELECT_RECIPES == 'true'
+        run: python -m pip install --no-cache-dir PyYAML==6.0.3
 
       - name: Select accuracy models
         id: select
