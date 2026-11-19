@@ -93,7 +93,7 @@ Post one of these exact commands as a new PR comment:
 
 | Command | Behavior |
 | --- | --- |
-| `/ci run` | Run the bare CPU UT matrix, build wheels, and run the remaining runtime/source UT and model smoke tests for the current head. |
+| `/ci run` | Run the bare CPU UT matrix, build wheels, and run the remaining runtime/source UT and Recipe Fast Sanity for the current head. |
 | `/ci run --allow-stale` | Run even when the PR is behind its base branch; no automatic merge is performed. |
 | `/ci retry` | Retry failed jobs in the latest run for the current head, falling back to a full rerun if GitHub rejects the partial rerun. |
 | `/ci cancel` | Request cancellation of active PPU CI runs for this PR, including older heads. |
@@ -133,7 +133,9 @@ a repository maintainer can add the `ci-preview` label to opt the PR into the
 use the trusted default-branch `/ci` executor.
 
 The preview route uses the PR merge commit for both workflow definitions and
-source, builds fresh wheels, and runs pin UT and model tests. While the
+source, builds fresh wheels, and runs pin UT and Recipe Fast Sanity. The required
+Fast Sanity lane needs `PPU_RECIPE_PUBLIC_ENABLED=true` when device jobs run.
+Full-weight model smoke remains available through `ppu-debug.yaml`. While the
 `ci-preview` label remains present, each matching push starts a new preview and
 cancels the older preview for the same PR. Removing the label cancels an active
 preview and skips the preview jobs. Preview results do not publish or replace

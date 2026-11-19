@@ -22,6 +22,10 @@ import sys
 from pathlib import Path
 
 CATALOG = Path(__file__).resolve().parent / "ppu_e2e_models.json"
+SCHEDULED_RECIPE_REPLACEMENTS = {
+    "deepseek-v4-mxfp4": "deepseek-v4-flash",
+    "glm-5.3-mxfp4-tp4": "glm-5.3",
+}
 
 
 def _category(entry: dict) -> str:
@@ -142,6 +146,27 @@ def build_recipe_matrix(models: str, tier: str = "fast_sanity") -> dict:
             }
         )
     return {"include": include}
+
+
+def scheduled_legacy_accuracy_cases(selected: list[dict]) -> list[str]:
+    """Keep legacy cases not covered by the scheduled default Recipe matrix."""
+    recipes = {
+        entry["key"]: entry
+        for entry in build_recipe_matrix("", "model_sanity")["include"]
+    }
+    legacy_cases = []
+    for entry in selected:
+        case_id = entry["case_id"]
+        recipe = recipes.get(SCHEDULED_RECIPE_REPLACEMENTS.get(case_id))
+        if not (
+            recipe
+            and entry["board"] == "ZW-M890P"
+            and entry["model_id"] == recipe["model_id"]
+            and entry["model_key"] == recipe["golden_model_key"]
+            and entry["ppu_count"] == recipe["ppu_count"]
+        ):
+            legacy_cases.append(case_id)
+    return legacy_cases
 
 
 def main(argv: list[str]) -> int:

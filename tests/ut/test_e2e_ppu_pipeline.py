@@ -100,6 +100,27 @@ def test_catalog_keeps_smoke_and_accuracy_subsets_exact() -> None:
 
 
 @pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("board", "OAM-810E"),
+        ("model_id", "other/checkpoint"),
+        ("model_key", "other_golden"),
+        ("ppu_count", 4),
+    ],
+)
+def test_scheduled_recipe_preserves_legacy_case_when_identity_changes(
+    field, value
+) -> None:
+    select = _load_select()
+    matrix = select.build_accuracy_matrix(_catalog(), "deepseek-v4-mxfp4")
+    legacy_case = matrix["include"][0]
+    assert select.scheduled_legacy_accuracy_cases([legacy_case]) == []
+    assert select.scheduled_legacy_accuracy_cases([{**legacy_case, field: value}]) == [
+        "deepseek-v4-mxfp4"
+    ]
+
+
+@pytest.mark.parametrize(
     ("key", "board"),
     [
         ("qwen3.8-27b", "OAM-810E"),
@@ -781,7 +802,8 @@ def test_nightly_select_step_labels_jobs_with_the_case_id() -> None:
     never runs.
     """
     text = NIGHTLY_WORKFLOW.read_text()
-    assert '{"model": entry["case_id"]}' in text
+    assert 'legacy_cases = [entry["case_id"] for entry in selected]' in text
+    assert '{"model": case_id} for case_id in legacy_cases' in text
     assert "ACCURACY_MODEL_KEYS" not in text
 
 

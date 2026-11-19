@@ -451,7 +451,6 @@ def test_manual_workflow_does_not_change_pr_gate():
         "runtime-image",
         "build",
         "pin-unit-tests",
-        "model-tests",
         "recipe-sanity",
         "upstream-reuse",
     ]

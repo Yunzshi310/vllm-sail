@@ -107,8 +107,15 @@ jobs runs PPU inference or `tests/e2e`.
 
 ### Recipe sanity results
 
-The PR recipe job runs `fast_sanity`. The registered accuracy nightly runs
-`model_sanity` (including GSM8K and micro-E2E). The runner administrator must
+The PR recipe job runs `fast_sanity` in place of the legacy model smoke job.
+Full-weight Qwen smoke is still available through the manual PPU debug workflow.
+The registered accuracy nightly runs `model_sanity` (including GSM8K and
+micro-E2E). When recipes are enabled, scheduled Nightly skips the legacy
+GLM-5.3 TP4 and DeepSeek-V4-Flash MXFP4 TP8 cases covered by recipes. Other
+cases, including DeepSeek INT8 and DP+EP, still run. With recipes disabled,
+the full legacy matrix runs; manual legacy case selection is unchanged.
+
+The runner administrator must
 set `PPU_CI_PRIVATE_RESULTS_ROOT` in the runner service environment on every
 eligible runner to retain private results after the runtime container exits.
 Provision a persistent root outside the job workspace and temporary storage with
