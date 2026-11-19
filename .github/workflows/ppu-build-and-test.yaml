@@ -169,7 +169,7 @@ jobs:
     needs: [runtime-image, build]
     if: >-
       ${{ !cancelled() &&
-      vars.PPU_RECIPE_PUBLIC_ENABLED == 'true' &&
+      (vars.PPU_RECIPE_PUBLIC_ENABLED == '' || vars.PPU_RECIPE_PUBLIC_ENABLED == 'true') &&
       !inputs.skip_device_tests &&
       needs.runtime-image.result == 'success' &&
       (github.event_name != 'pull_request' ||

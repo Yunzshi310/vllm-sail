@@ -133,8 +133,10 @@ a repository maintainer can add the `ci-preview` label to opt the PR into the
 use the trusted default-branch `/ci` executor.
 
 The preview route uses the PR merge commit for both workflow definitions and
-source, builds fresh wheels, and runs pin UT and Recipe Fast Sanity. The required
-Fast Sanity lane needs `PPU_RECIPE_PUBLIC_ENABLED=true` when device jobs run.
+source, builds fresh wheels, and runs pin UT and Recipe Fast Sanity. The PR
+Fast Sanity lane runs when `PPU_RECIPE_PUBLIC_ENABLED` is unset or set to
+`true`. Setting it to `false` disables the lane. The PPU CI gate still requires
+Fast Sanity to pass whenever device checks are required.
 Full-weight model smoke remains available through `ppu-debug.yaml`. While the
 `ci-preview` label remains present, each matching push starts a new preview and
 cancels the older preview for the same PR. Removing the label cancels an active

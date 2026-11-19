@@ -1378,7 +1378,7 @@ def test_gate_accepts_skipped_reuse_only_without_the_entry_script(
     assert (result.returncode == 0) is passed, result.stderr
 
 
-@pytest.mark.parametrize("enabled", ["", "false", "true"])
+@pytest.mark.parametrize("enabled", ["", "false", "true", "typo"])
 def test_recipe_public_flag_controls_callers_and_gate(build_jobs, enabled):
     context = {
         "vars.PPU_RECIPE_PUBLIC_ENABLED": enabled,
@@ -1397,12 +1397,24 @@ def test_recipe_public_flag_controls_callers_and_gate(build_jobs, enabled):
     for job in (
         fast_manual["build"],
         fast_manual["recipe-fast-sanity"],
-        fast_leaf["prepare"],
         model_leaf["prepare"],
         accuracy_nightly["recipe-model-sanity"],
-        build_jobs["recipe-sanity"],
     ):
         assert bool(expression(job["if"], context)) == (enabled == "true")
+    assert bool(expression(fast_leaf["prepare"]["if"], context)) == (
+        enabled in ("", "true")
+    )
+    for labels in ([], ["ci-preview"]):
+        preview = {
+            **context,
+            "github.event_name": "pull_request",
+            "github.event.action": "synchronize",
+            "github.event.pull_request.draft": False,
+            "github.event.pull_request.labels.*.name": labels,
+        }
+        assert bool(expression(build_jobs["recipe-sanity"]["if"], preview)) == (
+            "ci-preview" in labels and enabled in ("", "true")
+        )
     assert (
         fast_manual["recipe-fast-sanity"]["with"]["wheel_source_sha"]
         == "${{ github.sha }}"
