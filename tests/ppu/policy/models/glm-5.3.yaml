@@ -18,9 +18,6 @@ tiers:
       prompt: "Compute 6 * 7 and reply with the integer only."
       max_tokens: 16
       temperature: 0.0
-      stream:
-        max_tokens: 128
-        enable_thinking: false
   model_sanity:
     stages:
       - id: sanity
