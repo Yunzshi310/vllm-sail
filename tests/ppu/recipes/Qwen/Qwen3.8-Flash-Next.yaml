@@ -66,6 +66,11 @@ hardware_overrides:
     extra_args: []
     extra_env: {}
 presets:
+  fast_sanity:
+    hardware: zhenwu_m890
+    select:
+      features:
+        spec_decoding: false
   dp_ep_low_latency:
     hardware: zhenwu_m890
     remove_args:

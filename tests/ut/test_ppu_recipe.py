@@ -262,6 +262,9 @@ def test_resolve_qwen38_flash_next_matches_catalog_and_sampling_contract() -> No
     )
     assert "--load-format" in resolved_fs["flags"]
     assert "dummy" in resolved_fs["flags"]
+    assert resolved_fs["preset"] == "fast_sanity"
+    assert resolved_fs["ppu_count"] == 4
+    assert "--speculative-config" not in resolved_fs["flags"]
     idx_ov = resolved_fs["flags"].index("--hf-overrides")
     assert json.loads(resolved_fs["flags"][idx_ov + 1]) == {"num_hidden_layers": 2}
 

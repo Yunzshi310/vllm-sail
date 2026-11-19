@@ -14,6 +14,7 @@ tiers:
     layer_override: 2
     fallback_full_layers: true
     cache: enabled
+    preset: fast_sanity
     probe:
       prompt: "Compute 6 * 7 and reply with the integer only."
       max_tokens: 16
