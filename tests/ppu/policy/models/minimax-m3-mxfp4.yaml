@@ -1,0 +1,15 @@
+schema_version: ppu-test-policy/v1
+model_id: MiniMaxAI/MiniMax-M3
+recipe: tests/ppu/recipes/MiniMaxAI/MiniMax-M3.yaml
+variant: mxfp4_fp8
+hardware: zhenwu_m890
+tiers:
+  fast_sanity:
+    dummy_weights: true
+    layer_override: 2
+    fallback_full_layers: true
+    cache: enabled
+    probe:
+      prompt: "Compute 6 * 7 and reply with the integer only."
+      max_tokens: 16
+      temperature: 0.0
