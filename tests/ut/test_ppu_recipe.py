@@ -315,9 +315,8 @@ def test_resolve_deepseek_v41_and_v4_pro_recipes() -> None:
 
     v4p = ppu_recipe.resolve_recipe(
         RECIPES_DIR / "deepseek-ai" / "DeepSeek-V4-Pro.yaml",
-        cache="enabled",
-        dummy_weights=True,
-        layer_override=3,
+        policy_path=POLICY_DIR / "models" / "deepseek-v4-pro.yaml",
+        tier="fast_sanity",
     )
     assert v4p["ppu_count"] == 8
     assert "--kv-cache-dtype" in v4p["flags"]

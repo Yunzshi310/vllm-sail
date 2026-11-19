@@ -1,0 +1,14 @@
+schema_version: ppu-test-policy/v1
+model_id: deepseek-ai/DeepSeek-V4-Pro
+recipe: tests/ppu/recipes/deepseek-ai/DeepSeek-V4-Pro.yaml
+hardware: zhenwu_m890
+tiers:
+  fast_sanity:
+    dummy_weights: true
+    layer_override: 3
+    fallback_full_layers: true
+    cache: enabled
+    probe:
+      prompt: "Compute 6 * 7 and reply with the integer only."
+      max_tokens: 16
+      temperature: 0.0
