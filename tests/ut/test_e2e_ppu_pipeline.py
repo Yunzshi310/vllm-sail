@@ -174,6 +174,24 @@ def test_qwen_smoke_catalog_targets_both_boards(key: str, board: str) -> None:
     assert qwen["extra_serve_flags"] == "--trust-remote-code"
 
 
+def test_scheduled_recipe_replaces_only_the_glm53_flash_legacy_case(
+    tmp_path, monkeypatch
+) -> None:
+    select = _load_select()
+    selected = select.build_accuracy_matrix(_catalog(), "")["include"]
+    remaining = select.scheduled_legacy_accuracy_cases(selected)
+    shutil.copytree(ROOT / "tests/ppu", tmp_path / "tests/ppu")
+    (tmp_path / "tests/ppu/policy/models/glm-5.3-flash.yaml").unlink()
+    monkeypatch.setattr(select, "REPO_ROOT", tmp_path)
+    import ppu_recipe
+
+    monkeypatch.setattr(ppu_recipe, "REPO_ROOT", tmp_path)
+    legacy = "glm-5.3-flash-mxfp4-tp2"
+    without_flash = select.scheduled_legacy_accuracy_cases(selected)
+    assert legacy in without_flash
+    assert remaining == [case for case in without_flash if case != legacy]
+
+
 def test_accuracy_catalog_keeps_model_ids_and_per_model_card_count() -> None:
     accuracy = {
         entry["key"]: entry for entry in _catalog() if entry["category"] == "accuracy"
