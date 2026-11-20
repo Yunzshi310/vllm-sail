@@ -9,6 +9,9 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -95,6 +98,34 @@ def test_checked_in_recipes_and_policies_validate_cleanly() -> None:
     assert report["checked_flag_sets"] >= 10
 
 
+def test_glm53_flash_matches_legacy_tp2_and_default_fast_sanity() -> None:
+    recipe = RECIPES_DIR / "zai-org" / "GLM-5.3-Flash.yaml"
+    policy = POLICY_DIR / "models" / "glm-5.3-flash.yaml"
+    legacy = next(
+        case
+        for case in json.loads((CI_DIR / "ppu_e2e_models.json").read_text())
+        if case["key"] == "glm-5.3-flash-mxfp4-tp2"
+    )
+    resolved = ppu_recipe.resolve_recipe(
+        recipe, policy_path=policy, tier="model_sanity"
+    )
+    assert resolved["ppu_count"] == legacy["ppu_count"] == 2
+    assert resolved["hf_model_id"] == legacy["model_id"]
+    assert resolved["golden_model_key"] == legacy["model_key"]
+    assert {
+        flag: value
+        for flag, value, _ in ppu_recipe._parse_flag_entries(resolved["flags"])
+        if flag != "--enable-prefix-caching"
+    } == {
+        flag: value
+        for flag, value, _ in ppu_recipe._parse_flag_entries(legacy["server_cmd"][9:])
+    }
+    fast = ppu_e2e_select.build_recipe_matrix("", "fast_sanity")["include"]
+    assert any(
+        item["key"] == "glm-5.3-flash" and item["ppu_count"] == 2 for item in fast
+    )
+
+
 def test_resolve_glm53_matches_catalog_and_supports_presets() -> None:
     recipe = RECIPES_DIR / "zai-org" / "GLM-5.3.yaml"
     policy = POLICY_DIR / "models" / "glm-5.3.yaml"
@@ -179,6 +210,123 @@ def test_resolve_dsv4_matches_catalog_and_dpep_preset() -> None:
     assert "--data-parallel-size" in resolved_dpep["flags"]
     assert "--no-enable-prefix-caching" in resolved_dpep["flags"]
     assert "--enable-prefix-caching" not in resolved_dpep["flags"]
+
+
+def test_resolve_and_validate_variant_overrides_and_policy_variant(
+    tmp_path: Path,
+) -> None:
+    recipe = RECIPES_DIR / "MiniMaxAI" / "MiniMax-M3.yaml"
+    policy = POLICY_DIR / "models" / "minimax-m3-mxfp4.yaml"
+
+    resolved_default = ppu_recipe.resolve_recipe(recipe, cache="enabled")
+    assert resolved_default["variant"] == "default"
+    assert (
+        resolved_default["hf_model_id"]
+        == "T-HEAD/MiniMax-M3-Quant-W-FP8-PerChannel-A-FP8-PerToken"
+    )
+    assert resolved_default["golden_model_key"] == "minimax-m3-fp8"
+    assert (
+        resolved_default["served_name"]
+        == "MiniMax-M3-Quant-W-FP8-PerChannel-A-FP8-PerToken"
+    )
+
+    resolved_mxfp4 = ppu_recipe.resolve_recipe(
+        recipe, policy_path=policy, tier="fast_sanity"
+    )
+    assert resolved_mxfp4["variant"] == "mxfp4_fp8"
+    assert resolved_mxfp4["hf_model_id"] == "T-HEAD/MiniMax-M3-MXFP4-FP8"
+    assert resolved_mxfp4["golden_model_key"] == "minimax-m3-mxfp4-fp8"
+    assert resolved_mxfp4["served_name"] == "minimax-m3-mxfp4-fp8"
+    assert resolved_mxfp4["ppu_count"] == 8
+    assert resolved_mxfp4["config_digest"] != resolved_default["config_digest"]
+
+    resolved_dpep = ppu_recipe.resolve_recipe(
+        recipe, variant="mxfp4_fp8", preset="dp_ep_low_latency", cache="disabled"
+    )
+    assert resolved_dpep["hf_model_id"] == "T-HEAD/MiniMax-M3-MXFP4-FP8"
+    assert resolved_dpep["ppu_count"] == 8
+    assert resolved_dpep["server_env"]["HGGC_EMBEDDED_COPY_THRESHOLD"] == "0x10000"
+    assert "--data-parallel-size" in resolved_dpep["flags"]
+    assert "--tensor-parallel-size" not in resolved_dpep["flags"]
+
+    matrix = ppu_e2e_select.build_recipe_matrix("minimax-m3-mxfp4", tier="fast_sanity")
+    assert len(matrix["include"]) == 1
+    entry = matrix["include"][0]
+    assert entry["variant"] == "mxfp4_fp8"
+    assert entry["model_id"] == "T-HEAD/MiniMax-M3-MXFP4-FP8"
+    assert entry["golden_model_key"] == "minimax-m3-mxfp4-fp8"
+
+    # Reject unknown or blank policy variant.
+    bad_pol = yaml.safe_load(policy.read_text())
+    bad_pol["variant"] = "nonexistent"
+    bad_pol_path = tmp_path / "bad_var_pol.yaml"
+    bad_pol_path.write_text(yaml.safe_dump(bad_pol), encoding="utf-8")
+    with pytest.raises(ppu_recipe.ValidationError, match="unknown variant"):
+        ppu_recipe.validate_paths([bad_pol_path], vllm_parser_mode="skip")
+
+    bad_pol["variant"] = "   "
+    bad_pol_path.write_text(yaml.safe_dump(bad_pol), encoding="utf-8")
+    with pytest.raises(ppu_recipe.ValidationError, match="must be non-empty string"):
+        ppu_recipe.validate_paths([bad_pol_path], vllm_parser_mode="skip")
+
+    # Reject invalid variant metadata and sensitive leaks.
+    base_rec = yaml.safe_load(recipe.read_text())
+    for mutator, match in (
+        (
+            lambda d: d["variants"]["mxfp4_fp8"].update({"hf_model_id": ""}),
+            "hf_model_id must be non-empty string",
+        ),
+        (
+            lambda d: d["variants"]["mxfp4_fp8"].update(
+                {"hf_model_id": "T-HEAD/" + "a" * 97}
+            ),
+            "max 96 chars",
+        ),
+        (
+            lambda d: d["variants"]["mxfp4_fp8"].update({"assets": {"model": "only"}}),
+            "missing required key",
+        ),
+        (
+            lambda d: d["variants"]["mxfp4_fp8"].update(
+                {"served_name": "/data/secret"}
+            ),
+            "local_path",
+        ),
+    ):
+        bad_rec = copy.deepcopy(base_rec)
+        mutator(bad_rec)
+        bad_rec_path = tmp_path / "bad_var_rec.yaml"
+        bad_rec_path.write_text(yaml.safe_dump(bad_rec), encoding="utf-8")
+        with pytest.raises(ppu_recipe.ValidationError, match=match):
+            ppu_recipe.validate_paths([bad_rec_path], vllm_parser_mode="skip")
+
+
+def test_resolve_deepseek_v41_and_v4_pro_recipes() -> None:
+    v41 = ppu_recipe.resolve_recipe(
+        RECIPES_DIR / "deepseek-ai" / "DeepSeek-V4.1-Flash.yaml",
+        policy_path=POLICY_DIR / "models" / "deepseek-v4.1-flash.yaml",
+        tier="fast_sanity",
+    )
+    assert v41["ppu_count"] == 8
+    assert v41["layer_override"] is None
+    assert "--hf-overrides" not in v41["flags"]
+    assert v41["hf_model_id"].endswith("Engram-MXFP8")
+    assert "--engram-config" in v41["flags"]
+    assert "--mm-encoder-tp-mode" in v41["flags"]
+    assert v41["server_env"]["VLLM_ENGINE_READY_TIMEOUT_S"] == "3600"
+
+    v4p = ppu_recipe.resolve_recipe(
+        RECIPES_DIR / "deepseek-ai" / "DeepSeek-V4-Pro.yaml",
+        policy_path=POLICY_DIR / "models" / "deepseek-v4-pro.yaml",
+        tier="fast_sanity",
+    )
+    assert v4p["ppu_count"] == 8
+    assert "--kv-cache-dtype" in v4p["flags"]
+    assert "--compilation-config" in v4p["flags"]
+    assert "--block-size" in v4p["flags"]
+    assert json.loads(v4p["flags"][v4p["flags"].index("--hf-overrides") + 1]) == {
+        "num_hidden_layers": 3
+    }
 
 
 def test_config_digest_ignores_ephemeral_endpoint_and_tracks_changes() -> None:
@@ -380,6 +528,197 @@ def test_recipe_defaults_include_every_policy_defining_the_requested_tier(
             ppu_e2e_select.build_recipe_matrix(f"{other}-only", tier)
 
 
+def test_qwen_fast_sanity_is_selected_at_tp2() -> None:
+    matrix = ppu_e2e_select.build_recipe_matrix("", tier="fast_sanity")
+    qwen = next(item for item in matrix["include"] if item["key"] == "qwen3.8-27b")
+    assert qwen["ppu_count"] == 2
+    assert qwen["model_id"] == "Qwen/Qwen3.8-27B"
+    nightly = ppu_e2e_select.build_recipe_matrix("", tier="model_sanity")
+    assert "qwen3.8-27b" not in {item["key"] for item in nightly["include"]}
+
+
+@pytest.mark.parametrize("value", [False, {"max_tokens": True}, {"max_tokens": 129}])
+def test_fast_sanity_stream_policy_checks_token_budget(value) -> None:
+    policy = yaml.safe_load((POLICY_DIR / "models" / "qwen3.8-27b.yaml").read_text())
+    policy["tiers"]["fast_sanity"]["probe"]["stream"] = value
+    with pytest.raises(ppu_recipe.ValidationError, match=r"fast_sanity\.probe\.stream"):
+        ppu_recipe.validate_policy_structure(policy, context="test policy")
+
+
+def _stream_event(delta, finish=None):
+    chunk = {"choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+    return f"data: {json.dumps(chunk)}\r\n\r\n".encode()
+
+
+_CONTENT = _stream_event({"role": "assistant", "content": "42"})
+_FINISH = _stream_event({}, finish="stop")
+_DONE = b"data: [DONE]\r\n\r\n"
+
+
+@pytest.fixture
+def probe_server():
+    calls = []
+
+    def start(stream_body, *, status=200, keep_sending=False):
+        stopped = threading.Event()
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                calls.append((self.path, body))
+                if not body.get("stream"):
+                    completed = {
+                        "choices": [
+                            {"message": {"content": "42"}, "finish_reason": "stop"}
+                        ],
+                        "usage": {"completion_tokens": 1},
+                    }
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(json.dumps(completed).encode())
+                    return
+                self.send_response(status)
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.end_headers()
+                try:
+                    self.wfile.write(stream_body)
+                    if keep_sending:
+                        while not stopped.wait(0.01):
+                            self.wfile.write(b": keepalive\n\n")
+                except OSError:
+                    pass
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(
+            target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
+        )
+        thread.start()
+        return server, thread, stopped
+
+    servers = []
+
+    def listen(*args, **kwargs):
+        server, thread, stopped = start(*args, **kwargs)
+        servers.append((server, thread, stopped))
+        return server.server_port, calls
+
+    yield listen
+    for server, thread, stopped in servers:
+        stopped.set()
+        server.shutdown()
+        thread.join()
+        server.server_close()
+
+
+@pytest.mark.parametrize(
+    ("body", "status", "reason"),
+    [
+        (_CONTENT + _FINISH + _DONE, 200, None),
+        (_CONTENT + _FINISH, 200, "missing_done"),
+        (_CONTENT, 200, "truncated_stream"),
+        (_CONTENT + _DONE, 200, "truncated_stream"),
+        (
+            _stream_event({"reasoning": "42", "content": "  "}) + _FINISH + _DONE,
+            200,
+            "empty_stream_content",
+        ),
+        (b"data: {synthetic-private-response}\n\n", 200, "invalid_stream_chunk"),
+        (b": " + b"x" * 65536, 200, "stream_response_too_large"),
+        (b"synthetic-private-response", 500, "stream_http_error"),
+    ],
+)
+def test_stream_chat_probe_validates_loopback_http(probe_server, body, status, reason):
+    port, calls = probe_server(body, status=status)
+    kwargs = {
+        "port": port,
+        "served_name": "dummy",
+        "probe": {
+            "prompt": "Say 42",
+            "stream": {"max_tokens": 64, "enable_thinking": False},
+        },
+    }
+    if reason is None:
+        result = ppu_recipe_runner._send_stream_chat_probe(**kwargs)
+        assert result["status"] == "pass"
+        assert result["content_chars"] == 2
+    else:
+        with pytest.raises(ppu_recipe_runner._StreamProbeError, match=f"^{reason}$"):
+            ppu_recipe_runner._send_stream_chat_probe(**kwargs)
+    assert calls == [
+        (
+            "/v1/chat/completions",
+            {
+                "model": "dummy",
+                "messages": [{"role": "user", "content": "Say 42"}],
+                "stream": True,
+                "temperature": 0.0,
+                "max_tokens": 64,
+                "chat_template_kwargs": {"enable_thinking": False},
+            },
+        )
+    ]
+
+
+def test_stream_probe_deadline_includes_keepalive_traffic(probe_server):
+    port, _ = probe_server(_CONTENT, keep_sending=True)
+    started = time.monotonic()
+    with pytest.raises(ppu_recipe_runner._StreamProbeError, match="^stream_timeout$"):
+        ppu_recipe_runner._send_stream_chat_probe(
+            port=port,
+            served_name="dummy",
+            probe={"prompt": "Say 42", "stream": {"max_tokens": 16}},
+            timeout=0.15,
+        )
+    assert time.monotonic() - started < 2
+
+
+def test_missing_done_fails_fast_sanity_without_restarting_server(
+    tmp_path, monkeypatch, probe_server
+):
+    port, calls = probe_server(
+        _stream_event({"content": "synthetic-private-value"}) + _FINISH
+    )
+    launches = []
+    monkeypatch.setattr(
+        ppu_recipe_runner, "_launch_resolved_server", lambda *a, **k: launches.append(a)
+    )
+    monkeypatch.setattr(ppu_recipe_runner, "_wait_server_ready", lambda *a, **k: 10.0)
+    phases = tmp_path / "phase.txt"
+    monkeypatch.setenv("PPU_RECIPE_PHASE_FILE", str(phases))
+
+    exit_code = ppu_recipe_runner.main(
+        [
+            "--recipe",
+            str(RECIPES_DIR / "Qwen" / "Qwen3.8-27B.yaml"),
+            "--policy",
+            str(POLICY_DIR / "models" / "qwen3.8-27b.yaml"),
+            "--tier",
+            "fast_sanity",
+            "--results-dir",
+            str(tmp_path),
+            "--port",
+            str(port),
+            "--vllm-parser",
+            "skip",
+        ]
+    )
+    assert exit_code == 1
+    assert len(launches) == 1
+    assert [body.get("stream", False) for _, body in calls] == [False, True]
+    assert calls[0][1]["model"] == calls[1][1]["model"]
+    summary = json.loads((tmp_path / "summary.json").read_text())
+    assert summary["status"] == "fail"
+    assert summary["attempts"][0]["stream_probe"]["error"] == "missing_done"
+    assert summary["timings"]["cold_start_s"] == 10.0
+    assert "stream_s" in summary["timings"] and "nonstream_s" in summary["timings"]
+    assert phases.read_text().strip() == "missing_done"
+    assert "synthetic-private-value" not in json.dumps(summary)
+    ppu_recipe.redact_and_verify_public_payload(summary, allow_loopback=True)
+
+
 def test_runner_fast_sanity_falls_back_from_2l_to_full_layers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -426,8 +765,46 @@ def test_runner_fast_sanity_falls_back_from_2l_to_full_layers(
         "cold_start_s": 45.0,
         "eval_s": 1.2,
         "bench_s": 0.0,
+        "nonstream_s": 1.2,
     }
     assert (tmp_path / "out" / "summary.json").is_file()
+
+
+def test_runner_fast_sanity_uses_policy_variant_and_null_layer_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[tuple[str | None, int | None]] = []
+
+    def fake_attempt(*, variant, layer_override, label, **kwargs):
+        seen.append((variant, layer_override))
+        return {
+            "mode": label,
+            "layer_override": layer_override,
+            "status": "pass",
+            "cold_start_s": 30.0,
+            "eval_s": 1.0,
+            "config_digest": "c" * 64,
+            "ppu_count": 8,
+            "probe": {"status": "pass", "elapsed_s": 1.0},
+        }
+
+    pol_doc = yaml.safe_load(
+        (POLICY_DIR / "models" / "minimax-m3-mxfp4.yaml").read_text()
+    )
+    pol_doc["tiers"]["fast_sanity"]["layer_override"] = None
+    pol_path = tmp_path / "minimax-full.yaml"
+    pol_path.write_text(yaml.safe_dump(pol_doc), encoding="utf-8")
+
+    monkeypatch.setattr(ppu_recipe_runner, "_attempt_fast_sanity_once", fake_attempt)
+    res = ppu_recipe_runner.run_fast_sanity(
+        recipe_path=RECIPES_DIR / "MiniMaxAI" / "MiniMax-M3.yaml",
+        policy_path=pol_path,
+        results_dir=tmp_path / "out",
+        parser_mode="skip",
+    )
+    assert seen == [("mxfp4_fp8", None)]
+    assert res["status"] == "pass"
+    assert res["variant"] == "mxfp4_fp8"
 
 
 @pytest.mark.parametrize(
