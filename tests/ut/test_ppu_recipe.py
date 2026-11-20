@@ -165,14 +165,22 @@ def test_resolve_glm53_matches_catalog_and_supports_presets() -> None:
     )
     assert "--load-format" in resolved_fs["flags"]
     assert "dummy" in resolved_fs["flags"]
-    idx_ov = resolved_fs["flags"].index("--hf-overrides")
-    assert json.loads(resolved_fs["flags"][idx_ov + 1]) == {"num_hidden_layers": 2}
+    assert resolved_fs["layer_override"] == "auto"
+    assert "--hf-overrides" not in resolved_fs["flags"]
+
+    resolved_fs_7l = ppu_recipe.resolve_recipe(
+        recipe, policy_path=policy, tier="fast_sanity", layer_override=7
+    )
+    idx_ov = resolved_fs_7l["flags"].index("--hf-overrides")
+    assert json.loads(resolved_fs_7l["flags"][idx_ov + 1]) == {"num_hidden_layers": 7}
+    assert resolved_fs_7l["config_digest"] != resolved_fs["config_digest"]
 
     resolved_fs_full = ppu_recipe.resolve_recipe(
         recipe, policy_path=policy, tier="fast_sanity", layer_override=None
     )
     assert "--hf-overrides" not in resolved_fs_full["flags"]
     assert resolved_fs_full["config_digest"] != resolved_fs["config_digest"]
+    assert resolved_fs_full["config_digest"] != resolved_fs_7l["config_digest"]
 
     resolved_tp8 = ppu_recipe.resolve_recipe(recipe, preset="tp8", cache="enabled")
     assert resolved_tp8["ppu_count"] == 8
@@ -411,7 +419,7 @@ def test_resolve_deepseek_v41_and_v4_pro_recipes() -> None:
         tier="fast_sanity",
     )
     assert v41["ppu_count"] == 8
-    assert v41["layer_override"] is None
+    assert v41["layer_override"] == "auto"
     assert "--hf-overrides" not in v41["flags"]
     assert v41["hf_model_id"].endswith("Engram-MXFP8")
     assert "--engram-config" in v41["flags"]
@@ -424,11 +432,20 @@ def test_resolve_deepseek_v41_and_v4_pro_recipes() -> None:
         tier="fast_sanity",
     )
     assert v4p["ppu_count"] == 8
+    assert v4p["layer_override"] == "auto"
     assert "--kv-cache-dtype" in v4p["flags"]
     assert "--compilation-config" in v4p["flags"]
     assert "--block-size" in v4p["flags"]
-    assert json.loads(v4p["flags"][v4p["flags"].index("--hf-overrides") + 1]) == {
-        "num_hidden_layers": 3
+    assert "--hf-overrides" not in v4p["flags"]
+
+    v4p_5l = ppu_recipe.resolve_recipe(
+        RECIPES_DIR / "deepseek-ai" / "DeepSeek-V4-Pro.yaml",
+        policy_path=POLICY_DIR / "models" / "deepseek-v4-pro.yaml",
+        tier="fast_sanity",
+        layer_override=5,
+    )
+    assert json.loads(v4p_5l["flags"][v4p_5l["flags"].index("--hf-overrides") + 1]) == {
+        "num_hidden_layers": 5
     }
 
 
@@ -882,21 +899,45 @@ def test_missing_done_fails_fast_sanity_without_restarting_server(
 def test_runner_fast_sanity_falls_back_from_2l_to_full_layers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    hub_dir = tmp_path / "hf_hub"
+    snap_dir = (
+        hub_dir
+        / "models--T-HEAD--GLM-5.3-MoE-Quant-W-MXFP4-A-MXFP4-Dense-Quant-W-FP8-PerChannel-A-FP8-PerToken"
+        / "snapshots"
+        / "abc123"
+    )
+    snap_dir.mkdir(parents=True)
+    (snap_dir.parent.parent / "refs").mkdir(parents=True)
+    (snap_dir.parent.parent / "refs" / "main").write_text("abc123\n", encoding="utf-8")
+    (snap_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "glm5_moe",
+                "num_hidden_layers": 78,
+                "first_k_dense_replace": 3,
+                "mlp_layer_types": ["dense"] * 3 + ["sparse"] * 75,
+                "indexer_types": ["full"] * 3 + ["shared"] * 3 + ["full"] * 72,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HUGGINGFACE_HUB_CACHE", str(hub_dir))
+
     calls: list[int | None] = []
 
     def fake_attempt(*, layer_override, label, **kwargs):
         calls.append(layer_override)
-        if layer_override == 2:
+        if layer_override == 7:
             return {
                 "mode": label,
-                "layer_override": 2,
+                "layer_override": 7,
                 "status": "fail",
                 "cold_start_s": 12.5,
                 "eval_s": 0.0,
                 "config_digest": "a" * 64,
                 "ppu_count": 4,
                 "error": ppu_recipe_runner._sanitize_error_text(
-                    "2-layer failed at /nas_aisw/datasets/x"
+                    "7-layer failed at /nas_aisw/datasets/x"
                 ),
             }
         return {
@@ -918,7 +959,9 @@ def test_runner_fast_sanity_falls_back_from_2l_to_full_layers(
         parser_mode="skip",
         queue_s=3.5,
     )
-    assert calls == [2, None]
+    assert calls == [7, None]
+    assert res["layer_inference"]["layer_override"] == 7
+    assert res["layer_inference"]["reason"] == "inferred_prefix_cover"
     assert res["status"] == "pass"
     assert res["timings"] == {
         "queue_s": 3.5,
@@ -1621,3 +1664,282 @@ def test_runtime_vllm_parser_validates_checked_in_recipes() -> None:
     report = ppu_recipe.validate_paths(files, vllm_parser_mode="required")
     assert report["parser_checked"] is True
     assert report["checked_flag_sets"] >= 10
+
+
+def _write_checkpoint(
+    root: Path,
+    config: dict,
+    *,
+    weight_keys: list[str] | None = None,
+    single_safetensors: bool = False,
+) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    if weight_keys is not None:
+        if single_safetensors:
+            header = {
+                key: {"dtype": "BF16", "shape": [1], "data_offsets": [0, 2]}
+                for key in weight_keys
+            }
+            header_bytes = json.dumps(header).encode("utf-8")
+            (root / "model.safetensors").write_bytes(
+                len(header_bytes).to_bytes(8, "little") + header_bytes + b"\x00\x00"
+            )
+        else:
+            (root / "model.safetensors.index.json").write_text(
+                json.dumps(
+                    {"weight_map": {k: "shard.safetensors" for k in weight_keys}}
+                ),
+                encoding="utf-8",
+            )
+    return root
+
+
+@pytest.mark.parametrize(
+    (
+        "case_name",
+        "config",
+        "weight_keys",
+        "flags",
+        "expected_layers",
+        "expected_reason",
+    ),
+    [
+        (
+            "homogeneous_dense_with_binary_safetensors",
+            {"model_type": "llama", "num_hidden_layers": 32},
+            [f"model.layers.{i}.mlp.down_proj.weight" for i in range(32)],
+            [],
+            2,
+            "inferred_prefix_cover",
+        ),
+        (
+            "first_dense_then_moe_kimi_style",
+            {
+                "model_type": "kimi_moe",
+                "num_hidden_layers": 61,
+                "first_k_dense_replace": 1,
+            },
+            ["model.layers.0.mlp.down_proj.weight"]
+            + [f"model.layers.{i}.mlp.experts.0.w1.weight" for i in range(1, 61)],
+            [],
+            2,
+            "inferred_prefix_cover",
+        ),
+        (
+            "vlm_vision_tower_excluded_minimax_style",
+            {
+                "model_type": "minimax_m3_vl",
+                "vision_config": {"num_hidden_layers": 32},
+                "text_config": {
+                    "model_type": "minimax_m3",
+                    "num_hidden_layers": 60,
+                    "moe_layer_freq": [0, 0, 0] + [1] * 57,
+                },
+            },
+            [
+                f"vision_tower.encoder.layers.{i}.self_attn.q_proj.weight"
+                for i in range(32)
+            ]
+            + [f"language_model.model.layers.{i}.mlp.fc1.weight" for i in range(3)]
+            + [
+                f"language_model.model.layers.{i}.block_sparse_moe.experts.{e}.w1.weight"
+                for i in range(3, 60)
+                for e in (0, 1)
+            ],
+            [],
+            4,
+            "inferred_prefix_cover",
+        ),
+        (
+            "hybrid_linear_full_attention_with_ple_qwen_style",
+            {
+                "model_type": "qwen3_5",
+                "text_config": {
+                    "num_hidden_layers": 48,
+                    "full_attention_interval": 4,
+                    "ple_layer_ids": [2],
+                    "layer_types": (
+                        [
+                            "linear_attention",
+                            "linear_attention",
+                            "linear_attention",
+                            "full_attention",
+                        ]
+                        * 12
+                    ),
+                },
+            },
+            None,
+            [],
+            4,
+            "inferred_prefix_cover",
+        ),
+        (
+            "mtp_padded_compress_ratios_dsv4_flash_style",
+            {
+                "model_type": "deepseek_v4",
+                "num_hidden_layers": 43,
+                "num_nextn_predict_layers": 3,
+                "compress_ratios": [0, 0, 4, 128] + [4, 128] * 21,
+            },
+            ["model.layers.0.mlp.down_proj.weight"]
+            + ["model.layers.1.mlp.experts.0.w1.weight"]
+            + [
+                "model.layers.2.mlp.experts.0.w1.weight",
+                "model.layers.2.self_attn.compressor.weight",
+                "model.layers.2.engram.weight",
+            ]
+            + [f"model.layers.{i}.mlp.experts.0.w1.weight" for i in range(3, 44)]
+            + [f"model.layers.{i}.self_attn.compressor.weight" for i in range(3, 44)],
+            [],
+            5,
+            "inferred_prefix_cover",
+        ),
+        (
+            "dense_linear_sparse_dsa_glm_flash_style",
+            {
+                "model_type": "glm5_moe_lite",
+                "num_hidden_layers": 45,
+                "first_k_dense_replace": 3,
+                "mlp_layer_types": ["dense"] * 3 + ["sparse"] * 42,
+                "layer_types": ["linear_attention"] * 4
+                + ["deepseek_sparse_attention"] * 41,
+            },
+            None,
+            [],
+            5,
+            "inferred_prefix_cover",
+        ),
+        (
+            "dense_shared_full_indexer_glm53_style",
+            {
+                "model_type": "glm5_moe",
+                "num_hidden_layers": 78,
+                "first_k_dense_replace": 3,
+                "mlp_layer_types": ["dense"] * 3 + ["sparse"] * 75,
+                "indexer_types": ["full"] * 3 + ["shared"] * 3 + ["full"] * 72,
+            },
+            None,
+            [],
+            7,
+            "inferred_prefix_cover",
+        ),
+        (
+            "segmented_deepseek_v41_uses_full_layers",
+            {"model_type": "deepseek_v41", "num_hidden_layers": 40},
+            [f"model.layers.{i}.self_attn.q_proj.weight" for i in range(40)],
+            [],
+            None,
+            "segmented_architecture",
+        ),
+        (
+            "unknown_segmented_20_plus_20_exceeds_cap_uses_full",
+            {"model_type": "custom_hybrid_enc_dec", "num_hidden_layers": 40},
+            [f"model.layers.{i}.encoder_attn.q_proj.weight" for i in range(20)]
+            + [f"model.layers.{i}.decoder_attn.q_proj.weight" for i in range(20, 40)],
+            [],
+            None,
+            "exceeds_override_cap",
+        ),
+        (
+            "tail_layer_specialization_exceeds_cap_uses_full",
+            {
+                "model_type": "custom_moe",
+                "num_hidden_layers": 45,
+                "moe_layers_enum": "3..44",
+                "swiglu_limits": [7.0] * 43 + [None, None],
+            },
+            None,
+            [],
+            None,
+            "exceeds_override_cap",
+        ),
+        (
+            "online_quantization_flag_uses_full_layers",
+            {"model_type": "qwen3_5", "num_hidden_layers": 64},
+            [f"model.layers.{i}.mlp.down_proj.weight" for i in range(64)],
+            ["--quantization", "w8a8_dynamic_token_symmetric_channel"],
+            None,
+            "online_quantization",
+        ),
+        (
+            "auto_map_without_weights_or_config_schedule_fails_safe_to_full",
+            {
+                "model_type": "opaque_custom",
+                "num_hidden_layers": 32,
+                "auto_map": {
+                    "AutoModelForCausalLM": "modeling_opaque.OpaqueForCausalLM"
+                },
+            },
+            None,
+            [],
+            None,
+            "missing_weight_metadata",
+        ),
+    ],
+)
+def test_infer_fast_sanity_layer_override_archetypes(
+    tmp_path: Path,
+    case_name: str,
+    config: dict,
+    weight_keys: list[str] | None,
+    flags: list[str],
+    expected_layers: int | None,
+    expected_reason: str,
+) -> None:
+    ckpt_dir = _write_checkpoint(
+        tmp_path / case_name,
+        config,
+        weight_keys=weight_keys,
+        single_safetensors=(case_name == "homogeneous_dense_with_binary_safetensors"),
+    )
+    info = ppu_recipe.infer_fast_sanity_layer_override(ckpt_dir, flags=flags)
+    assert info["layer_override"] == expected_layers
+    assert info["reason"] == expected_reason
+    assert str(tmp_path) not in json.dumps(info)
+    ppu_recipe.redact_and_verify_public_payload(info, allow_loopback=True)
+
+
+@pytest.mark.parametrize(
+    "bad_override",
+    [0, -2, True, False, 2.5, "bogus", "2"],
+)
+def test_validate_policy_rejects_invalid_layer_override(bad_override: object) -> None:
+    policy = yaml.safe_load((POLICY_DIR / "models" / "glm-5.3.yaml").read_text())
+    policy["tiers"]["fast_sanity"]["layer_override"] = bad_override
+    with pytest.raises(
+        ppu_recipe.ValidationError, match=r"fast_sanity\.layer_override"
+    ):
+        ppu_recipe.validate_policy_structure(policy, context="test policy")
+
+
+def test_resolve_cli_supports_auto_int_and_full_layer_override(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    recipe = str(RECIPES_DIR / "zai-org" / "GLM-5.3.yaml")
+    policy = str(POLICY_DIR / "models" / "glm-5.3.yaml")
+    for cli_val, expected in (("auto", "auto"), ("5", 5), ("full", None)):
+        assert (
+            ppu_recipe.main(
+                [
+                    "resolve",
+                    "--recipe",
+                    recipe,
+                    "--policy",
+                    policy,
+                    "--tier",
+                    "fast_sanity",
+                    "--layer-override",
+                    cli_val,
+                ]
+            )
+            == 0
+        )
+        out = json.loads(capsys.readouterr().out)
+        assert out["layer_override"] == expected
+        if type(expected) is int:
+            idx = out["flags"].index("--hf-overrides")
+            assert json.loads(out["flags"][idx + 1]) == {"num_hidden_layers": expected}
+        else:
+            assert "--hf-overrides" not in out["flags"]

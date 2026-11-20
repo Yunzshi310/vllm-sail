@@ -36,7 +36,9 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
 from ppu_recipe import (  # noqa: E402
+    infer_fast_sanity_layer_override,
     redact_and_verify_public_payload,
+    resolve_local_checkpoint_dir,
     resolve_recipe,
     validate_paths,
 )
@@ -719,13 +721,37 @@ def run_fast_sanity(
     probe = fs_cfg["probe"]
     fallback_full = bool(fs_cfg.get("fallback_full_layers", True))
     eff_variant = variant if variant is not None else policy.get("variant", "default")
-    configured_layers = fs_cfg.get("layer_override", 2)
+    configured_layers = fs_cfg.get("layer_override", "auto")
+    layer_inference: dict[str, Any] | None = None
+    effective_layers: int | None
+    if configured_layers == "auto":
+        if layer_mode == "full":
+            effective_layers = None
+        else:
+            base_resolved = resolve_recipe(
+                recipe_path,
+                policy_path=policy_path,
+                tier="fast_sanity",
+                variant=eff_variant,
+                preset=preset,
+                layer_override=None,
+                assets_map_path=assets_map,
+            )
+            model_dir = resolve_local_checkpoint_dir(base_resolved["resolved_model"])
+            layer_inference = infer_fast_sanity_layer_override(
+                model_dir, flags=base_resolved["flags"]
+            )
+            effective_layers = layer_inference["layer_override"]
+    else:
+        effective_layers = (
+            int(configured_layers) if configured_layers is not None else None
+        )
 
     attempts: list[dict[str, Any]] = []
     if layer_mode in {"auto", "2l", "both"} and (
-        configured_layers is not None or layer_mode in {"2l", "both"}
+        effective_layers is not None or layer_mode in {"2l", "both"}
     ):
-        two_l = int(configured_layers if configured_layers is not None else 2)
+        two_l = int(effective_layers if effective_layers is not None else 2)
         res_2l = _attempt_fast_sanity_once(
             recipe_path=recipe_path,
             policy_path=policy_path,
@@ -794,6 +820,8 @@ def run_fast_sanity(
         },
         "attempts": attempts,
     }
+    if layer_inference is not None:
+        summary["layer_inference"] = layer_inference
     if "probe" in final_attempt:
         summary["timings"]["nonstream_s"] = final_attempt["probe"]["elapsed_s"]
     if "stream_probe" in final_attempt:

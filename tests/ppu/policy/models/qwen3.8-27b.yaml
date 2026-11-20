@@ -5,7 +5,7 @@ hardware: zhenwu_m890
 tiers:
   fast_sanity:
     dummy_weights: true
-    layer_override: 2
+    layer_override: auto
     fallback_full_layers: true
     cache: enabled
     probe:
