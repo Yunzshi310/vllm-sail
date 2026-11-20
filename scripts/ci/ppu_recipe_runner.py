@@ -14,10 +14,14 @@ import os
 import re
 import secrets
 import signal
+import socket
 import subprocess
 import sys
 import time
+from collections.abc import Iterator
+from http.client import HTTPConnection, HTTPException, HTTPResponse, IncompleteRead
 from pathlib import Path
+from threading import Timer
 from typing import Any
 from urllib.error import URLError
 from urllib.request import Request, urlopen
@@ -36,6 +40,9 @@ from ppu_recipe import (  # noqa: E402
     resolve_recipe,
     validate_paths,
 )
+
+STREAM_PROBE_TIMEOUT_S = 60.0
+STREAM_PROBE_MAX_BYTES = 64 * 1024
 
 FATAL_RE = re.compile(
     r"Traceback \(most recent"
@@ -184,6 +191,16 @@ def _wait_server_ready(
     raise RuntimeError(f"server not ready within {timeout}s.\n{tail}")
 
 
+def _chat_probe_body(served_name: str, probe: dict[str, Any]) -> dict[str, Any]:
+    body: dict[str, Any] = {
+        "model": served_name,
+        "messages": [{"role": "user", "content": probe["prompt"]}],
+    }
+    if "seed" in probe:
+        body["seed"] = int(probe["seed"])
+    return body
+
+
 def _send_chat_probe(
     *,
     port: int,
@@ -191,14 +208,9 @@ def _send_chat_probe(
     probe: dict[str, Any],
     timeout: int = 180,
 ) -> dict[str, Any]:
-    body: dict[str, Any] = {
-        "model": served_name,
-        "messages": [{"role": "user", "content": probe["prompt"]}],
-        "max_completion_tokens": int(probe.get("max_tokens", 128)),
-        "temperature": float(probe.get("temperature", 0.0)),
-    }
-    if "seed" in probe:
-        body["seed"] = int(probe["seed"])
+    body = _chat_probe_body(served_name, probe)
+    body["max_completion_tokens"] = int(probe.get("max_tokens", 128))
+    body["temperature"] = float(probe.get("temperature", 0.0))
     req = Request(
         f"http://127.0.0.1:{port}/v1/chat/completions",
         data=json.dumps(body).encode("utf-8"),
@@ -231,6 +243,147 @@ def _send_chat_probe(
         "finish_reason": choice.get("finish_reason"),
         "content_chars": len(content),
         "completion_tokens": completion_tokens,
+    }
+
+
+class _StreamProbeError(RuntimeError):
+    """Carry an allowlisted failure code without response or exception text."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _stream_data_events(response: HTTPResponse) -> Iterator[bytes]:
+    remaining = STREAM_PROBE_MAX_BYTES
+    fields: list[bytes] = []
+    while line := response.readline(remaining + 1):
+        remaining -= len(line)
+        if remaining < 0:
+            raise _StreamProbeError("stream_response_too_large")
+        if not line.endswith(b"\n"):
+            break
+        line = line.rstrip(b"\r\n")
+        if not line:
+            if fields:
+                yield b"\n".join(fields)
+                fields.clear()
+            continue
+        field, _, value = line.partition(b":")
+        if field == b"data":
+            fields.append(value.removeprefix(b" "))
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError("unexpected JSON constant")
+
+
+def _check_stream_completion(response: HTTPResponse) -> int:
+    content_chars = 0
+    has_content = False
+    finished = False
+    try:
+        for event in _stream_data_events(response):
+            if event == b"[DONE]":
+                if not finished:
+                    raise _StreamProbeError("truncated_stream")
+                if not has_content:
+                    raise _StreamProbeError("empty_stream_content")
+                return content_chars
+            try:
+                chunk = json.loads(event, parse_constant=_reject_json_constant)
+                choices = chunk["choices"]
+            except (ValueError, TypeError, KeyError, RecursionError):
+                raise _StreamProbeError("invalid_stream_chunk") from None
+            if finished and choices == [] and isinstance(chunk.get("usage"), dict):
+                continue
+            if finished or not isinstance(choices, list) or len(choices) != 1:
+                raise _StreamProbeError("invalid_stream_chunk")
+            choice = choices[0]
+            if not isinstance(choice, dict) or not isinstance(
+                choice.get("delta"), dict
+            ):
+                raise _StreamProbeError("invalid_stream_chunk")
+            delta = choice["delta"]
+            if delta.get("role") not in (None, "assistant"):
+                raise _StreamProbeError("invalid_stream_chunk")
+            content = delta.get("content")
+            if content is not None:
+                if not isinstance(content, str):
+                    raise _StreamProbeError("invalid_stream_chunk")
+                content_chars += len(content)
+                has_content |= bool(content.strip())
+            finish = choice.get("finish_reason")
+            if finish is not None:
+                if not isinstance(finish, str) or not finish.strip():
+                    raise _StreamProbeError("invalid_stream_chunk")
+                finished = True
+    except (IncompleteRead, ConnectionResetError):
+        pass
+    raise _StreamProbeError("missing_done" if finished else "truncated_stream")
+
+
+def _send_stream_chat_probe(
+    *,
+    port: int,
+    served_name: str,
+    probe: dict[str, Any],
+    timeout: float = STREAM_PROBE_TIMEOUT_S,
+) -> dict[str, Any]:
+    stream = probe["stream"]
+    body = _chat_probe_body(served_name, probe)
+    body.update(stream=True, temperature=0.0, max_tokens=stream["max_tokens"])
+    if "enable_thinking" in stream:
+        body["chat_template_kwargs"] = {"enable_thinking": stream["enable_thinking"]}
+
+    started = time.monotonic()
+    deadline = started + timeout
+    connection = HTTPConnection("127.0.0.1", port=port, timeout=timeout)
+    timer = None
+    try:
+        connection.connect()
+        connected_socket = connection.sock
+        assert connected_socket is not None
+
+        def interrupt_read() -> None:
+            try:
+                connected_socket.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+        # Socket timeouts alone allow a peer to keep a request alive by sending
+        # small fragments. Shutdown also interrupts a blocked header or body read.
+        timer = Timer(max(0.0, deadline - time.monotonic()), interrupt_read)
+        timer.daemon = True
+        timer.start()
+        connection.request(
+            "POST",
+            "/v1/chat/completions",
+            body=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
+        )
+        with connection.getresponse() as response:
+            if response.status != 200:
+                raise _StreamProbeError("stream_http_error")
+            if response.headers.get_content_type() != "text/event-stream":
+                raise _StreamProbeError("invalid_stream_chunk")
+            content_chars = _check_stream_completion(response)
+        if time.monotonic() >= deadline:
+            raise _StreamProbeError("stream_timeout")
+    except (TimeoutError, OSError, HTTPException, _StreamProbeError) as exc:
+        if isinstance(exc, TimeoutError) or time.monotonic() >= deadline:
+            raise _StreamProbeError("stream_timeout") from None
+        if isinstance(exc, _StreamProbeError):
+            raise
+        raise _StreamProbeError("stream_transport_error") from None
+    finally:
+        if timer is not None:
+            timer.cancel()
+        connection.close()
+    return {
+        "status": "pass",
+        "elapsed_s": round(time.monotonic() - started, 3),
+        "content_chars": content_chars,
     }
 
 
@@ -461,6 +614,7 @@ def _attempt_fast_sanity_once(
     *,
     recipe_path: Path,
     policy_path: Path,
+    variant: str | None = None,
     preset: str | None,
     assets_map: Path | None,
     port: int,
@@ -475,6 +629,7 @@ def _attempt_fast_sanity_once(
         recipe_path,
         policy_path=policy_path,
         tier="fast_sanity",
+        variant=variant,
         preset=preset,
         layer_override=layer_override,
         assets_map_path=assets_map,
@@ -497,17 +652,33 @@ def _attempt_fast_sanity_once(
         _record_phase("chat_probe")
         t_eval0 = time.monotonic()
         probe_res = _send_chat_probe(port=port, served_name=base_name, probe=probe)
-        eval_s = round(time.monotonic() - t_eval0, 3)
-        return {
+        attempt = {
             "mode": label,
             "layer_override": layer_override,
             "status": "pass",
             "cold_start_s": cold_start_s,
-            "eval_s": eval_s,
+            "eval_s": round(time.monotonic() - t_eval0, 3),
             "config_digest": resolved["config_digest"],
             "ppu_count": resolved["ppu_count"],
             "probe": probe_res,
         }
+        if "stream" in probe:
+            _record_phase("stream_probe")
+            t_stream = time.monotonic()
+            try:
+                attempt["stream_probe"] = _send_stream_chat_probe(
+                    port=port, served_name=base_name, probe=probe
+                )
+            except _StreamProbeError as exc:
+                attempt["status"] = "fail"
+                attempt["error"] = exc.reason
+                attempt["stream_probe"] = {
+                    "status": "fail",
+                    "error": exc.reason,
+                    "elapsed_s": round(time.monotonic() - t_stream, 3),
+                }
+            attempt["eval_s"] = round(time.monotonic() - t_eval0, 3)
+        return attempt
     except Exception as exc:
         elapsed = round(time.monotonic() - t_start, 3)
         return {
@@ -530,6 +701,7 @@ def run_fast_sanity(
     policy_path: Path,
     results_dir: Path,
     assets_map: Path | None = None,
+    variant: str | None = None,
     preset: str | None = None,
     port: int = 9985,
     ready_timeout: int = 1800,
@@ -546,13 +718,18 @@ def run_fast_sanity(
     fs_cfg = policy["tiers"]["fast_sanity"]
     probe = fs_cfg["probe"]
     fallback_full = bool(fs_cfg.get("fallback_full_layers", True))
+    eff_variant = variant if variant is not None else policy.get("variant", "default")
+    configured_layers = fs_cfg.get("layer_override", 2)
 
     attempts: list[dict[str, Any]] = []
-    if layer_mode in {"auto", "2l", "both"}:
-        two_l = int(fs_cfg.get("layer_override", 2))
+    if layer_mode in {"auto", "2l", "both"} and (
+        configured_layers is not None or layer_mode in {"2l", "both"}
+    ):
+        two_l = int(configured_layers if configured_layers is not None else 2)
         res_2l = _attempt_fast_sanity_once(
             recipe_path=recipe_path,
             policy_path=policy_path,
+            variant=eff_variant,
             preset=preset,
             assets_map=assets_map,
             port=port,
@@ -563,13 +740,20 @@ def run_fast_sanity(
             label="fast_2l",
         )
         attempts.append(res_2l)
-    if layer_mode == "full" or (
-        layer_mode == "both"
-        or (layer_mode == "auto" and fallback_full and attempts[-1]["status"] != "pass")
+    if (
+        layer_mode in {"full", "both"}
+        or not attempts
+        or (
+            layer_mode == "auto"
+            and fallback_full
+            and attempts[-1]["status"] != "pass"
+            and "stream_probe" not in attempts[-1]
+        )
     ):
         res_full = _attempt_fast_sanity_once(
             recipe_path=recipe_path,
             policy_path=policy_path,
+            variant=eff_variant,
             preset=preset,
             assets_map=assets_map,
             port=port + (1 if attempts else 0),
@@ -581,15 +765,25 @@ def run_fast_sanity(
         )
         attempts.append(res_full)
 
-    passed = any(item["status"] == "pass" for item in attempts)
-    final_attempt = next(
+    stream_failure = next(
+        (
+            item
+            for item in attempts
+            if item.get("stream_probe", {}).get("status") == "fail"
+        ),
+        None,
+    )
+    final_attempt = stream_failure or next(
         (item for item in attempts if item["status"] == "pass"), attempts[-1]
     )
+    if stream_failure is not None:
+        _record_phase(stream_failure["error"])
     summary = {
         "tier": "fast_sanity",
         "model_id": policy["model_id"],
+        "variant": eff_variant,
         "preset": preset,
-        "status": "pass" if passed else "fail",
+        "status": final_attempt["status"],
         "parser_checked": val_report["parser_checked"],
         "config_digest": final_attempt["config_digest"],
         "timings": {
@@ -600,6 +794,10 @@ def run_fast_sanity(
         },
         "attempts": attempts,
     }
+    if "probe" in final_attempt:
+        summary["timings"]["nonstream_s"] = final_attempt["probe"]["elapsed_s"]
+    if "stream_probe" in final_attempt:
+        summary["timings"]["stream_s"] = final_attempt["stream_probe"]["elapsed_s"]
     redact_and_verify_public_payload(summary, allow_loopback=True)
     (results_dir / "summary.json").write_text(
         json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
@@ -683,6 +881,7 @@ def run_model_sanity(
     policy_path: Path,
     results_dir: Path,
     assets_map: Path | None = None,
+    variant: str | None = None,
     preset: str | None = None,
     port: int = 9985,
     ready_timeout: int = 3600,
@@ -725,6 +924,7 @@ def run_model_sanity(
         recipe_path,
         policy_path=policy_path,
         tier="model_sanity",
+        variant=variant,
         preset=preset,
         assets_map_path=assets_map,
         port=port,
@@ -903,6 +1103,7 @@ def run_model_sanity(
         summary = {
             "tier": "model_sanity",
             "model_id": policy["model_id"],
+            "variant": resolved["variant"],
             "hf_model_id": resolved["hf_model_id"],
             "golden_model_key": resolved["golden_model_key"],
             "preset": preset,
@@ -961,6 +1162,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--results-dir", type=Path, required=True)
     parser.add_argument("--assets-map", type=Path, default=None)
+    parser.add_argument("--variant", default=None)
     parser.add_argument("--preset", default=None)
     parser.add_argument("--port", type=int, default=9985)
     parser.add_argument("--ready-timeout", type=int, default=1800)
@@ -981,6 +1183,7 @@ def main(argv: list[str] | None = None) -> int:
             policy_path=args.policy,
             results_dir=args.results_dir,
             assets_map=args.assets_map,
+            variant=args.variant,
             preset=args.preset,
             port=args.port,
             ready_timeout=args.ready_timeout,
@@ -994,6 +1197,7 @@ def main(argv: list[str] | None = None) -> int:
             policy_path=args.policy,
             results_dir=args.results_dir,
             assets_map=args.assets_map,
+            variant=args.variant,
             preset=args.preset,
             port=args.port,
             ready_timeout=args.ready_timeout,
