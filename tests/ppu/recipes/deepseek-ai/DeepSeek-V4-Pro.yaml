@@ -38,7 +38,7 @@ model:
     - --cpu-distributed-timeout-seconds
     - "3600"
   base_env:
-    VLLM_ENGINE_READY_TIMEOUT_S: "3600"
+    VLLM_ENGINE_READY_TIMEOUT_S: "6000"
 features:
   tool_calling:
     args:

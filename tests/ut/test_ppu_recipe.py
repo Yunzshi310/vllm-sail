@@ -308,6 +308,8 @@ def test_resolve_deepseek_v41_and_v4_pro_recipes() -> None:
         tier="fast_sanity",
     )
     assert v41["ppu_count"] == 8
+    assert v41["layer_override"] is None
+    assert "--hf-overrides" not in v41["flags"]
     assert v41["hf_model_id"].endswith("Engram-MXFP8")
     assert "--engram-config" in v41["flags"]
     assert "--mm-encoder-tp-mode" in v41["flags"]
