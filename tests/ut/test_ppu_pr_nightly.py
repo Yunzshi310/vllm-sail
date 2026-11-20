@@ -162,6 +162,6 @@ def test_pr_nightly_workflow_pins_same_head_and_artifact_and_keeps_ci_status_sep
     assert all("secrets" not in job for job in jobs.values())
     command = yaml.safe_load((workflows / "run-ci-command.yml").read_text())
     assert any(
-        step.get("run") == "python -m scripts.ci.ppu_pr_nightly command"
+        step.get("run") == "python3 -m scripts.ci.ppu_pr_nightly command"
         for step in command["jobs"]["command"]["steps"]
     )
