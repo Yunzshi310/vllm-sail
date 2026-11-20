@@ -1877,6 +1877,120 @@ def _write_checkpoint(
             None,
             "missing_weight_metadata",
         ),
+        (
+            "compressed_tensors_tail_module_regex_ignore_uses_full",
+            {
+                "model_type": "llama",
+                "num_hidden_layers": 32,
+                "quantization_config": {
+                    "quant_method": "compressed-tensors",
+                    "ignore": [r"re:^model\.layers\.31\.mlp\.down_proj$"],
+                },
+            },
+            None,
+            ["--load-format", "dummy"],
+            None,
+            "exceeds_override_cap",
+        ),
+        (
+            "compressed_tensors_prefix_module_regex_ignore_selects_3l",
+            {
+                "model_type": "llama",
+                "num_hidden_layers": 32,
+                "quantization_config": {
+                    "quant_method": "compressed-tensors",
+                    "ignore": [r"re:^model\.layers\.(0|1)\.mlp\.down_proj$"],
+                },
+            },
+            None,
+            ["--load-format", "dummy"],
+            3,
+            "inferred_prefix_cover",
+        ),
+        (
+            "quark_tail_exclude_and_layer_quant_config_uses_full",
+            {
+                "model_type": "deepseek_v4",
+                "num_hidden_layers": 32,
+                "quantization_config": {
+                    "quant_method": "quark",
+                    "exclude": ["layers.31.ffn.shared_experts"],
+                },
+            },
+            None,
+            ["--load-format", "dummy"],
+            None,
+            "exceeds_override_cap",
+        ),
+        (
+            "quark_layer_quant_config_regex_tail_uses_full",
+            {
+                "model_type": "deepseek_v4",
+                "num_hidden_layers": 32,
+                "quantization_config": {
+                    "quant_method": "quark",
+                    "layer_quant_config": {
+                        r"re:layers\.31\.ffn\.shared_experts\.w1": {
+                            "weight": {"dtype": "bf16"}
+                        }
+                    },
+                },
+            },
+            None,
+            ["--load-format", "dummy"],
+            None,
+            "exceeds_override_cap",
+        ),
+        (
+            "compressed_tensors_config_groups_tail_target_uses_full",
+            {
+                "model_type": "llama",
+                "num_hidden_layers": 32,
+                "quantization_config": {
+                    "quant_method": "compressed-tensors",
+                    "config_groups": {
+                        "group_tail": {
+                            "targets": [r"re:^model\.layers\.31\.self_attn\.q_proj$"],
+                            "weights": {"num_bits": 16},
+                        }
+                    },
+                },
+            },
+            None,
+            ["--load-format", "dummy"],
+            None,
+            "exceeds_override_cap",
+        ),
+        (
+            "unresolved_layer_specific_quant_regex_fails_safe_to_full",
+            {
+                "model_type": "llama",
+                "num_hidden_layers": 32,
+                "quantization_config": {
+                    "quant_method": "compressed-tensors",
+                    "ignore": [r"re:^model\.layers\.31\.custom_proprietary_proj$"],
+                },
+            },
+            None,
+            ["--load-format", "dummy"],
+            None,
+            "unresolved_quantization_rule",
+        ),
+        (
+            "uniform_router_and_lm_head_quant_regex_control_selects_2l",
+            {
+                "model_type": "llama",
+                "num_hidden_layers": 32,
+                "quantization_config": {
+                    "quant_method": "compressed-tensors",
+                    "ignore": [r"re:.*lm_head$", r"re:.*\.mlp\.gate$"],
+                },
+            },
+            None,
+            ["--load-format", "dummy"],
+            2,
+            "inferred_prefix_cover",
+        ),
     ],
 )
 def test_infer_fast_sanity_layer_override_archetypes(
@@ -1943,3 +2057,182 @@ def test_resolve_cli_supports_auto_int_and_full_layer_override(
             assert json.loads(out["flags"][idx + 1]) == {"num_hidden_layers": expected}
         else:
             assert "--hf-overrides" not in out["flags"]
+
+
+def test_resolve_and_runner_emit_nested_hf_overrides_for_nested_text_configs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    hub_cache = tmp_path / "hub_cache"
+    rev = "3" * 40
+    qwen_snap = hub_cache / "models--Qwen--Qwen3.8-27B" / "snapshots" / rev
+    (qwen_snap.parent.parent / "refs").mkdir(parents=True)
+    (qwen_snap.parent.parent / "refs" / "main").write_text(f"{rev}\n", encoding="utf-8")
+    _write_checkpoint(
+        qwen_snap,
+        {
+            "model_type": "qwen3_5",
+            "text_config": {
+                "model_type": "qwen3_5_text",
+                "num_attention_heads": 24,
+                "num_hidden_layers": 64,
+                "full_attention_interval": 4,
+                "layer_types": (
+                    [
+                        "linear_attention",
+                        "linear_attention",
+                        "linear_attention",
+                        "full_attention",
+                    ]
+                    * 16
+                ),
+            },
+        },
+    )
+    monkeypatch.setenv("HF_HUB_CACHE", str(hub_cache))
+
+    qwen_recipe = RECIPES_DIR / "Qwen" / "Qwen3.8-27B.yaml"
+    qwen_policy = POLICY_DIR / "models" / "qwen3.8-27b.yaml"
+    resolved = ppu_recipe.resolve_recipe(
+        qwen_recipe, policy_path=qwen_policy, tier="fast_sanity", layer_override=4
+    )
+    ov_idx = resolved["argv"].index("--hf-overrides")
+    assert json.loads(resolved["argv"][ov_idx + 1]) == {
+        "text_config": {"num_hidden_layers": 4}
+    }
+
+    launched_calls: list[tuple[list[str], Path | None]] = []
+    fake_proc = type("FakeProc", (), {"pid": 999999})()
+    monkeypatch.setattr(
+        ppu_recipe_runner,
+        "_launch_resolved_server",
+        lambda res, **kw: (
+            launched_calls.append((list(res["argv"]), kw.get("model_dir"))),
+            fake_proc,
+        )[1],
+    )
+    monkeypatch.setattr(ppu_recipe_runner, "_stop_server", lambda *a, **kw: None)
+    monkeypatch.setattr(ppu_recipe_runner, "_wait_server_ready", lambda *a, **kw: 5.0)
+    monkeypatch.setattr(
+        ppu_recipe_runner,
+        "_send_chat_probe",
+        lambda **kw: {
+            "status": "pass",
+            "elapsed_s": 0.2,
+            "finish_reason": "stop",
+            "content_chars": 2,
+            "completion_tokens": 1,
+        },
+    )
+    monkeypatch.setattr(
+        ppu_recipe_runner,
+        "_send_stream_chat_probe",
+        lambda **kw: {"status": "pass", "elapsed_s": 0.15, "content_chars": 2},
+    )
+    summary = ppu_recipe_runner.run_fast_sanity(
+        recipe_path=qwen_recipe,
+        policy_path=qwen_policy,
+        results_dir=tmp_path / "qwen_out",
+        parser_mode="skip",
+    )
+    assert summary["status"] == "pass"
+    assert summary["layer_inference"]["layer_override"] == 4
+    assert len(launched_calls) == 1
+    launched_argv, launched_model_dir = launched_calls[0]
+    assert launched_model_dir == qwen_snap
+    run_ov_idx = launched_argv.index("--hf-overrides")
+    assert json.loads(launched_argv[run_ov_idx + 1]) == {
+        "text_config": {"num_hidden_layers": 4}
+    }
+
+    # Nested llm_config, thinker_config.text_config, dual root+text, and text-only control
+    llm_ckpt = _write_checkpoint(
+        tmp_path / "llm_vlm",
+        {"model_type": "internvl_chat", "llm_config": {"num_hidden_layers": 32}},
+    )
+    assert ppu_recipe.build_layer_hf_overrides(3, llm_ckpt) == {
+        "llm_config": {"num_hidden_layers": 3}
+    }
+    assert ppu_recipe.infer_fast_sanity_layer_override(llm_ckpt)["layer_override"] == 2
+
+    omni_ckpt = _write_checkpoint(
+        tmp_path / "omni_vlm",
+        {
+            "model_type": "qwen2_5_omni",
+            "thinker_config": {"text_config": {"num_hidden_layers": 28}},
+        },
+    )
+    assert ppu_recipe.build_layer_hf_overrides(4, omni_ckpt) == {
+        "thinker_config": {"text_config": {"num_hidden_layers": 4}}
+    }
+
+    dual_ckpt = _write_checkpoint(
+        tmp_path / "dual_vlm",
+        {
+            "model_type": "custom_vlm",
+            "num_hidden_layers": 40,
+            "text_config": {"num_hidden_layers": 40},
+        },
+    )
+    assert ppu_recipe.build_layer_hf_overrides(4, dual_ckpt) == {
+        "num_hidden_layers": 4,
+        "text_config": {"num_hidden_layers": 4},
+    }
+
+    flat_ckpt = _write_checkpoint(
+        tmp_path / "flat_text",
+        {"model_type": "llama", "num_hidden_layers": 64},
+    )
+    assert ppu_recipe.build_layer_hf_overrides(4, flat_ckpt) == {"num_hidden_layers": 4}
+
+
+def test_resolve_local_checkpoint_dir_honors_hf_hub_cache_precedence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    hf_home = tmp_path / "hf-home"
+    hub_cache = tmp_path / "configured-hub-cache"
+    model_id = "Example/LayerCoverage"
+    for root, rev, dense_k in (
+        (hf_home / "hub", "a" * 40, 1),
+        (hub_cache, "b" * 40, 3),
+    ):
+        repo_dir = root / "models--Example--LayerCoverage"
+        (repo_dir / "refs").mkdir(parents=True, exist_ok=True)
+        (repo_dir / "refs" / "main").write_text(rev, encoding="utf-8")
+        _write_checkpoint(
+            repo_dir / "snapshots" / rev,
+            {
+                "model_type": "llama",
+                "num_hidden_layers": 32,
+                "first_k_dense_replace": dense_k,
+            },
+        )
+
+    both_env = {
+        "HF_HOME": str(hf_home),
+        "HF_HUB_CACHE": str(hub_cache),
+        "HF_HUB_OFFLINE": "1",
+    }
+    selected = ppu_recipe.resolve_local_checkpoint_dir(model_id, env=both_env)
+    assert selected == hub_cache / "models--Example--LayerCoverage" / "snapshots" / (
+        "b" * 40
+    )
+    assert ppu_recipe.infer_fast_sanity_layer_override(selected)["layer_override"] == 4
+
+    home_only = ppu_recipe.resolve_local_checkpoint_dir(
+        model_id, env={"HF_HOME": str(hf_home)}
+    )
+    assert home_only == (
+        hf_home / "hub" / "models--Example--LayerCoverage" / "snapshots" / ("a" * 40)
+    )
+    assert ppu_recipe.infer_fast_sanity_layer_override(home_only)["layer_override"] == 2
+
+    # Explicit HF_HUB_CACHE must not silently fall back to stale HF_HOME/hub
+    empty_hub = tmp_path / "empty-hub-cache"
+    empty_hub.mkdir()
+    assert (
+        ppu_recipe.resolve_local_checkpoint_dir(
+            model_id,
+            env={"HF_HOME": str(hf_home), "HF_HUB_CACHE": str(empty_hub)},
+        )
+        is None
+    )

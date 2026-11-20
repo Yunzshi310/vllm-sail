@@ -594,10 +594,19 @@ def _launch_resolved_server(
     resolved: dict[str, Any],
     *,
     log_path: Path,
+    model_dir: Path | None = None,
 ) -> subprocess.Popen[bytes]:
     env = dict(os.environ)
     env.update({k: str(v) for k, v in resolved.get("server_env", {}).items()})
     env.update({k: str(v) for k, v in resolved.get("runtime_env", {}).items()})
+    if (
+        model_dir is not None
+        and model_dir.parent.name == "snapshots"
+        and model_dir.parent.parent.name.startswith("models--")
+    ):
+        hub_root = str(model_dir.parent.parent.parent)
+        env["HF_HUB_CACHE"] = hub_root
+        env["HUGGINGFACE_HUB_CACHE"] = hub_root
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_fh = log_path.open("w", encoding="utf-8")
     try:
@@ -619,6 +628,7 @@ def _attempt_fast_sanity_once(
     variant: str | None = None,
     preset: str | None,
     assets_map: Path | None,
+    model_dir: Path | None = None,
     port: int,
     ready_timeout: int,
     layer_override: int | None,
@@ -635,6 +645,7 @@ def _attempt_fast_sanity_once(
         preset=preset,
         layer_override=layer_override,
         assets_map_path=assets_map,
+        model_dir=model_dir,
         port=port,
         served_model_name=base_name,
     )
@@ -643,7 +654,7 @@ def _attempt_fast_sanity_once(
     t_start = time.monotonic()
     try:
         _record_phase("server_startup")
-        proc = _launch_resolved_server(resolved, log_path=log_path)
+        proc = _launch_resolved_server(resolved, log_path=log_path, model_dir=model_dir)
         cold_start_s = _wait_server_ready(
             proc,
             log_path,
@@ -722,22 +733,28 @@ def run_fast_sanity(
     fallback_full = bool(fs_cfg.get("fallback_full_layers", True))
     eff_variant = variant if variant is not None else policy.get("variant", "default")
     configured_layers = fs_cfg.get("layer_override", "auto")
+    base_resolved = resolve_recipe(
+        recipe_path,
+        policy_path=policy_path,
+        tier="fast_sanity",
+        variant=eff_variant,
+        preset=preset,
+        layer_override=None,
+        assets_map_path=assets_map,
+    )
+    effective_env = {
+        **os.environ,
+        **{k: str(v) for k, v in base_resolved.get("server_env", {}).items()},
+    }
+    model_dir = resolve_local_checkpoint_dir(
+        base_resolved["resolved_model"], env=effective_env
+    )
     layer_inference: dict[str, Any] | None = None
     effective_layers: int | None
     if configured_layers == "auto":
         if layer_mode == "full":
             effective_layers = None
         else:
-            base_resolved = resolve_recipe(
-                recipe_path,
-                policy_path=policy_path,
-                tier="fast_sanity",
-                variant=eff_variant,
-                preset=preset,
-                layer_override=None,
-                assets_map_path=assets_map,
-            )
-            model_dir = resolve_local_checkpoint_dir(base_resolved["resolved_model"])
             layer_inference = infer_fast_sanity_layer_override(
                 model_dir, flags=base_resolved["flags"]
             )
@@ -758,6 +775,7 @@ def run_fast_sanity(
             variant=eff_variant,
             preset=preset,
             assets_map=assets_map,
+            model_dir=model_dir,
             port=port,
             ready_timeout=ready_timeout,
             layer_override=two_l,
@@ -782,6 +800,7 @@ def run_fast_sanity(
             variant=eff_variant,
             preset=preset,
             assets_map=assets_map,
+            model_dir=model_dir,
             port=port + (1 if attempts else 0),
             ready_timeout=ready_timeout,
             layer_override=None,
