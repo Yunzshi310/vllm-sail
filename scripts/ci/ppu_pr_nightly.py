@@ -91,11 +91,11 @@ def resolve_case(source, case, recipe_enabled):
             or selected[0].get("key") != case
         ):
             raise Rejected(f"Expected one Recipe model sanity case: {case}.")
-        return "recipe"
+        return "recipe", {"include": selected}
     if legacy:
         selected = ppu_e2e_select.build_accuracy_matrix(catalog, case)["include"]
         if len(selected) == 1:
-            return "legacy"
+            return "legacy", None
     raise Rejected(f"Unknown Nightly accuracy case: {case}. See tests/ppu/README.md.")
 
 
@@ -150,14 +150,9 @@ class NightlyController(Controller):
         if result["head"]["sha"] != sha or result["state"] != "open":
             raise Rejected("PR changed; request Nightly again for the current head.")
         prefix = f"PPU PR #{number} Nightly {case} @ {sha} (comment "
-        for run in self.pages(
-            f"/actions/workflows/{WORKFLOW}/runs",
-            "workflow_runs",
-            limit=2,
-            event="workflow_dispatch",
-            branch=self.default_branch,
-            created=">=" + pr["created_at"][:10],
-        ):
+        # GitHub caps filtered run listings at 1,000 results. Filter the
+        # workflow's unfiltered pages locally so older active runs are visible.
+        for run in self.pages(f"/actions/workflows/{WORKFLOW}/runs", "workflow_runs"):
             title = run.get("display_title", "")
             if (
                 title.startswith(prefix)
@@ -272,8 +267,11 @@ class NightlyController(Controller):
 
 if __name__ == "__main__":
     if sys.argv[1:2] == ["select"]:
-        print(
-            f"lane={resolve_case(Path(sys.argv[2]), sys.argv[3], sys.argv[4] == 'true')}"
+        lane, matrix = resolve_case(
+            Path(sys.argv[2]), sys.argv[3], sys.argv[4] == "true"
         )
+        print(f"lane={lane}")
+        if matrix is not None:
+            print("recipe_matrix=" + json.dumps(matrix, separators=(",", ":")))
     else:
         raise SystemExit(ci_main(controller=NightlyController))

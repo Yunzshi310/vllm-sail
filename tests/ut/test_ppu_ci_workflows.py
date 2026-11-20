@@ -1788,22 +1788,30 @@ def test_accuracy_nightly_routes_selected_models(
     ],
 )
 def test_recipe_workflow_refuses_arbitrary_wheel_run(
-    leaf_name, pr_mode, tier, build_run, allowed
+    tmp_path, leaf_name, pr_mode, tier, build_run, allowed
 ):
     prepare = workflow(leaf_name)["jobs"]["prepare"]
     select = next(step for step in prepare["steps"] if step.get("id") == "select")
-    script = select["run"].partition("python3 scripts/ci/ppu_e2e_select.py")[0]
+    selector = tmp_path / "scripts/ci/ppu_e2e_select.py"
+    selector.parent.mkdir(parents=True)
+    selector.write_text("print('recipe_matrix={\"include\":[]}')\n")
+    output = tmp_path / "github-output"
     result = subprocess.run(
-        ["bash", "-e", "-c", script],
+        ["bash", "-e", "-o", "pipefail", "-c", select["run"]],
+        cwd=tmp_path,
         env={
             **os.environ,
             "TIER": tier,
             "PR_MODE": pr_mode,
             "BUILD_RUN_ID": build_run,
             "GITHUB_RUN_ID": "101",
+            "GITHUB_OUTPUT": str(output),
+            "MODELS": "",
+            "SINGLE_CASE_MATRIX": "",
         },
     )
     assert (result.returncode == 0) is allowed
+    assert output.exists() is allowed
 
 
 @pytest.mark.parametrize(

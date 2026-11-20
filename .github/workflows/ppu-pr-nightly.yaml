@@ -57,6 +57,7 @@ jobs:
       contents: read
     outputs:
       lane: ${{ steps.select.outputs.lane }}
+      recipe_matrix: ${{ steps.select.outputs.recipe_matrix }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -94,7 +95,7 @@ jobs:
   recipe:
     name: PR Nightly Recipe
     needs: [select, build]
-    if: needs.select.outputs.lane == 'recipe'
+    if: needs.select.outputs.lane == 'recipe' && needs.select.outputs.recipe_matrix != ''
     permissions:
       contents: read
       actions: read
@@ -106,6 +107,7 @@ jobs:
       wheel_source_sha: ${{ inputs.head_sha }}
       build_run_id: ${{ github.run_id }}
       models: ${{ inputs.case_id }}
+      single_case_matrix: ${{ needs.select.outputs.recipe_matrix }}
 
   legacy:
     name: PR Nightly legacy accuracy

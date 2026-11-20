@@ -2354,9 +2354,6 @@ def nightly_setup(body, permission_value="write"):
         f"/actions/workflows/{WORKFLOW}/runs",
         [],
         "workflow_runs",
-        event="workflow_dispatch",
-        branch="main",
-        created=">=2026-10-01",
     )
     path = f"/actions/workflows/{WORKFLOW}/dispatches"
     gh.add("POST", ROOT + path, None)
@@ -2410,13 +2407,32 @@ def test_nightly_command_reuses_active_case_for_same_head():
             )
         ],
         "workflow_runs",
-        event="workflow_dispatch",
-        branch="main",
-        created=">=2026-10-01",
     )
     control.command()
     assert "already requested" in reply(gh)
     assert not gh.writes(path)
+
+
+@pytest.mark.parametrize("last_page", [3, 11])
+def test_nightly_command_finds_active_case_on_later_pages(last_page):
+    control, gh, path = nightly_setup("/ci run nightly glm-5.3")
+    flow = path.removesuffix("/dispatches")
+    run_path = f".github/workflows/{flow.split('/')[-1]}"
+    other = run(
+        display_title=f"PPU PR #8 Nightly glm-5.3 @ {SHA} (comment 20)",
+        path=run_path,
+    )
+    for page in range(1, last_page):
+        gh.page(f"{flow}/runs", [other] * 100, "workflow_runs", page=page)
+    active = run(
+        status="queued",
+        display_title=f"PPU PR #7 Nightly glm-5.3 @ {SHA} (comment 19)",
+        path=run_path,
+    )
+    gh.page(f"{flow}/runs", [active], "workflow_runs", page=last_page)
+    control.command()
+    assert not gh.writes(path)
+    assert "already requested" in reply(gh)
 
 
 def test_nightly_dispatcher_still_routes_formal_ci_as_before():
