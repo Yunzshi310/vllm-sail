@@ -11,36 +11,86 @@ import pytest
 import yaml
 
 from scripts.ci.ppu_ci_command import Rejected
-from scripts.ci.ppu_e2e_select import build_recipe_matrix
-from scripts.ci.ppu_pr_nightly import resolve_case
+from scripts.ci.ppu_e2e_select import (
+    CATALOG,
+    build_accuracy_matrix,
+    build_recipe_matrix,
+    scheduled_legacy_accuracy_cases,
+)
+from scripts.ci.ppu_pr_nightly import resolve_cases
 
 ROOT = Path(__file__).resolve().parents[2]
 
 
 @pytest.mark.parametrize("case", ["glm-5.3", "deepseek-v4-flash"])
 def test_resolves_a_built_in_nightly_recipe(case):
-    assert resolve_case(ROOT, case, True) == (
-        "recipe",
+    assert resolve_cases(ROOT, case, True) == (
+        [case],
         build_recipe_matrix(case, "model_sanity"),
+        [],
     )
 
 
 def test_resolves_an_exact_legacy_case_even_with_recipes_disabled():
-    assert resolve_case(ROOT, "deepseek-v4-int8-dp-ep", False) == ("legacy", None)
+    assert resolve_cases(ROOT, "deepseek-v4-int8-dp-ep", False) == (
+        [],
+        None,
+        ["deepseek-v4-int8-dp-ep"],
+    )
+
+
+def test_resolves_multiple_mixed_recipe_and_legacy_cases():
+    recipe_cases, recipe_matrix, legacy_cases = resolve_cases(
+        ROOT, "glm-5.3, deepseek-v4-int8, deepseek-v4-flash, minimax-m3-fp8", True
+    )
+    assert recipe_cases == ["glm-5.3", "deepseek-v4-flash"]
+    assert recipe_matrix == build_recipe_matrix(
+        "glm-5.3,deepseek-v4-flash", "model_sanity"
+    )
+    assert legacy_cases == ["deepseek-v4-int8", "minimax-m3-fp8"]
+
+
+def test_resolves_all_cases_deduplicated_like_scheduled_nightly():
+    recipe_cases, recipe_matrix, legacy_cases = resolve_cases(ROOT, "all", True)
+    expected_recipe = build_recipe_matrix("", "model_sanity")
+    assert recipe_matrix == expected_recipe
+    assert recipe_cases == [row["key"] for row in expected_recipe["include"]]
+    catalog = json.loads(CATALOG.read_text())
+    expected_legacy = scheduled_legacy_accuracy_cases(
+        build_accuracy_matrix(catalog, "")["include"]
+    )
+    assert legacy_cases == expected_legacy
+    # Migrated legacy cases must not run twice under `all`.
+    assert "deepseek-v4-mxfp4" not in legacy_cases
+    assert "glm-5.3-mxfp4-tp4" not in legacy_cases
+
+
+def test_resolves_all_cases_when_recipes_disabled():
+    recipe_cases, recipe_matrix, legacy_cases = resolve_cases(ROOT, "all", False)
+    assert recipe_cases == []
+    assert recipe_matrix is None
+    catalog = json.loads(CATALOG.read_text())
+    expected_legacy = [
+        row["case_id"] for row in build_accuracy_matrix(catalog, "")["include"]
+    ]
+    assert legacy_cases == expected_legacy
 
 
 @pytest.mark.parametrize(
     "case,enabled,error",
     [
         ("glm-5.3", False, "disabled"),
-        ("qwen3.8-27b", True, "failed model_sanity selection"),
+        ("qwen3.8-27b", True, "selection failed"),
         ("unknown-case", True, "Unknown"),
-        ("all", True, "one Recipe"),
+        ("glm-5.3,unknown-case", True, "Unknown"),
+        ("all,glm-5.3", True, "Cannot combine"),
+        ("glm-5.3,glm-5.3", True, "Duplicate"),
+        ("glm-5.3,", True, "Use `/ci run nightly"),
     ],
 )
 def test_invalid_or_disabled_case_never_reaches_build(case, enabled, error):
     with pytest.raises(Rejected, match=error):
-        resolve_case(ROOT, case, enabled)
+        resolve_cases(ROOT, case, enabled)
 
 
 def test_case_resolution_reads_the_candidate_instead_of_the_controller_checkout(
@@ -58,30 +108,40 @@ def test_case_resolution_reads_the_candidate_instead_of_the_controller_checkout(
     shutil.copytree(ROOT / "tests/ppu", tmp_path / "tests/ppu")
     policy_dir = tmp_path / "tests/ppu/policy/models"
     shutil.copy(policy_dir / "glm-5.3.yaml", policy_dir / "new-pr-policy.yaml")
-    assert resolve_case(tmp_path, "new-pr-case", True) == ("legacy", None)
-    lane, matrix = resolve_case(tmp_path, "new-pr-policy", True)
-    assert lane == "recipe"
+    assert resolve_cases(tmp_path, "new-pr-case", True) == ([], None, ["new-pr-case"])
+    recipe_cases, matrix, legacy_cases = resolve_cases(
+        tmp_path, "new-pr-policy,new-pr-case", True
+    )
+    assert recipe_cases == ["new-pr-policy"]
+    assert legacy_cases == ["new-pr-case"]
     assert [row["key"] for row in matrix["include"]] == ["new-pr-policy"]
     shutil.copy(policy_dir / "glm-5.3.yaml", policy_dir / "new-pr-case.yaml")
     with pytest.raises(Rejected, match="ambiguous"):
-        resolve_case(tmp_path, "new-pr-case", True)
+        resolve_cases(tmp_path, "new-pr-case", True)
 
 
-@pytest.mark.parametrize("scope", ["single", "multiple", "wrong", "scheduled"])
-def test_device_matrix_uses_the_exact_selected_case(tmp_path, scope):
-    models = "glm-5.3,deepseek-v4-flash"
-    all_cases = build_recipe_matrix(models, "model_sanity")
-    _, selected = resolve_case(ROOT, "glm-5.3", True)
+@pytest.mark.parametrize(
+    "scope",
+    ["single", "multiple", "extra", "wrong_order", "duplicate", "scheduled"],
+)
+def test_device_matrix_uses_the_exact_selected_cases(tmp_path, scope):
+    two_models = "glm-5.3,deepseek-v4-flash"
+    two_cases = build_recipe_matrix(two_models, "model_sanity")
+    _, single_case, _ = resolve_cases(ROOT, "glm-5.3", True)
+    swapped = build_recipe_matrix("deepseek-v4-flash,glm-5.3", "model_sanity")
     values = {
-        "single": json.dumps(selected),
-        "multiple": json.dumps(all_cases),
-        "wrong": json.dumps(build_recipe_matrix("deepseek-v4-flash", "model_sanity")),
-        "scheduled": "",
+        "single": ("glm-5.3", json.dumps(single_case), single_case),
+        "multiple": (two_models, json.dumps(two_cases), two_cases),
+        "extra": ("glm-5.3", json.dumps(two_cases), None),
+        "wrong_order": (two_models, json.dumps(swapped), None),
+        "duplicate": ("glm-5.3,glm-5.3", json.dumps(single_case), None),
+        "scheduled": ("", "", two_cases),
     }
+    requested_models, selected_matrix, expected = values[scope]
     output = tmp_path / "github-output"
     selector = tmp_path / "scripts/ci/ppu_e2e_select.py"
     selector.parent.mkdir(parents=True)
-    selector.write_text(f"print({('recipe_matrix=' + json.dumps(all_cases))!r})\n")
+    selector.write_text(f"print({('recipe_matrix=' + json.dumps(two_cases))!r})\n")
     recipe = yaml.safe_load(
         (ROOT / ".github/workflows/_ppu-recipe-model-sanity.yaml").read_text()
     )
@@ -90,16 +150,15 @@ def test_device_matrix_uses_the_exact_selected_case(tmp_path, scope):
         for step in recipe["jobs"]["prepare"]["steps"]
         if step.get("id") == "select"
     )
-    selected = build_recipe_matrix("glm-5.3", "model_sanity")
     env = {
         **os.environ,
-        "MODELS": "" if scope == "scheduled" else "glm-5.3",
+        "MODELS": requested_models,
         "TIER": "model_sanity",
         "PR_MODE": "false",
         "GITHUB_RUN_ID": "10",
         "BUILD_RUN_ID": "10",
         "GITHUB_OUTPUT": str(output),
-        "SINGLE_CASE_MATRIX": values[scope],
+        "SELECTED_MATRIX": selected_matrix,
     }
     result = subprocess.run(
         ["bash", "-e", "-o", "pipefail", "-c", step["run"]],
@@ -108,17 +167,16 @@ def test_device_matrix_uses_the_exact_selected_case(tmp_path, scope):
         capture_output=True,
         text=True,
     )
-    if scope in {"multiple", "wrong"}:
+    if expected is None:
         assert result.returncode != 0
         assert output.read_text() == ""
         return
     assert result.returncode == 0, result.stderr
     line = output.read_text().splitlines()[0]
-    expected = all_cases if scope == "scheduled" else selected
     assert json.loads(line.removeprefix("recipe_matrix=")) == expected
 
 
-def test_pr_nightly_workflow_pins_same_head_and_artifact_and_keeps_ci_status_separate():
+def test_pr_nightly_workflow_pins_same_head_serializes_lanes_and_keeps_ci_status_separate():
     workflows = ROOT / ".github/workflows"
     workflow = yaml.safe_load((workflows / "ppu-pr-nightly.yaml").read_text())
     assert set(workflow[True]) == {"workflow_dispatch"}
@@ -129,9 +187,11 @@ def test_pr_nightly_workflow_pins_same_head_and_artifact_and_keeps_ci_status_sep
     assert "default_branch" in jobs["validate"]["if"]
     assert jobs["select"]["needs"] == "validate"
     assert jobs["select"]["permissions"] == {"contents": "read"}
-    assert jobs["select"]["outputs"]["recipe_matrix"] == (
-        "${{ steps.select.outputs.recipe_matrix }}"
-    )
+    assert jobs["select"]["outputs"] == {
+        "recipe_models": "${{ steps.select.outputs.recipe_models }}",
+        "legacy_models": "${{ steps.select.outputs.legacy_models }}",
+        "recipe_matrix": "${{ steps.select.outputs.recipe_matrix }}",
+    }
     assert jobs["select"]["steps"][1]["with"] == {
         "ref": "${{ inputs.head_sha }}",
         "path": "candidate",
@@ -139,27 +199,37 @@ def test_pr_nightly_workflow_pins_same_head_and_artifact_and_keeps_ci_status_sep
     }
     assert jobs["build"]["needs"] == "select"
     assert jobs["build"]["with"]["pr_head_sha"] == "${{ inputs.head_sha }}"
-    for lane in ("recipe", "legacy"):
-        assert jobs[lane]["needs"] == ["select", "build"]
-        call = jobs[lane]["with"]
-        assert (
-            call["pr_head_sha"] == call["wheel_source_sha"] == "${{ inputs.head_sha }}"
-        )
-        assert call["models"] == "${{ inputs.case_id }}"
-        assert call["build_run_id"] == "${{ github.run_id }}"
-    assert jobs["recipe"]["with"]["pr_mode"] is False
-    assert jobs["recipe"]["if"] == (
-        "needs.select.outputs.lane == 'recipe' && needs.select.outputs.recipe_matrix != ''"
-    )
-    assert jobs["recipe"]["with"]["single_case_matrix"] == (
-        "${{ needs.select.outputs.recipe_matrix }}"
-    )
-    assert jobs["legacy"]["if"] == "needs.select.outputs.lane == 'legacy'"
-    assert jobs["legacy"]["with"]["pr_mode"] is True
+    assert jobs["legacy"]["needs"] == ["select", "build"]
+    assert jobs["legacy"]["if"] == "needs.select.outputs.legacy_models != ''"
+    assert jobs["legacy"]["with"] == {
+        "pr_mode": True,
+        "pr_head_sha": "${{ inputs.head_sha }}",
+        "wheel_source_sha": "${{ inputs.head_sha }}",
+        "build_run_id": "${{ github.run_id }}",
+        "models": "${{ needs.select.outputs.legacy_models }}",
+    }
+    assert jobs["recipe"]["needs"] == ["select", "build", "legacy"]
+    assert "!cancelled()" in jobs["recipe"]["if"]
+    assert "needs.select.result == 'success'" in jobs["recipe"]["if"]
+    assert "needs.build.result == 'success'" in jobs["recipe"]["if"]
+    assert "needs.select.outputs.recipe_models != ''" in jobs["recipe"]["if"]
+    assert "needs.select.outputs.recipe_matrix != ''" in jobs["recipe"]["if"]
+    assert jobs["recipe"]["with"] == {
+        "pr_mode": False,
+        "pr_head_sha": "${{ inputs.head_sha }}",
+        "wheel_source_sha": "${{ inputs.head_sha }}",
+        "build_run_id": "${{ github.run_id }}",
+        "models": "${{ needs.select.outputs.recipe_models }}",
+        "selected_matrix": "${{ needs.select.outputs.recipe_matrix }}",
+    }
     assert "needs.validate.result == 'success'" in jobs["report"]["if"]
     assert jobs["report"]["steps"][0]["with"]["ref"] == "${{ github.sha }}"
     assert all("statuses" not in job.get("permissions", {}) for job in jobs.values())
     assert all("secrets" not in job for job in jobs.values())
+
+    legacy_leaf = yaml.safe_load((workflows / "_ppu-accuracy-tests.yaml").read_text())
+    assert legacy_leaf["jobs"]["accuracy"]["strategy"]["max-parallel"] == 1
+
     command = yaml.safe_load((workflows / "run-ci-command.yml").read_text())
     assert any(
         step.get("run") == "python3 -m scripts.ci.ppu_pr_nightly command"
