@@ -731,6 +731,7 @@ def run_fast_sanity(
     fs_cfg = policy["tiers"]["fast_sanity"]
     probe = fs_cfg["probe"]
     fallback_full = bool(fs_cfg.get("fallback_full_layers", True))
+    dummy_weights = bool(fs_cfg.get("dummy_weights", True))
     eff_variant = variant if variant is not None else policy.get("variant", "default")
     configured_layers = fs_cfg.get("layer_override", "auto")
     base_resolved = resolve_recipe(
@@ -791,7 +792,15 @@ def run_fast_sanity(
             layer_mode == "auto"
             and fallback_full
             and attempts[-1]["status"] != "pass"
-            and "stream_probe" not in attempts[-1]
+            and (
+                "stream_probe" not in attempts[-1]
+                or (
+                    dummy_weights
+                    and attempts[-1].get("layer_override") is not None
+                    and attempts[-1].get("stream_probe", {}).get("error")
+                    == "empty_stream_content"
+                )
+            )
         )
     ):
         res_full = _attempt_fast_sanity_once(
@@ -810,11 +819,20 @@ def run_fast_sanity(
         )
         attempts.append(res_full)
 
+    has_passing_attempt = any(item["status"] == "pass" for item in attempts)
     stream_failure = next(
         (
             item
-            for item in attempts
+            for item in reversed(attempts)
             if item.get("stream_probe", {}).get("status") == "fail"
+            and not (
+                layer_mode == "auto"
+                and fallback_full
+                and dummy_weights
+                and item.get("layer_override") is not None
+                and item["stream_probe"].get("error") == "empty_stream_content"
+                and has_passing_attempt
+            )
         ),
         None,
     )

@@ -2128,9 +2128,14 @@ def test_resolve_and_runner_emit_nested_hf_overrides_for_nested_text_configs(
         "_send_stream_chat_probe",
         lambda **kw: {"status": "pass", "elapsed_s": 0.15, "content_chars": 2},
     )
+    auto_qwen_policy = tmp_path / "qwen-auto.yaml"
+    pol_doc = yaml.safe_load(qwen_policy.read_text(encoding="utf-8"))
+    pol_doc["tiers"]["fast_sanity"]["layer_override"] = "auto"
+    auto_qwen_policy.write_text(yaml.safe_dump(pol_doc), encoding="utf-8")
+
     summary = ppu_recipe_runner.run_fast_sanity(
         recipe_path=qwen_recipe,
-        policy_path=qwen_policy,
+        policy_path=auto_qwen_policy,
         results_dir=tmp_path / "qwen_out",
         parser_mode="skip",
     )
@@ -2326,3 +2331,151 @@ def test_default_hub_cache_resolves_nested_overrides_without_hf_env_vars(
         )
         is None
     )
+
+
+def test_short_layer_dummy_empty_stream_content_falls_back_to_full_layers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    hub_cache = tmp_path / "hub"
+    rev = "d" * 40
+    snap = hub_cache / "models--Qwen--Qwen3.8-27B" / "snapshots" / rev
+    (snap.parent.parent / "refs").mkdir(parents=True)
+    (snap.parent.parent / "refs" / "main").write_text(f"{rev}\n", encoding="utf-8")
+    _write_checkpoint(
+        snap,
+        {
+            "model_type": "qwen3_5",
+            "text_config": {
+                "model_type": "qwen3_5_text",
+                "num_attention_heads": 24,
+                "num_hidden_layers": 64,
+                "full_attention_interval": 4,
+            },
+        },
+    )
+    monkeypatch.setenv("HF_HUB_CACHE", str(hub_cache))
+
+    qwen_recipe = RECIPES_DIR / "Qwen" / "Qwen3.8-27B.yaml"
+    pol_doc = yaml.safe_load(
+        (POLICY_DIR / "models" / "qwen3.8-27b.yaml").read_text(encoding="utf-8")
+    )
+    assert pol_doc["tiers"]["fast_sanity"]["layer_override"] is None
+    pol_doc["tiers"]["fast_sanity"]["layer_override"] = "auto"
+    auto_pol = tmp_path / "qwen-auto.yaml"
+    auto_pol.write_text(yaml.safe_dump(pol_doc), encoding="utf-8")
+
+    # 1) Short-stack dummy empty_stream_content falls back to full layers and passes
+    seen_layers: list[int | None] = []
+
+    def attempt_recover(*, layer_override, label, **kw):
+        seen_layers.append(layer_override)
+        if layer_override == 4:
+            return {
+                "mode": label,
+                "layer_override": 4,
+                "status": "fail",
+                "error": "empty_stream_content",
+                "cold_start_s": 294.0,
+                "eval_s": 0.44,
+                "config_digest": "a" * 64,
+                "ppu_count": 2,
+                "probe": {"status": "pass", "elapsed_s": 0.29},
+                "stream_probe": {
+                    "status": "fail",
+                    "error": "empty_stream_content",
+                    "elapsed_s": 0.15,
+                },
+            }
+        return {
+            "mode": label,
+            "layer_override": None,
+            "status": "pass",
+            "cold_start_s": 303.0,
+            "eval_s": 1.77,
+            "config_digest": "b" * 64,
+            "ppu_count": 2,
+            "probe": {"status": "pass", "elapsed_s": 0.56},
+            "stream_probe": {"status": "pass", "elapsed_s": 1.21, "content_chars": 64},
+        }
+
+    monkeypatch.setattr(ppu_recipe_runner, "_attempt_fast_sanity_once", attempt_recover)
+    res_ok = ppu_recipe_runner.run_fast_sanity(
+        recipe_path=qwen_recipe,
+        policy_path=auto_pol,
+        results_dir=tmp_path / "out_ok",
+        parser_mode="skip",
+    )
+    assert seen_layers == [4, None]
+    assert res_ok["status"] == "pass"
+    assert res_ok["timings"]["cold_start_s"] == 303.0
+    assert res_ok["timings"]["stream_s"] == 1.21
+
+    # 2) Control: full-layer empty_stream_content still fails and records phase
+    phase_file = tmp_path / "phase.txt"
+    monkeypatch.setenv("PPU_RECIPE_PHASE_FILE", str(phase_file))
+
+    def attempt_both_empty(*, layer_override, label, **kw):
+        return {
+            "mode": label,
+            "layer_override": layer_override,
+            "status": "fail",
+            "error": "empty_stream_content",
+            "cold_start_s": 100.0,
+            "eval_s": 0.3,
+            "config_digest": "c" * 64,
+            "ppu_count": 2,
+            "probe": {"status": "pass", "elapsed_s": 0.2},
+            "stream_probe": {
+                "status": "fail",
+                "error": "empty_stream_content",
+                "elapsed_s": 0.1,
+            },
+        }
+
+    monkeypatch.setattr(
+        ppu_recipe_runner, "_attempt_fast_sanity_once", attempt_both_empty
+    )
+    res_fail = ppu_recipe_runner.run_fast_sanity(
+        recipe_path=qwen_recipe,
+        policy_path=auto_pol,
+        results_dir=tmp_path / "out_fail",
+        parser_mode="skip",
+    )
+    assert res_fail["status"] == "fail"
+    assert len(res_fail["attempts"]) == 2
+    assert phase_file.read_text(encoding="utf-8").strip() == "empty_stream_content"
+
+    # 3) Control: framing error (missing_done) on short stack fails fast without restart
+    framing_layers: list[int | None] = []
+
+    def attempt_missing_done(*, layer_override, label, **kw):
+        framing_layers.append(layer_override)
+        return {
+            "mode": label,
+            "layer_override": layer_override,
+            "status": "fail",
+            "error": "missing_done",
+            "cold_start_s": 100.0,
+            "eval_s": 0.3,
+            "config_digest": "d" * 64,
+            "ppu_count": 2,
+            "probe": {"status": "pass", "elapsed_s": 0.2},
+            "stream_probe": {
+                "status": "fail",
+                "error": "missing_done",
+                "elapsed_s": 0.1,
+            },
+        }
+
+    monkeypatch.setattr(
+        ppu_recipe_runner, "_attempt_fast_sanity_once", attempt_missing_done
+    )
+    res_framing = ppu_recipe_runner.run_fast_sanity(
+        recipe_path=qwen_recipe,
+        policy_path=auto_pol,
+        results_dir=tmp_path / "out_framing",
+        parser_mode="skip",
+    )
+    assert framing_layers == [4]
+    assert res_framing["status"] == "fail"
+    assert phase_file.read_text(encoding="utf-8").strip() == "missing_done"
