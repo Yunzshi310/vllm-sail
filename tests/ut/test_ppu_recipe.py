@@ -273,12 +273,10 @@ def test_resolve_minimax_reproduces_the_retired_catalog_case() -> None:
     )
     assert resolved_fs["ppu_count"] == 8
     assert resolved_fs["dummy_weights"] is True
-    # MoE starts at layer 3, so the override has to reach past the dense stack.
-    assert resolved_fs["layer_override"] == 4
+    assert resolved_fs["layer_override"] == "auto"
     assert "--load-format" in resolved_fs["flags"]
     assert "dummy" in resolved_fs["flags"]
-    idx_ov = resolved_fs["flags"].index("--hf-overrides")
-    assert json.loads(resolved_fs["flags"][idx_ov + 1]) == {"num_hidden_layers": 4}
+    assert "--hf-overrides" not in resolved_fs["flags"]
 
 
 def test_model_sanity_policy_selects_eight_card_dp_ep_preset() -> None:
@@ -477,10 +475,10 @@ def test_resolve_kimi_k26_matches_catalog_and_sampling_contract() -> None:
     resolved_fs = ppu_recipe.resolve_recipe(
         recipe, policy_path=policy, tier="fast_sanity"
     )
+    assert resolved_fs["layer_override"] == "auto"
     assert "--load-format" in resolved_fs["flags"]
     assert "dummy" in resolved_fs["flags"]
-    idx_ov = resolved_fs["flags"].index("--hf-overrides")
-    assert json.loads(resolved_fs["flags"][idx_ov + 1]) == {"num_hidden_layers": 2}
+    assert "--hf-overrides" not in resolved_fs["flags"]
 
     # The eval generation block is the sampling contract the golden gate
     # compares key by key: any drift from the committed 890p golden fails
