@@ -400,6 +400,14 @@ def _canonical_flags(ordered: list[tuple[str, str | None, bool]]) -> list[str]:
     return canonical
 
 
+def _expand_env_path(raw: str, active_env: Mapping[str, str]) -> Path:
+    expanded = os.path.expandvars(raw)
+    if expanded == "~" or expanded.startswith("~/"):
+        home_base = Path(active_env["HOME"]) if active_env.get("HOME") else Path.home()
+        return home_base if expanded == "~" else home_base / expanded[2:]
+    return Path(os.path.expanduser(expanded))
+
+
 def resolve_local_checkpoint_dir(
     resolved_model: str,
     *,
@@ -420,31 +428,41 @@ def resolve_local_checkpoint_dir(
         "HUGGINGFACE_HUB_CACHE"
     )
     cache_roots: list[Path] = []
-    primary_hub_cache: Path | None = None
+    primary_hub_cache: Path
     if explicit_hub:
-        primary_hub_cache = Path(explicit_hub)
+        primary_hub_cache = _expand_env_path(explicit_hub, active_env)
         cache_roots.append(primary_hub_cache)
     elif hf_home := active_env.get("HF_HOME"):
-        primary_hub_cache = Path(hf_home) / "hub"
-        cache_roots.extend([primary_hub_cache, Path(hf_home)])
-    elif env is None:
-        primary_hub_cache = Path.home() / ".cache" / "huggingface" / "hub"
+        hf_home_dir = _expand_env_path(hf_home, active_env)
+        primary_hub_cache = hf_home_dir / "hub"
+        cache_roots.extend([primary_hub_cache, hf_home_dir])
+    elif xdg_cache := active_env.get("XDG_CACHE_HOME"):
+        primary_hub_cache = (
+            _expand_env_path(xdg_cache, active_env) / "huggingface" / "hub"
+        )
+        cache_roots.append(primary_hub_cache)
+    else:
+        home_base = (
+            _expand_env_path(active_env["HOME"], active_env)
+            if active_env.get("HOME")
+            else Path.home()
+        )
+        primary_hub_cache = home_base / ".cache" / "huggingface" / "hub"
         cache_roots.append(primary_hub_cache)
 
-    if primary_hub_cache is not None:
-        try:
-            hf_hub = importlib.import_module("huggingface_hub")
-            local_dir = Path(
-                hf_hub.snapshot_download(
-                    resolved_model,
-                    cache_dir=str(primary_hub_cache),
-                    local_files_only=True,
-                )
+    try:
+        hf_hub = importlib.import_module("huggingface_hub")
+        local_dir = Path(
+            hf_hub.snapshot_download(
+                resolved_model,
+                cache_dir=str(primary_hub_cache),
+                local_files_only=True,
             )
-            if (local_dir / "config.json").is_file():
-                return local_dir
-        except Exception:
-            pass
+        )
+        if (local_dir / "config.json").is_file():
+            return local_dir
+    except Exception:
+        pass
 
     repo_folder = f"models--{resolved_model.strip('/').replace('/', '--')}"
     seen: set[Path] = set()

@@ -2236,3 +2236,93 @@ def test_resolve_local_checkpoint_dir_honors_hf_hub_cache_precedence(
         )
         is None
     )
+
+
+def test_default_hub_cache_resolves_nested_overrides_without_hf_env_vars(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for var in (
+        "HF_HUB_CACHE",
+        "HUGGINGFACE_HUB_CACHE",
+        "HF_HOME",
+        "XDG_CACHE_HOME",
+        "HOME",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+    virtual_home = tmp_path / "virtual-home"
+    rev = "a" * 40
+    qwen_snap = (
+        virtual_home
+        / ".cache"
+        / "huggingface"
+        / "hub"
+        / "models--Qwen--Qwen3.8-27B"
+        / "snapshots"
+        / rev
+    )
+    (qwen_snap.parent.parent / "refs").mkdir(parents=True)
+    (qwen_snap.parent.parent / "refs" / "main").write_text(f"{rev}\n", encoding="utf-8")
+    _write_checkpoint(
+        qwen_snap,
+        {
+            "model_type": "qwen3_5",
+            "text_config": {
+                "model_type": "qwen3_5_text",
+                "num_attention_heads": 24,
+                "num_hidden_layers": 64,
+                "full_attention_interval": 4,
+            },
+        },
+    )
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: virtual_home))
+
+    assert ppu_recipe.resolve_local_checkpoint_dir("Qwen/Qwen3.8-27B", env={}) == (
+        qwen_snap
+    )
+    qwen_recipe = RECIPES_DIR / "Qwen" / "Qwen3.8-27B.yaml"
+    qwen_policy = POLICY_DIR / "models" / "qwen3.8-27b.yaml"
+    resolved = ppu_recipe.resolve_recipe(
+        qwen_recipe, policy_path=qwen_policy, tier="fast_sanity", layer_override=4
+    )
+    ov_idx = resolved["argv"].index("--hf-overrides")
+    assert json.loads(resolved["argv"][ov_idx + 1]) == {
+        "text_config": {"num_hidden_layers": 4}
+    }
+
+    # XDG_CACHE_HOME overrides HOME/.cache when HF_HOME / HF_HUB_CACHE are unset
+    xdg_root = tmp_path / "xdg-cache"
+    rev_xdg = "c" * 40
+    xdg_snap = (
+        xdg_root
+        / "huggingface"
+        / "hub"
+        / "models--Qwen--Qwen3.8-27B"
+        / "snapshots"
+        / rev_xdg
+    )
+    (xdg_snap.parent.parent / "refs").mkdir(parents=True)
+    (xdg_snap.parent.parent / "refs" / "main").write_text(
+        f"{rev_xdg}\n", encoding="utf-8"
+    )
+    _write_checkpoint(
+        xdg_snap,
+        {
+            "model_type": "qwen3_5",
+            "text_config": {"num_hidden_layers": 64, "full_attention_interval": 4},
+        },
+    )
+    assert (
+        ppu_recipe.resolve_local_checkpoint_dir(
+            "Qwen/Qwen3.8-27B",
+            env={"HOME": str(virtual_home), "XDG_CACHE_HOME": str(xdg_root)},
+        )
+        == xdg_snap
+    )
+    assert (
+        ppu_recipe.resolve_local_checkpoint_dir(
+            "Qwen/Qwen3.8-27B",
+            env={"HOME": str(virtual_home), "HF_HOME": "~/custom-empty-hf"},
+        )
+        is None
+    )
