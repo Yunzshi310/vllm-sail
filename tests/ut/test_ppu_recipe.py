@@ -2479,3 +2479,80 @@ def test_short_layer_dummy_empty_stream_content_falls_back_to_full_layers(
     assert framing_layers == [4]
     assert res_framing["status"] == "fail"
     assert phase_file.read_text(encoding="utf-8").strip() == "missing_done"
+
+    # 4) Terminal attribution: when short-stack empty_stream_content falls back and
+    #    fast_full fails in server_startup or chat_probe, digest/timings/phase/diagnostics
+    #    must belong to fast_full rather than reverting to fast_2l's empty_stream_content.
+    ppu_recipe_diagnostics = _load_module(
+        "ppu_recipe_diagnostics", CI_DIR / "ppu_recipe_diagnostics.py"
+    )
+    for fail_stage, expected_diag in (
+        ("server_startup", "server_startup_failed"),
+        ("chat_probe", "chat_probe_failed"),
+    ):
+        priv_dir = tmp_path / f"priv_{fail_stage}"
+        res_dir = priv_dir / "results"
+        res_dir.mkdir(parents=True)
+        (priv_dir / "runtime.log").write_text("started\n", encoding="utf-8")
+        stage_phase = priv_dir / "recipe-phase.txt"
+        monkeypatch.setenv("PPU_RECIPE_PHASE_FILE", str(stage_phase))
+
+        def attempt_full_nonstream_fail(
+            *,
+            layer_override,
+            label,
+            _stage=fail_stage,
+            _phase=stage_phase,
+            **kw,
+        ):
+            if layer_override == 4:
+                _phase.write_text("stream_probe\n", encoding="utf-8")
+                return {
+                    "mode": label,
+                    "layer_override": 4,
+                    "status": "fail",
+                    "error": "empty_stream_content",
+                    "cold_start_s": 294.0,
+                    "eval_s": 0.44,
+                    "config_digest": "a" * 64,
+                    "ppu_count": 2,
+                    "probe": {"status": "pass", "elapsed_s": 0.29},
+                    "stream_probe": {
+                        "status": "fail",
+                        "error": "empty_stream_content",
+                        "elapsed_s": 0.15,
+                    },
+                }
+            _phase.write_text(f"{_stage}\n", encoding="utf-8")
+            return {
+                "mode": label,
+                "layer_override": None,
+                "status": "fail",
+                "error": f"{_stage} error",
+                "cold_start_s": 123.0,
+                "eval_s": 0.0,
+                "config_digest": "b" * 64,
+                "ppu_count": 2,
+            }
+
+        monkeypatch.setattr(
+            ppu_recipe_runner,
+            "_attempt_fast_sanity_once",
+            attempt_full_nonstream_fail,
+        )
+        res_term = ppu_recipe_runner.run_fast_sanity(
+            recipe_path=qwen_recipe,
+            policy_path=auto_pol,
+            results_dir=res_dir,
+            parser_mode="skip",
+        )
+        assert res_term["status"] == "fail"
+        assert res_term["config_digest"] == "b" * 64
+        assert res_term["timings"]["cold_start_s"] == 123.0
+        assert "nonstream_s" not in res_term["timings"]
+        assert "stream_s" not in res_term["timings"]
+        assert stage_phase.read_text(encoding="utf-8").strip() == fail_stage
+        assert (
+            ppu_recipe_diagnostics.failure_reason(priv_dir, "fast_sanity")
+            == expected_diag
+        )

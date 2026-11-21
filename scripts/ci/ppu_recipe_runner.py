@@ -785,6 +785,7 @@ def run_fast_sanity(
             label="fast_2l",
         )
         attempts.append(res_2l)
+    did_fallback = False
     if (
         layer_mode in {"full", "both"}
         or not attempts
@@ -803,6 +804,7 @@ def run_fast_sanity(
             )
         )
     ):
+        did_fallback = bool(attempts) and layer_mode == "auto"
         res_full = _attempt_fast_sanity_once(
             recipe_path=recipe_path,
             policy_path=policy_path,
@@ -819,25 +821,18 @@ def run_fast_sanity(
         )
         attempts.append(res_full)
 
-    has_passing_attempt = any(item["status"] == "pass" for item in attempts)
+    terminal_attempts = [attempts[-1]] if did_fallback else attempts
     stream_failure = next(
         (
             item
-            for item in reversed(attempts)
+            for item in terminal_attempts
             if item.get("stream_probe", {}).get("status") == "fail"
-            and not (
-                layer_mode == "auto"
-                and fallback_full
-                and dummy_weights
-                and item.get("layer_override") is not None
-                and item["stream_probe"].get("error") == "empty_stream_content"
-                and has_passing_attempt
-            )
         ),
         None,
     )
     final_attempt = stream_failure or next(
-        (item for item in attempts if item["status"] == "pass"), attempts[-1]
+        (item for item in terminal_attempts if item["status"] == "pass"),
+        terminal_attempts[-1],
     )
     if stream_failure is not None:
         _record_phase(stream_failure["error"])
