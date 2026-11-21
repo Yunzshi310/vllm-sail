@@ -151,14 +151,14 @@ jobs:
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
-          pattern: ppu-recipe-model_sanity-*-${{ github.run_id }}-${{ github.run_attempt }}
+          pattern: ppu-recipe-model_sanity-*-${{ github.run_id }}-*
           path: ${{ runner.temp }}/nightly-case-summaries
       - name: Read allowlisted legacy summaries
         if: needs.select.outputs.legacy_models != '' && needs.build.result == 'success'
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
-          pattern: ppu-pr-nightly-legacy-*-${{ github.run_id }}-${{ github.run_attempt }}
+          pattern: ppu-pr-nightly-legacy-*-${{ github.run_id }}-*
           path: ${{ runner.temp }}/nightly-case-summaries
       - name: Publish result for the tested PR head
         env:

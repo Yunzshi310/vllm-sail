@@ -11,7 +11,14 @@ import urllib.error
 from pathlib import Path
 
 from scripts.ci import ppu_e2e_select, ppu_recipe_diagnostics
-from scripts.ci.ppu_ci_command import HELP, Controller, Rejected, marker, parse_command
+from scripts.ci.ppu_ci_command import (
+    HELP,
+    Controller,
+    Rejected,
+    best_effort,
+    marker,
+    parse_command,
+)
 from scripts.ci.ppu_ci_command import main as ci_main
 
 COMMAND = "/ci run nightly"
@@ -390,7 +397,7 @@ class NightlyController(Controller):
         ):
             raise Rejected("No matching PR Nightly request comment.")
 
-    def _summary_path(self, lane, case):
+    def _summary_path(self, lane, case, attempt=None):
         summary_dir = self.env.get("SUMMARY_DIR")
         if summary_dir:
             prefix = (
@@ -399,13 +406,88 @@ class NightlyController(Controller):
                 else "ppu-pr-nightly-legacy"
             )
             run_id = self.env["GITHUB_RUN_ID"]
-            attempt = self.env.get("GITHUB_RUN_ATTEMPT", "1")
+            resolved_attempt = (
+                str(attempt)
+                if attempt is not None
+                else self.env.get("GITHUB_RUN_ATTEMPT", "1")
+            )
             return (
                 Path(summary_dir)
-                / f"{prefix}-{case}-{run_id}-{attempt}"
+                / f"{prefix}-{case}-{run_id}-{resolved_attempt}"
                 / "summary.json"
             )
         return Path(self.env["SUMMARY_PATH"])
+
+    def _current_attempt(self):
+        raw = self.env.get("GITHUB_RUN_ATTEMPT", "1")
+        return (
+            int(raw) if isinstance(raw, str) and raw.isdigit() and int(raw) > 0 else 1
+        )
+
+    def _latest_case_jobs(self, current_attempt):
+        if current_attempt <= 1:
+            return {}
+        run_id = self.env.get("GITHUB_RUN_ID", "")
+        if not run_id:
+            return {}
+        jobs = best_effort(
+            lambda: list(
+                self.pages(f"/actions/runs/{run_id}/jobs", "jobs", filter="latest")
+            )
+        )
+        if not jobs:
+            return {}
+        mapping = {}
+        for job in jobs:
+            if not isinstance(job, dict):
+                continue
+            name = job.get("name")
+            attempt = job.get("run_attempt")
+            if (
+                not isinstance(name, str)
+                or type(attempt) is not int
+                or not 1 <= attempt <= current_attempt
+            ):
+                continue
+            leaf = name.rsplit("/", 1)[-1].strip()
+            if leaf.startswith("Accuracy "):
+                case = leaf.removeprefix("Accuracy ").strip()
+                lane = "legacy"
+            elif leaf.startswith("Model sanity & micro-E2E "):
+                case = leaf.removeprefix("Model sanity & micro-E2E ").strip()
+                lane = "recipe"
+            else:
+                continue
+            if valid_case(case):
+                key = (lane, case)
+                prev = mapping.get(key)
+                if prev is None or attempt >= prev[0]:
+                    mapping[key] = (attempt, job.get("conclusion"))
+        return mapping
+
+    def _resolve_case_summary(
+        self, lane, case, lane_result, current_attempt, latest_jobs
+    ):
+        job_info = latest_jobs.get((lane, case))
+        if job_info is not None:
+            attempt, conclusion = job_info
+            result = public_result(self._summary_path(lane, case, attempt=attempt))
+            return result, conclusion
+        result = public_result(self._summary_path(lane, case, attempt=current_attempt))
+        if (
+            any(item is not None for item in result)
+            or current_attempt <= 1
+            or lane_result != "success"
+            or not self.env.get("SUMMARY_DIR")
+        ):
+            return result, None
+        # Fallback only when job metadata is unavailable and the lane succeeded:
+        # accept only the latest prior passing summary, never a stale failure.
+        for attempt in range(current_attempt - 1, 0, -1):
+            candidate = public_result(self._summary_path(lane, case, attempt=attempt))
+            if candidate[0] == "pass":
+                return candidate, None
+        return result, None
 
     def report(self):
         inputs = self.inputs()
@@ -452,6 +534,12 @@ class NightlyController(Controller):
         single_mode = (
             not setup_failed and len(selected_cases) == 1 and case_spec != "all"
         )
+        current_attempt = self._current_attempt()
+        latest_jobs = (
+            self._latest_case_jobs(current_attempt)
+            if not setup_failed and selected_cases
+            else {}
+        )
         if setup_failed or not selected_cases:
             lines = [
                 f"PR Nightly `{case_spec}` at `{sha}` — **{outcome}**",
@@ -462,8 +550,8 @@ class NightlyController(Controller):
             lane_result = needs.get(lane, {}).get("result")
             _, reason, score, samples, micro = (None,) * 5
             if outcome in ("Passed", "Failed"):
-                _, reason, score, samples, micro = public_result(
-                    self._summary_path(lane, case)
+                (_, reason, score, samples, micro), _ = self._resolve_case_summary(
+                    lane, case, lane_result, current_attempt, latest_jobs
                 )
             lines = [
                 f"PR Nightly `{case}` at `{sha}` — **{outcome}**",
@@ -485,9 +573,13 @@ class NightlyController(Controller):
             passed = 0
             for case, lane in selected_cases:
                 lane_result = needs.get(lane, {}).get("result")
+                conclusion = None
                 if lane_result in ("success", "failure", "cancelled"):
-                    status, reason, score, samples, micro = public_result(
-                        self._summary_path(lane, case)
+                    (
+                        (status, reason, score, samples, micro),
+                        conclusion,
+                    ) = self._resolve_case_summary(
+                        lane, case, lane_result, current_attempt, latest_jobs
                     )
                 else:
                     status, reason, score, samples, micro = (None,) * 5
@@ -495,7 +587,7 @@ class NightlyController(Controller):
                     status = {
                         "cancelled": "cancelled",
                         "skipped": "not_run",
-                    }.get(lane_result, "unavailable")
+                    }.get(conclusion or lane_result, "unavailable")
                 if status == "pass":
                     passed += 1
                 reason_cell = (

@@ -224,6 +224,15 @@ def test_pr_nightly_workflow_pins_same_head_serializes_lanes_and_keeps_ci_status
     }
     assert "needs.validate.result == 'success'" in jobs["report"]["if"]
     assert jobs["report"]["steps"][0]["with"]["ref"] == "${{ github.sha }}"
+    downloads = [
+        step
+        for step in jobs["report"]["steps"]
+        if step.get("uses") == "actions/download-artifact@v4"
+    ]
+    assert {step["with"]["pattern"] for step in downloads} == {
+        "ppu-recipe-model_sanity-*-${{ github.run_id }}-*",
+        "ppu-pr-nightly-legacy-*-${{ github.run_id }}-*",
+    }
     assert all("statuses" not in job.get("permissions", {}) for job in jobs.values())
     assert all("secrets" not in job for job in jobs.values())
 
@@ -235,3 +244,121 @@ def test_pr_nightly_workflow_pins_same_head_serializes_lanes_and_keeps_ci_status
         step.get("run") == "python3 -m scripts.ci.ppu_pr_nightly command"
         for step in command["jobs"]["command"]["steps"]
     )
+
+
+def test_recipe_sanity_isolates_actions_env_and_sanitizes_diagnostics(tmp_path):
+    recipe = yaml.safe_load(
+        (ROOT / ".github/workflows/_ppu-recipe-model-sanity.yaml").read_text()
+    )
+    steps = recipe["jobs"]["sanity"]["steps"]
+    checkouts = [
+        step for step in steps if step.get("uses", "").startswith("actions/checkout@")
+    ]
+    assert len(checkouts) == 2
+    assert checkouts[1]["with"]["ref"] == "${{ github.sha }}"
+    assert checkouts[1]["with"]["sparse-checkout"] == "scripts/ci"
+    assert checkouts[1]["with"]["persist-credentials"] is False
+
+    runtime_step = next(step for step in steps if step.get("id") == "recipe")
+    retain_step = next(step for step in steps if step.get("id") == "retain")
+    publish_step = next(step for step in steps if step.get("id") == "publish")
+    for step in (runtime_step, retain_step, publish_step):
+        assert step["env"]["TRUSTED_CI_DIR"] == "${{ steps.runtime.outputs.trusted }}"
+
+    # 1. Verify Actions control env is stripped before executing the wrapper,
+    #    while legitimate runtime env vars pass through.
+    trusted_dir = tmp_path / "trusted"
+    candidate_dir = tmp_path / "candidate"
+    (trusted_dir / "scripts/ci").mkdir(parents=True)
+    (candidate_dir / "scripts/ci").mkdir(parents=True)
+    (candidate_dir / "scripts/ci/ppu_runtime_container.sh").write_text(
+        "echo CANDIDATE_WRAPPER_EXECUTED >&2; exit 99\n"
+    )
+    probe_out = tmp_path / "env-probe.json"
+    (trusted_dir / "scripts/ci/ppu_runtime_container.sh").write_text(
+        "python3 - <<'PY'\n"
+        "import json, os\n"
+        f"open({str(probe_out)!r}, 'w').write(json.dumps(dict(os.environ)))\n"
+        "PY\n"
+    )
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    result = subprocess.run(
+        ["bash", "-e", "-o", "pipefail", "-c", runtime_step["run"]],
+        env={
+            **os.environ,
+            "TRUSTED_CI_DIR": str(trusted_dir),
+            "PPU_CI_SOURCE_DIR": str(candidate_dir),
+            "PPU_CI_ARTIFACT_DIR": str(artifacts),
+            "MODEL_ID": "test/model",
+            "GITHUB_RUN_ID": "900",
+            "GITHUB_RUN_ATTEMPT": "2",
+            "ACTIONS_RUNTIME_TOKEN": "synthetic-actions-token",
+            "GITHUB_TOKEN": "synthetic-gh-token",
+            "GITHUB_OUTPUT": str(tmp_path / "gh-output"),
+            "GITHUB_ENV": str(tmp_path / "gh-env"),
+            "GITHUB_PATH": str(tmp_path / "gh-path"),
+            "GITHUB_STEP_SUMMARY": str(tmp_path / "gh-summary"),
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    seen_env = json.loads(probe_out.read_text())
+    for forbidden in (
+        "ACTIONS_RUNTIME_TOKEN",
+        "GITHUB_TOKEN",
+        "GITHUB_OUTPUT",
+        "GITHUB_ENV",
+        "GITHUB_PATH",
+        "GITHUB_STEP_SUMMARY",
+    ):
+        assert forbidden not in seen_env
+    assert seen_env["MODEL_ID"] == "test/model"
+    assert seen_env["GITHUB_RUN_ID"] == "900"
+    assert seen_env["GITHUB_RUN_ATTEMPT"] == "2"
+
+    # 2. Verify publish step allowlists diagnostics output before stdout,
+    #    summary.json, and GITHUB_STEP_SUMMARY (adversarial + normal control).
+    for raw_diag, expected_reason in (
+        ("SYNTHETIC_TOKEN /private/model.log", "unknown"),
+        ("gsm8k_gate_failed", "gsm8k_gate_failed"),
+    ):
+        diag_dir = tmp_path / f"diag-{expected_reason}"
+        (diag_dir / "scripts/ci").mkdir(parents=True)
+        (diag_dir / "scripts/ci/ppu_recipe_diagnostics.py").write_text(
+            f"print({raw_diag!r})\n"
+        )
+        public_dir = tmp_path / f"public-{expected_reason}"
+        public_dir.mkdir()
+        step_summary = tmp_path / f"summary-{expected_reason}.md"
+        pub = subprocess.run(
+            ["bash", "-e", "-o", "pipefail", "-c", publish_step["run"]],
+            env={
+                **os.environ,
+                "RECIPE_OUTCOME": "failure",
+                "RETENTION_OUTCOME": "success",
+                "RETENTION": "retained",
+                "TRUSTED_CI_DIR": str(diag_dir),
+                "PPU_CI_SOURCE_DIR": str(candidate_dir),
+                "MODEL_KEY": "glm-5.3",
+                "PRIVATE_DIR": str(artifacts),
+                "PUBLIC_DIR": str(public_dir),
+                "TIER": "model_sanity",
+                "GITHUB_STEP_SUMMARY": str(step_summary),
+            },
+            capture_output=True,
+            text=True,
+        )
+        assert pub.returncode == 0, pub.stderr
+        public_json = (public_dir / "summary.json").read_text()
+        summary_md = step_summary.read_text()
+        assert json.loads(public_json)["failure_reason"] == expected_reason
+        assert f"failure_reason: {expected_reason}" in pub.stdout
+        assert f"**Recipe failure reason:** {expected_reason}" in summary_md
+        assert "SYNTHETIC_TOKEN" not in (
+            pub.stdout + pub.stderr + public_json + summary_md
+        )
+        assert "/private/model.log" not in (
+            pub.stdout + pub.stderr + public_json + summary_md
+        )
