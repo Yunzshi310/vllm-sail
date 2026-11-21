@@ -362,3 +362,128 @@ def test_recipe_sanity_isolates_actions_env_and_sanitizes_diagnostics(tmp_path):
         assert "/private/model.log" not in (
             pub.stdout + pub.stderr + public_json + summary_md
         )
+
+
+def test_trusted_runtime_container_never_executes_candidate_runtime_image_on_host(
+    tmp_path,
+):
+    recipe = yaml.safe_load(
+        (ROOT / ".github/workflows/_ppu-recipe-model-sanity.yaml").read_text()
+    )
+    runtime_step = next(
+        step for step in recipe["jobs"]["sanity"]["steps"] if step.get("id") == "recipe"
+    )
+
+    # Set up trusted checkout with the real ppu_runtime_container.sh and a
+    # recording trusted ppu_runtime_image.sh.
+    trusted_dir = tmp_path / "trusted"
+    (trusted_dir / "scripts/ci").mkdir(parents=True)
+    shutil.copy(
+        ROOT / "scripts/ci/ppu_runtime_container.sh",
+        trusted_dir / "scripts/ci/ppu_runtime_container.sh",
+    )
+    trusted_marker = tmp_path / "trusted-image-called"
+    image_id = "sha256:" + "1" * 64
+    (trusted_dir / "scripts/ci/ppu_runtime_image.sh").write_text(
+        f"#!/usr/bin/env bash\n"
+        f"echo trusted > {str(trusted_marker)!r}\n"
+        f"printf '%s\\n' {image_id!r}\n"
+    )
+
+    # Set up a separate candidate git repo with a hostile ppu_runtime_image.sh.
+    candidate_dir = tmp_path / "candidate"
+    (candidate_dir / ".github").mkdir(parents=True)
+    (candidate_dir / "scripts/ci").mkdir(parents=True)
+    (candidate_dir / ".github/vllm-main-verified.commit").write_text("a" * 40 + "\n")
+    candidate_marker = tmp_path / "candidate-image-executed"
+    (candidate_dir / "scripts/ci/ppu_runtime_image.sh").write_text(
+        f"#!/usr/bin/env bash\necho hostile > {str(candidate_marker)!r}\nexit 99\n"
+    )
+    subprocess.run(["git", "init", str(candidate_dir)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(candidate_dir), "config", "user.name", "Test"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(candidate_dir), "config", "user.email", "test@example.com"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(candidate_dir), "add", "."], check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "-C", str(candidate_dir), "commit", "-m", "candidate"],
+        check=True,
+        capture_output=True,
+    )
+    candidate_sha = subprocess.check_output(
+        ["git", "-C", str(candidate_dir), "rev-parse", "HEAD"], text=True
+    ).strip()
+
+    # Set up minimal offline cache, wheels, artifacts, and stub flock/docker.
+    wheels_dir = tmp_path / "wheels"
+    wheels_dir.mkdir()
+    artifacts_dir = tmp_path / "artifacts"
+    artifacts_dir.mkdir()
+    hf_home = tmp_path / "hf_home"
+    snapshot = hf_home / "hub/models--test--model/snapshots/rev1"
+    snapshot.mkdir(parents=True)
+    refs_dir = hf_home / "hub/models--test--model/refs"
+    refs_dir.mkdir(parents=True)
+    (refs_dir / "main").write_text("rev1\n")
+    dg_cache = tmp_path / "dg_cache"
+    dg_cache.mkdir()
+    gsm8k = tmp_path / "gsm8k"
+    gsm8k.mkdir()
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "flock").write_text("#!/usr/bin/env bash\nexit 0\n")
+    (fake_bin / "flock").chmod(0o755)
+    docker_log = tmp_path / "docker.log"
+    (fake_bin / "docker").write_text(
+        f"#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> {str(docker_log)!r}\nexit 0\n"
+    )
+    (fake_bin / "docker").chmod(0o755)
+
+    result = subprocess.run(
+        ["bash", "-e", "-o", "pipefail", "-c", runtime_step["run"]],
+        env={
+            **os.environ,
+            "PATH": os.pathsep.join((str(fake_bin), os.environ["PATH"])),
+            "TRUSTED_CI_DIR": str(trusted_dir),
+            "PPU_CI_SOURCE_DIR": str(candidate_dir),
+            "PPU_CI_SOURCE_SHA": candidate_sha,
+            "PPU_CI_WHEEL_SOURCE_SHA": candidate_sha,
+            "PPU_CI_WHEELS_DIR": str(wheels_dir),
+            "PPU_CI_ARTIFACT_DIR": str(artifacts_dir),
+            "PPU_CI_DEVICE_COUNT": "1",
+            "PPU_CI_REQUIRE_PR_ARTIFACT": "false",
+            "PPU_CI_HF_HOME": str(hf_home),
+            "PPU_CI_DG_CACHE_DIR": str(dg_cache),
+            "GSM8K_DATASET_PATH": str(gsm8k),
+            "MODEL_ID": "test/model",
+            "RECIPE_PATH": "tests/ppu/recipes/test.yaml",
+            "POLICY_PATH": "tests/ppu/policy/models/test.yaml",
+            "TIER": "model_sanity",
+            "PRESET": "",
+            "PPU_CI_QUEUE_S": "0",
+            "GITHUB_RUN_ID": "900",
+            "GITHUB_RUN_ATTEMPT": "1",
+            "ACTIONS_RUNTIME_TOKEN": "synthetic-actions-token",
+            "GITHUB_OUTPUT": str(tmp_path / "gh-output"),
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert not candidate_marker.exists(), (
+        "Candidate ppu_runtime_image.sh must never execute on the host"
+    )
+    assert result.returncode == 0, (artifacts_dir / "launcher.log").read_text()
+    assert trusted_marker.is_file()
+    assert (artifacts_dir / "runtime-image-id.txt").read_text().strip() == image_id
+    assert f"source={candidate_dir.resolve()},target=/source,readonly" in (
+        docker_log.read_text()
+    )
