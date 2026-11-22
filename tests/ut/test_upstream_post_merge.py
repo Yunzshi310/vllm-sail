@@ -651,6 +651,8 @@ def test_gate5_intentional_failure_three_channel_zero_leak_and_fail_closed_wipe(
     for sample in (
         "host=/nas_aisw/models/Qwen",
         "mirror=https://art.eng.t-head.cn/pypi",
+        "bare_domain=eng.t-head.cn",
+        "bare_corp=alibaba-inc.com",
         "node ip 10.23.45.67.",
         "secret ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ123456",
         "model Step-5-Preview",
@@ -661,6 +663,68 @@ def test_gate5_intentional_failure_three_channel_zero_leak_and_fail_closed_wipe(
         with pytest.raises(post_merge.RedactionViolationError):
             post_merge.assert_zero_sensitive_leaks(sample, staging_paths=[staged])
         assert not staged.exists()
+
+    # Exact Round-1 CLI counterexample 1: bare internal domain on `publish` CLI
+    cli_pub_dir = tmp_path / "cli-bare-domain"
+    cli_summary = tmp_path / "cli-summary.md"
+    assert (
+        post_merge.main(
+            [
+                "publish",
+                "--gear",
+                "probe",
+                "--status",
+                "fail",
+                "--sail-sha",
+                _sha(42),
+                "--upstream-sha",
+                _sha(43),
+                "--failure-stage",
+                "plugin_registration",
+                "--target-signature",
+                "eng.t-head.cn",
+                "--public-plugin-break",
+                "--public-dir",
+                str(cli_pub_dir),
+                "--step-summary",
+                str(cli_summary),
+            ]
+        )
+        == 0
+    )
+    for out_file in (
+        cli_pub_dir / "public-summary.json",
+        cli_pub_dir / "issue-payload.json",
+        cli_summary,
+    ):
+        txt = out_file.read_text(encoding="utf-8")
+        post_merge.assert_zero_sensitive_leaks(txt)
+        assert "t-head.cn" not in txt.lower()
+
+    # Exact Round-1 CLI counterexample 2: tainted cursor field in `route` CLI fails closed without leaking
+    ls_file = tmp_path / "ls.txt"
+    ls_file.write_text(f"{_sha(44)}\trefs/heads/main\n", encoding="utf-8")
+    bad_cursor = tmp_path / "bad-cursor.json"
+    bad_cursor.write_text(
+        json.dumps({"last_ppu_green_sha": "/nas_aisw/review/Step-5-Preview"}),
+        encoding="utf-8",
+    )
+    route_proc = subprocess.run(
+        [
+            sys.executable,
+            str(REPO_ROOT / "scripts/ci/ppu_upstream_post_merge.py"),
+            "route",
+            "--ls-remote-file",
+            str(ls_file),
+            "--cursor-file",
+            str(bad_cursor),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert route_proc.returncode != 0
+    assert "/nas_aisw" not in (route_proc.stdout + route_proc.stderr)
+    assert "Step-5-Preview" not in (route_proc.stdout + route_proc.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -802,11 +866,104 @@ def test_gate6_ls_remote_dual_polling_sliding_window_and_rc_routing(tmp_path):
 
     fake_repo = tmp_path / "sail-pin-bump"
     (fake_repo / ".github").mkdir(parents=True)
+    (fake_repo / "csrc" / "upstream").mkdir(parents=True)
     pin_file = fake_repo / ".github" / "vllm-main-verified.commit"
+    manifest_copy = fake_repo / "csrc" / "upstream" / "manifest.toml"
     pin_file.write_text(VERIFIED_PIN + "\n", encoding="utf-8")
+    shutil.copyfile(REPO_ROOT / "csrc" / "upstream" / "manifest.toml", manifest_copy)
     bump_meta = post_merge.prepare_pin_bump(repo_root=fake_repo, target_sha=sha_main_2)
     assert bump_meta["changed"] == "true"
     assert pin_file.read_text(encoding="utf-8") == sha_main_2 + "\n"
+    from vllm_sail.native import manifest as kernel_manifest_mod
+
+    assert kernel_manifest_mod.load(manifest_copy).upstream_ref == sha_main_2
+
+
+def test_gate6_red_sha_repoll_docs_successor_and_rc_skipped_never_turn_green():
+    sha_red = _sha(501)
+    sha_docs_after_red = _sha(502)
+
+    # 1. CPU pass + PPU fail on sha_red -> re-polling sha_red must re-run PPU (never pass/noop)!
+    cursor_red = post_merge.advance_cursor(
+        None,
+        verified_pin=VERIFIED_PIN,
+        selected_gear="probe",
+        target_sha=sha_red,
+        status="fail",
+        cpu_status="pass",
+        ppu_status="fail",
+    )
+    repoll = post_merge.route_three_gears(
+        ls_remote_data={"main_sha": sha_red, "tags": {}},
+        verified_pin=VERIFIED_PIN,
+        release_baseline_tag="v0.33.0",
+        schedule_cron=post_merge.PROBE_CRON,
+        cursor=cursor_red,
+    )
+    assert repoll["run_ppu"] is True
+    assert repoll["ppu_skip_reason"] == "none"
+
+    # 2. Docs-only successor on top of red PPU SHA must NOT skip PPU and must NOT be promoted!
+    after_red = post_merge.route_three_gears(
+        ls_remote_data={"main_sha": sha_docs_after_red, "tags": {}},
+        verified_pin=VERIFIED_PIN,
+        release_baseline_tag="v0.33.0",
+        schedule_cron=post_merge.PROBE_CRON,
+        cursor=cursor_red,
+        changed_paths_since_ppu=["docs/design.md"],
+    )
+    assert after_red["run_ppu"] is True
+    assert (
+        post_merge.select_pin_bump_candidate(
+            [
+                {
+                    "gear": "probe",
+                    "upstream_sha": sha_docs_after_red,
+                    "cpu_status": "pass",
+                    "ppu_status": "skipped",
+                    "ppu_skip_reason": "allowlisted_non_ppu_changes",
+                    "last_ppu_tested_sha": sha_red,
+                    "last_ppu_green_sha": VERIFIED_PIN,
+                }
+            ],
+            verified_pin=VERIFIED_PIN,
+        )
+        is None
+    )
+
+    # 3. Workflow outcome reducer: skipped RC gate or failed ops-select fails closed!
+    rc_skipped = post_merge.evaluate_workflow_outcome(
+        selected_gear="rc_qualify",
+        target_sha=sha_red,
+        run_cpu=True,
+        run_ppu=True,
+        ppu_skip_reason="none",
+        build_result="success",
+        cpu_result="success",
+        rc_pin_result="success",
+        rc_fast_result="success",
+        rc_model_result="skipped",
+    )
+    assert rc_skipped["status"] == "fail"
+    assert rc_skipped["failure_stage"] == "rc_model_sanity"
+
+    rc_ops_fail = post_merge.evaluate_workflow_outcome(
+        selected_gear="rc_qualify",
+        target_sha=sha_red,
+        run_cpu=True,
+        run_ppu=True,
+        ppu_skip_reason="none",
+        ops_image="sha256:" + "f" * 64,
+        build_result="success",
+        cpu_result="success",
+        rc_pin_result="success",
+        rc_fast_result="success",
+        rc_model_result="success",
+        rc_ops_select_result="failure",
+        rc_ops_result="skipped",
+    )
+    assert rc_ops_fail["status"] == "fail"
+    assert rc_ops_fail["failure_stage"] == "rc_ops_tests"
 
 
 def test_gate6_upstream_canary_workflow_three_gears_contract():
@@ -815,11 +972,11 @@ def test_gate6_upstream_canary_workflow_three_gears_contract():
     wf = yaml.safe_load(wf_raw)
     triggers = wf.get(True) or wf.get("on")
 
-    # No workflow_call, no statuses:write, no legacy 60k raw log paste, no _ppu-upstream-reuse.
+    # No workflow_call, no top-level cache-mode, no statuses:write, no legacy 60k raw log paste.
     assert "workflow_call" not in triggers
+    assert "cache-mode" not in wf
     assert "slice(0, 60000)" not in wf_raw
     assert "_ppu-upstream-reuse.yaml" not in wf_raw
-    assert wf["cache-mode"] == "none"
     assert wf["permissions"] == {"contents": "read", "actions": "read"}
 
     crons = [entry["cron"] for entry in triggers["schedule"]]
@@ -832,6 +989,7 @@ def test_gate6_upstream_canary_workflow_three_gears_contract():
 
     assert "pytorch@sha256:" in jobs["cpu-fast-check"]["container"]["image"]
     assert jobs["ppu-probe-smoke"]["runs-on"] == "8-ppu-m890p"
+    assert "!cancelled()" in jobs["ppu-probe-smoke"]["if"]
     assert jobs["ppu-probe-smoke"]["concurrency"] == {
         "group": "upstream-post-merge-ppu-slot",
         "cancel-in-progress": False,

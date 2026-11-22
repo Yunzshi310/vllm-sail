@@ -204,7 +204,7 @@ def _sha1_commit(name: str, default: str | None = None) -> Callable[[], str | No
 
     def _get() -> str | None:
         source, raw = _read_env(name)
-        if raw is None or raw.strip() == "":
+        if raw is None:
             return default
         value = raw.strip()
         if len(value) != 40 or any(c not in "0123456789abcdef" for c in value):

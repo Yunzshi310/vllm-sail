@@ -42,7 +42,6 @@ on:
 permissions:
   contents: read
   actions: read
-cache-mode: none
 
 concurrency:
   group: upstream-post-merge-${{ github.event.schedule || inputs.gear || 'auto' }}
@@ -172,26 +171,28 @@ jobs:
           fi
           if [[ -n "${LAST_GREEN_OVERRIDE}" ]]; then
             python3 - <<'PY'
-          import json, os
+          import json, os, re
           from pathlib import Path
+          override = os.environ["LAST_GREEN_OVERRIDE"].strip()
+          if not re.fullmatch(r"[0-9a-f]{40}", override):
+              raise SystemExit("last_green_sha override must be a 40-character lowercase hex SHA")
           p = Path("state/cursor.json")
           data = json.loads(p.read_text(encoding="utf-8")) if p.is_file() else {}
-          override = os.environ["LAST_GREEN_OVERRIDE"].strip()
           data["last_ppu_green_sha"] = override
           data["last_ppu_tested_sha"] = override
           p.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
           PY
           fi
 
-          # Pre-compute changed upstream paths since last_ppu_tested_sha for PPU skip allowlist.
+          # Pre-compute changed upstream paths since last_ppu_green_sha (never a red SHA).
           verified="$(tr -d '[:space:]' < .github/vllm-main-verified.commit)"
-          base_ppu_sha="$(python3 -c 'import json, pathlib, sys; p=pathlib.Path("state/cursor.json"); print(json.loads(p.read_text()).get("last_ppu_tested_sha", sys.argv[1]) if p.is_file() else sys.argv[1])' "$verified")"
+          base_ppu_green_sha="$(python3 -c 'import json, pathlib, sys; p=pathlib.Path("state/cursor.json"); print(json.loads(p.read_text()).get("last_ppu_green_sha", sys.argv[1]) if p.is_file() else sys.argv[1])' "$verified")"
           head_main_sha="$(awk '$2 == "refs/heads/main" { print $1 }' state/ls-remote.txt)"
           target_for_diff="${UPSTREAM_REF_OVERRIDE:-$head_main_sha}"
-          if [[ "$target_for_diff" =~ ^[0-9a-f]{40}$ && "$base_ppu_sha" =~ ^[0-9a-f]{40}$ && "$target_for_diff" != "$base_ppu_sha" ]]; then
+          if [[ "$target_for_diff" =~ ^[0-9a-f]{40}$ && "$base_ppu_green_sha" =~ ^[0-9a-f]{40}$ && "$target_for_diff" != "$base_ppu_green_sha" ]]; then
             git init -q state/vllm-diff
-            if git -C state/vllm-diff fetch --quiet --depth=120 https://github.com/vllm-project/vllm.git "$target_for_diff" "$base_ppu_sha" 2>/dev/null; then
-              git -C state/vllm-diff diff --name-only "$base_ppu_sha" "$target_for_diff" > state/changed-files.txt || true
+            if git -C state/vllm-diff fetch --quiet --depth=120 https://github.com/vllm-project/vllm.git "$target_for_diff" "$base_ppu_green_sha" 2>/dev/null; then
+              git -C state/vllm-diff diff --name-only "$base_ppu_green_sha" "$target_for_diff" > state/changed-files.txt || true
             fi
             rm -rf state/vllm-diff
           fi
@@ -208,6 +209,7 @@ jobs:
             --upstream-ref "${UPSTREAM_REF_OVERRIDE}" \
             --cursor-file state/cursor.json \
             --changed-files-file state/changed-files.txt \
+            --changed-files-base-sha "${base_ppu_green_sha}" \
             --active-pr-runs "${active_pr}" \
             "${force_arg[@]}" \
             --github-output "$GITHUB_OUTPUT"
@@ -377,10 +379,12 @@ jobs:
     name: PPU 1-card sliding-window smoke & bisect
     needs: [route, build, cpu-fast-check]
     if: >-
+      !cancelled() &&
       needs.route.outputs.selected_gear == 'probe' &&
       needs.route.outputs.run_ppu == 'true' &&
       needs.build.result == 'success' &&
-      (needs.route.outputs.run_cpu != 'true' || needs.cpu-fast-check.result == 'success')
+      ((needs.route.outputs.run_cpu == 'true' && needs.cpu-fast-check.result == 'success') ||
+       (needs.route.outputs.run_cpu != 'true' && needs.cpu-fast-check.result == 'skipped'))
     runs-on: 8-ppu-m890p
     timeout-minutes: 90
     concurrency:
@@ -650,7 +654,7 @@ jobs:
           EXPECTED_VLLM_COMMIT: ${{ needs.route.outputs.target_sha }}
         run: |
           mkdir -p ops-selection
-          python3 - <<'PY'
+          RUNTIME_IMAGE="$(python3 - <<'PY'
           import json, os
           from pathlib import Path
           from scripts.ci.ppu_ops_select import (
@@ -668,7 +672,9 @@ jobs:
           runtime = digest_image(os.environ["OPS_IMAGE_OVERRIDE"])
           github_outputs({"runtime_image": runtime})
           write_json("ops-selection/changes.json", collect_changes(root, None, None, os.environ["GITHUB_SHA"]))
+          print(runtime)
           PY
+          )"
           cp scripts/ci/ppu_ops_tests.json scripts/ci/ppu_ops_environment.json ops-selection/
           python3 scripts/ci/ppu_ops_select.py select --repo . \
             --config ops-selection/ppu_ops_tests.json \
@@ -678,7 +684,7 @@ jobs:
             --wheel-manifest ops-wheels/wheel-manifest.json \
             --build-run-id "${GITHUB_RUN_ID}" \
             --build-image "${BUILD_IMAGE}" \
-            --runtime-image "${{ steps.select.outputs.runtime_image || inputs.ops_image }}" \
+            --runtime-image "${RUNTIME_IMAGE}" \
             --expected-vllm-commit "${EXPECTED_VLLM_COMMIT}" \
             --scope full \
             --output ops-selection/selection.json
@@ -748,7 +754,42 @@ jobs:
             const { owner, repo } = context.repo;
             const branch = "ci/auto-pin-bump-vllm-main";
             const refName = `heads/${branch}`;
-            const filePath = ".github/vllm-main-verified.commit";
+            const pinPath = ".github/vllm-main-verified.commit";
+            const manifestPath = "csrc/upstream/manifest.toml";
+
+            const baseCommit = await github.rest.git.getCommit({
+              owner,
+              repo,
+              commit_sha: context.sha,
+            });
+            const pinBlob = await github.rest.git.createBlob({
+              owner,
+              repo,
+              content: fs.readFileSync(pinPath, "utf8"),
+              encoding: "utf-8",
+            });
+            const manifestBlob = await github.rest.git.createBlob({
+              owner,
+              repo,
+              content: fs.readFileSync(manifestPath, "utf8"),
+              encoding: "utf-8",
+            });
+            const newTree = await github.rest.git.createTree({
+              owner,
+              repo,
+              base_tree: baseCommit.data.tree.sha,
+              tree: [
+                { path: pinPath, mode: "100644", type: "blob", sha: pinBlob.data.sha },
+                { path: manifestPath, mode: "100644", type: "blob", sha: manifestBlob.data.sha },
+              ],
+            });
+            const newCommit = await github.rest.git.createCommit({
+              owner,
+              repo,
+              message: `${meta.title}\n\nSigned-off-by: github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>`,
+              tree: newTree.data.sha,
+              parents: [context.sha],
+            });
 
             try {
               await github.rest.git.getRef({ owner, repo, ref: refName });
@@ -756,7 +797,7 @@ jobs:
                 owner,
                 repo,
                 ref: refName,
-                sha: context.sha,
+                sha: newCommit.data.sha,
                 force: true,
               });
             } catch (err) {
@@ -765,26 +806,9 @@ jobs:
                 owner,
                 repo,
                 ref: `refs/${refName}`,
-                sha: context.sha,
+                sha: newCommit.data.sha,
               });
             }
-
-            const existingFile = await github.rest.repos.getContent({
-              owner,
-              repo,
-              path: filePath,
-              ref: branch,
-            });
-
-            await github.rest.repos.createOrUpdateFileContents({
-              owner,
-              repo,
-              path: filePath,
-              message: `${meta.title}\n\nSigned-off-by: github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>`,
-              content: Buffer.from(`${meta.new_pin}\n`, "utf8").toString("base64"),
-              sha: existingFile.data.sha,
-              branch,
-            });
 
             const { data: openPrs } = await github.rest.pulls.list({
               owner,
@@ -824,6 +848,7 @@ jobs:
       - rc-pin-ut
       - rc-fast-sanity
       - rc-model-sanity
+      - rc-ops-select
       - rc-ops-tests
       - daily-pin-bump
     runs-on: ubuntu-latest
@@ -856,6 +881,7 @@ jobs:
           RUN_CPU: ${{ needs.route.outputs.run_cpu || 'false' }}
           RUN_PPU: ${{ needs.route.outputs.run_ppu || 'false' }}
           PPU_SKIP_REASON: ${{ needs.route.outputs.ppu_skip_reason || 'none' }}
+          OPS_IMAGE: ${{ inputs.ops_image || '' }}
           BUILD_IMAGE: ${{ needs.build.outputs.image || '' }}
           ROUTE_RESULT: ${{ needs.route.result }}
           BUILD_RESULT: ${{ needs.build.result }}
@@ -864,90 +890,36 @@ jobs:
           RC_PIN_RESULT: ${{ needs.rc-pin-ut.result }}
           RC_FAST_RESULT: ${{ needs.rc-fast-sanity.result }}
           RC_MODEL_RESULT: ${{ needs.rc-model-sanity.result }}
+          RC_OPS_SELECT_RESULT: ${{ needs.rc-ops-select.result }}
           RC_OPS_RESULT: ${{ needs.rc-ops-tests.result }}
           BUMP_RESULT: ${{ needs.daily-pin-bump.result }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
           mkdir -p /tmp/post-merge-public
-
-          if [[ "${ROUTE_RESULT}" != "success" ]]; then
-            status="infra_error"
-            cpu_status="not_run"
-            ppu_status="not_run"
-            fail_stage="route"
-          elif [[ "${SELECTED_GEAR}" == "daily_pin_bump" ]]; then
-            cpu_status="not_run"
-            ppu_status="not_run"
-            fail_stage="none"
-            if [[ -z "${TARGET_SHA}" ]]; then
-              status="noop"
-            elif [[ "${BUMP_RESULT}" == "success" ]]; then
-              status="pass"
-            else
-              status="infra_error"
-            fi
-          elif [[ -z "${TARGET_SHA}" ]]; then
-            status="noop"
-            cpu_status="not_run"
-            ppu_status="not_run"
-            fail_stage="none"
-          else
-            fail_stage="none"
-            if [[ "${BUILD_RESULT}" == "failure" || "${BUILD_RESULT}" == "cancelled" ]]; then
-              status="fail"
-              cpu_status="not_run"
-              ppu_status="not_run"
-              fail_stage="wheel_build"
-            else
-              if [[ "${RUN_CPU}" == "true" ]]; then
-                cpu_status=$([[ "${CPU_RESULT}" == "success" ]] && echo "pass" || echo "fail")
-              else
-                cpu_status="not_run"
-              fi
-
-              if [[ "${SELECTED_GEAR}" == "probe" ]]; then
-                if [[ "${cpu_status}" == "fail" ]]; then
-                  ppu_status="skipped"
-                  PPU_SKIP_REASON="cpu_fast_check_failed"
-                elif [[ "${RUN_PPU}" == "true" ]]; then
-                  ppu_status=$([[ "${PPU_SMOKE_RESULT}" == "success" ]] && echo "pass" || echo "fail")
-                else
-                  ppu_status="skipped"
-                fi
-                if [[ "${cpu_status}" == "fail" || "${ppu_status}" == "fail" ]]; then
-                  status="fail"
-                  [[ "${ppu_status}" == "fail" ]] && fail_stage="ppu_probe_smoke"
-                elif [[ "${PPU_SKIP_REASON}" == "deferred_for_sail_pr_ci" ]]; then
-                  status="deferred"
-                else
-                  status="pass"
-                fi
-              else
-                # rc_qualify
-                rc_fail=0
-                for pair in "rc_pin_ut:${RC_PIN_RESULT}" "rc_fast_sanity:${RC_FAST_RESULT}" "rc_model_sanity:${RC_MODEL_RESULT}" "rc_ops_tests:${RC_OPS_RESULT}"; do
-                  st_name="${pair%%:*}"
-                  st_val="${pair#*:}"
-                  if [[ "${st_val}" == "failure" || "${st_val}" == "cancelled" ]]; then
-                    rc_fail=1
-                    fail_stage="${st_name}"
-                    break
-                  fi
-                done
-                if [[ "${cpu_status}" == "fail" ]]; then
-                  ppu_status="skipped"
-                  status="fail"
-                elif [[ "${rc_fail}" -eq 1 ]]; then
-                  ppu_status="fail"
-                  status="fail"
-                else
-                  ppu_status="pass"
-                  status="pass"
-                fi
-              fi
-            fi
-          fi
+          resolved_env="/tmp/post-merge-public/resolved-outcome.env"
+          : > "${resolved_env}"
+          python3 scripts/ci/ppu_upstream_post_merge.py resolve-outcome \
+            --gear "${SELECTED_GEAR}" \
+            --target-sha "${TARGET_SHA}" \
+            --run-cpu "${RUN_CPU}" \
+            --run-ppu "${RUN_PPU}" \
+            --ppu-skip-reason "${PPU_SKIP_REASON}" \
+            --ops-image "${OPS_IMAGE}" \
+            --route-result "${ROUTE_RESULT}" \
+            --build-result "${BUILD_RESULT}" \
+            --cpu-result "${CPU_RESULT}" \
+            --ppu-smoke-result "${PPU_SMOKE_RESULT}" \
+            --rc-pin-result "${RC_PIN_RESULT}" \
+            --rc-fast-result "${RC_FAST_RESULT}" \
+            --rc-model-result "${RC_MODEL_RESULT}" \
+            --rc-ops-select-result "${RC_OPS_SELECT_RESULT}" \
+            --rc-ops-result "${RC_OPS_RESULT}" \
+            --bump-result "${BUMP_RESULT}" \
+            --github-output "${resolved_env}" >/dev/null
+          # shellcheck disable=SC1090
+          source "${resolved_env}"
+          rm -f "${resolved_env}"
 
           extra_args=()
           if [[ -f /tmp/post-merge-meta/cursor.json ]]; then
@@ -969,8 +941,8 @@ jobs:
             --rc-tag "${RC_TAG}" \
             --cpu-status "${cpu_status}" \
             --ppu-status "${ppu_status}" \
-            --ppu-skip-reason "${PPU_SKIP_REASON}" \
-            --failure-stage "${fail_stage}" \
+            --ppu-skip-reason "${ppu_skip_reason}" \
+            --failure-stage "${failure_stage}" \
             --run-url "${RUN_URL}" \
             --public-dir /tmp/post-merge-public \
             --step-summary "${GITHUB_STEP_SUMMARY}" \

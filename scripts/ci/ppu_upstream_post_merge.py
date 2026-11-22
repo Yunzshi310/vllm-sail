@@ -139,7 +139,7 @@ _SENSITIVE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "internal_domain",
         re.compile(
-            r"(?i)\b(?:[a-z0-9-]+\.)+(?:alibaba-inc\.com|eng\.t-head\.cn|alipay\.net|aliyun-inc\.com)\b"
+            r"(?i)(?<![a-z0-9-])(?:[a-z0-9-]+\.)*(?:alibaba-inc\.com|t-head\.cn|alipay\.net|aliyun-inc\.com)(?![a-z0-9-])"
         ),
     ),
     (
@@ -360,6 +360,101 @@ def should_skip_ppu_for_paths(changed_paths: Sequence[str] | None) -> bool:
     return all(is_safe_ppu_skip_path(path) for path in changed_paths)
 
 
+def _sanitize_cursor(
+    cursor: dict[str, Any] | None, *, verified_pin: str
+) -> dict[str, Any]:
+    """Validate and canonicalize cursor state, failing closed on malformed fields."""
+    pin = _require_sha1(verified_pin, "verified_pin")
+    if not cursor:
+        return {
+            "schema": 1,
+            "last_cpu_checked_sha": pin,
+            "last_cpu_green_sha": pin,
+            "last_ppu_tested_sha": pin,
+            "last_ppu_green_sha": pin,
+            "tested_rc_tags": [],
+            "patch_fingerprints": {},
+        }
+    if not isinstance(cursor, dict):
+        raise ValueError("cursor must be a JSON object")
+
+    def _sha_field(key: str) -> str:
+        raw = cursor.get(key)
+        if raw is None or raw == "":
+            return pin
+        if not isinstance(raw, str):
+            raise ValueError(f"{key} must be a 40-character lowercase hex SHA")
+        return _require_sha1(raw, key)
+
+    raw_rcs = cursor.get("tested_rc_tags") or []
+    if not isinstance(raw_rcs, list):
+        raise ValueError("tested_rc_tags must be a list")
+    tested_rcs: list[str] = []
+    for item in raw_rcs:
+        if not isinstance(item, str) or not RC_TAG_RE.fullmatch(item.strip()):
+            raise ValueError(f"invalid RC tag in cursor: {item!r}")
+        tested_rcs.append(item.strip())
+
+    raw_fps = cursor.get("patch_fingerprints") or {}
+    if not isinstance(raw_fps, dict):
+        raise ValueError("patch_fingerprints must be an object")
+    clean_fps: dict[str, str] = {}
+    for k, v in raw_fps.items():
+        if not isinstance(k, str) or not isinstance(v, str):
+            raise ValueError("patch_fingerprints entries must be strings")
+        assert_zero_sensitive_leaks(k)
+        if not SAFE_SYMBOL_RE.fullmatch(k):
+            raise ValueError(f"invalid patch target key in cursor: {k!r}")
+        if v != "additive" and not re.fullmatch(r"[0-9a-f]{64}", v):
+            raise ValueError(f"invalid patch fingerprint hash for {k!r}")
+        clean_fps[k] = v
+
+    sanitized: dict[str, Any] = {
+        "schema": 1,
+        "last_cpu_checked_sha": _sha_field("last_cpu_checked_sha"),
+        "last_cpu_green_sha": _sha_field("last_cpu_green_sha"),
+        "last_ppu_tested_sha": _sha_field("last_ppu_tested_sha"),
+        "last_ppu_green_sha": _sha_field("last_ppu_green_sha"),
+        "tested_rc_tags": tested_rcs,
+        "patch_fingerprints": dict(sorted(clean_fps.items())),
+    }
+
+    rec = cursor.get("last_probe_record")
+    if rec is not None:
+        if not isinstance(rec, dict):
+            raise ValueError("last_probe_record must be an object")
+        up_sha = _require_sha1(
+            str(rec.get("upstream_sha", "")), "last_probe_record.upstream_sha"
+        )
+        green_sha = _require_sha1(
+            str(rec.get("last_ppu_green_sha", sanitized["last_ppu_green_sha"])),
+            "last_probe_record.last_ppu_green_sha",
+        )
+        tested_sha = _require_sha1(
+            str(rec.get("last_ppu_tested_sha", sanitized["last_ppu_tested_sha"])),
+            "last_probe_record.last_ppu_tested_sha",
+        )
+        cpu_st = str(rec.get("cpu_status", "not_run"))
+        ppu_st = str(rec.get("ppu_status", "not_run"))
+        skip_rs = str(rec.get("ppu_skip_reason", "none"))
+        if cpu_st not in ("pass", "fail", "not_run", "infra_error"):
+            raise ValueError("invalid last_probe_record.cpu_status")
+        if ppu_st not in ("pass", "fail", "skipped", "not_run", "infra_error"):
+            raise ValueError("invalid last_probe_record.ppu_status")
+        if skip_rs not in VALID_PPU_SKIP_REASONS:
+            raise ValueError("invalid last_probe_record.ppu_skip_reason")
+        sanitized["last_probe_record"] = {
+            "gear": "probe",
+            "upstream_sha": up_sha,
+            "cpu_status": cpu_st,
+            "ppu_status": ppu_st,
+            "ppu_skip_reason": skip_rs,
+            "last_ppu_tested_sha": tested_sha,
+            "last_ppu_green_sha": green_sha,
+        }
+    return sanitized
+
+
 def select_pin_bump_candidate(
     probe_records: Sequence[dict[str, Any]],
     *,
@@ -378,12 +473,16 @@ def select_pin_bump_candidate(
         ppu_status = record.get("ppu_status")
         skip_reason = record.get("ppu_skip_reason", "none")
         last_ppu_green = str(record.get("last_ppu_green_sha", "")).strip()
+        last_ppu_tested = str(record.get("last_ppu_tested_sha", last_ppu_green)).strip()
         if ppu_status == "pass":
             return sha
+        # A docs-only successor is promotable ONLY when PPU is currently green
+        # (no intervening failed PPU SHA between last_ppu_green_sha and sha).
         if (
             ppu_status == "skipped"
             and skip_reason == "allowlisted_non_ppu_changes"
             and SHA1_RE.fullmatch(last_ppu_green)
+            and last_ppu_tested == last_ppu_green
         ):
             return sha
     return None
@@ -399,6 +498,7 @@ def route_three_gears(
     upstream_ref_override: str = "",
     cursor: dict[str, Any] | None = None,
     changed_paths_since_ppu: Sequence[str] | None = None,
+    changed_files_base_sha: str = "",
     active_pr_runs: int = 0,
     probe_history: Sequence[dict[str, Any]] = (),
     force: bool = False,
@@ -407,11 +507,11 @@ def route_three_gears(
     if requested_gear not in VALID_GEARS:
         raise ValueError(f"unsupported gear: {requested_gear!r}")
     pin = _require_sha1(verified_pin, "verified_pin")
-    state = dict(cursor or {})
-    last_cpu_sha = state.get("last_cpu_checked_sha") or pin
-    last_ppu_tested = state.get("last_ppu_tested_sha") or pin
-    last_ppu_green = state.get("last_ppu_green_sha") or pin
-    tested_rcs = list(state.get("tested_rc_tags") or [])
+    state = _sanitize_cursor(cursor, verified_pin=pin)
+    last_cpu_green = state["last_cpu_green_sha"]
+    last_ppu_tested = state["last_ppu_tested_sha"]
+    last_ppu_green = state["last_ppu_green_sha"]
+    tested_rcs = list(state["tested_rc_tags"])
     tags: dict[str, str] = dict(ls_remote_data.get("tags") or {})
     main_sha = ls_remote_data.get("main_sha")
 
@@ -504,11 +604,20 @@ def route_three_gears(
             raise ValueError("git ls-remote output did not contain refs/heads/main")
         target_sha = _require_sha1(main_sha, "main_sha")
 
-    run_cpu = bool(force or target_sha != last_cpu_sha)
-    if not force and target_sha == last_ppu_tested:
+    # Skip checks ONLY when target_sha was previously verified GREEN (never on red).
+    run_cpu = bool(force or target_sha != last_cpu_green)
+    ppu_diff_base_ok = (not changed_files_base_sha) or (
+        _require_sha1(changed_files_base_sha, "changed_files_base_sha")
+        == last_ppu_green
+    )
+    if not force and target_sha == last_cpu_green and target_sha == last_ppu_green:
         run_ppu = False
         skip_reason = "already_tested"
-    elif should_skip_ppu_for_paths(changed_paths_since_ppu):
+    elif (
+        last_ppu_tested == last_ppu_green
+        and ppu_diff_base_ok
+        and should_skip_ppu_for_paths(changed_paths_since_ppu)
+    ):
         run_ppu = False
         skip_reason = "allowlisted_non_ppu_changes"
     elif active_pr_runs > 0 and not force:
@@ -530,6 +639,145 @@ def route_three_gears(
     }
 
 
+def evaluate_workflow_outcome(
+    *,
+    selected_gear: str,
+    target_sha: str,
+    run_cpu: bool,
+    run_ppu: bool,
+    ppu_skip_reason: str,
+    ops_image: str = "",
+    route_result: str = "success",
+    build_result: str = "skipped",
+    cpu_result: str = "skipped",
+    ppu_smoke_result: str = "skipped",
+    rc_pin_result: str = "skipped",
+    rc_fast_result: str = "skipped",
+    rc_model_result: str = "skipped",
+    rc_ops_select_result: str = "skipped",
+    rc_ops_result: str = "skipped",
+    bump_result: str = "skipped",
+) -> dict[str, str]:
+    """Deterministically reduce workflow job results without turning skipped/red into pass."""
+    safe_skip = ppu_skip_reason if ppu_skip_reason in VALID_PPU_SKIP_REASONS else "none"
+    if route_result != "success":
+        return {
+            "status": "infra_error",
+            "cpu_status": "not_run",
+            "ppu_status": "not_run",
+            "ppu_skip_reason": safe_skip,
+            "failure_stage": "route",
+        }
+    if selected_gear == "daily_pin_bump":
+        if not target_sha:
+            st = "noop"
+        elif bump_result == "success":
+            st = "pass"
+        else:
+            st = "infra_error"
+        return {
+            "status": st,
+            "cpu_status": "not_run",
+            "ppu_status": "not_run",
+            "ppu_skip_reason": "not_applicable",
+            "failure_stage": "route" if st == "infra_error" else "none",
+        }
+    if not target_sha:
+        return {
+            "status": "noop",
+            "cpu_status": "not_run",
+            "ppu_status": "not_run",
+            "ppu_skip_reason": safe_skip,
+            "failure_stage": "none",
+        }
+    if selected_gear == "probe":
+        if not run_cpu and not run_ppu and safe_skip == "already_tested":
+            return {
+                "status": "noop",
+                "cpu_status": "not_run",
+                "ppu_status": "skipped",
+                "ppu_skip_reason": "already_tested",
+                "failure_stage": "none",
+            }
+        if (run_cpu or run_ppu) and build_result != "success":
+            return {
+                "status": "fail",
+                "cpu_status": "not_run",
+                "ppu_status": "not_run",
+                "ppu_skip_reason": safe_skip,
+                "failure_stage": "wheel_build",
+            }
+        cpu_st = (
+            ("pass" if cpu_result == "success" else "fail") if run_cpu else "not_run"
+        )
+        if cpu_st == "fail":
+            return {
+                "status": "fail",
+                "cpu_status": "fail",
+                "ppu_status": "skipped",
+                "ppu_skip_reason": "cpu_fast_check_failed",
+                "failure_stage": "plugin_registration",
+            }
+        if run_ppu:
+            ppu_st = "pass" if ppu_smoke_result == "success" else "fail"
+            return {
+                "status": "pass" if ppu_st == "pass" else "fail",
+                "cpu_status": cpu_st,
+                "ppu_status": ppu_st,
+                "ppu_skip_reason": "none",
+                "failure_stage": "none" if ppu_st == "pass" else "ppu_probe_smoke",
+            }
+        return {
+            "status": "deferred" if safe_skip == "deferred_for_sail_pr_ci" else "pass",
+            "cpu_status": cpu_st,
+            "ppu_status": "skipped",
+            "ppu_skip_reason": safe_skip,
+            "failure_stage": "none",
+        }
+
+    # Gear 3: rc_qualify requires EVERY mandatory gate (and ops when requested) to be "success".
+    if build_result != "success":
+        return {
+            "status": "fail",
+            "cpu_status": "not_run",
+            "ppu_status": "not_run",
+            "ppu_skip_reason": "none",
+            "failure_stage": "wheel_build",
+        }
+    if cpu_result != "success":
+        return {
+            "status": "fail",
+            "cpu_status": "fail",
+            "ppu_status": "skipped",
+            "ppu_skip_reason": "cpu_fast_check_failed",
+            "failure_stage": "plugin_registration",
+        }
+    rc_gates: list[tuple[str, str]] = [
+        ("rc_pin_ut", rc_pin_result),
+        ("rc_fast_sanity", rc_fast_result),
+        ("rc_model_sanity", rc_model_result),
+    ]
+    if ops_image.strip():
+        rc_gates.append(("rc_ops_tests", rc_ops_select_result))
+        rc_gates.append(("rc_ops_tests", rc_ops_result))
+    for stage_name, result_val in rc_gates:
+        if result_val != "success":
+            return {
+                "status": "fail",
+                "cpu_status": "pass",
+                "ppu_status": "fail",
+                "ppu_skip_reason": "none",
+                "failure_stage": stage_name,
+            }
+    return {
+        "status": "pass",
+        "cpu_status": "pass",
+        "ppu_status": "pass",
+        "ppu_skip_reason": "none",
+        "failure_stage": "none",
+    }
+
+
 def advance_cursor(
     cursor: dict[str, Any] | None,
     *,
@@ -537,6 +785,7 @@ def advance_cursor(
     selected_gear: str,
     target_sha: str,
     rc_tag: str = "",
+    status: str = "pass",
     cpu_status: str = "not_run",
     ppu_status: str = "not_run",
     ppu_skip_reason: str = "none",
@@ -544,18 +793,8 @@ def advance_cursor(
 ) -> dict[str, Any]:
     """Update persistent cursor without recording hardware pass for skipped SHAs."""
     pin = _require_sha1(verified_pin, "verified_pin")
-    updated: dict[str, Any] = {
-        "schema": 1,
-        "last_cpu_checked_sha": (cursor or {}).get("last_cpu_checked_sha") or pin,
-        "last_cpu_green_sha": (cursor or {}).get("last_cpu_green_sha") or pin,
-        "last_ppu_tested_sha": (cursor or {}).get("last_ppu_tested_sha") or pin,
-        "last_ppu_green_sha": (cursor or {}).get("last_ppu_green_sha") or pin,
-        "tested_rc_tags": list((cursor or {}).get("tested_rc_tags") or []),
-        "patch_fingerprints": dict((cursor or {}).get("patch_fingerprints") or {}),
-    }
-    if (cursor or {}).get("last_probe_record"):
-        updated["last_probe_record"] = dict((cursor or {})["last_probe_record"])
-    if not target_sha or not SHA1_RE.fullmatch(target_sha):
+    updated = _sanitize_cursor(cursor, verified_pin=pin)
+    if status == "noop" or not target_sha or not SHA1_RE.fullmatch(target_sha):
         return updated
 
     if cpu_status in ("pass", "fail"):
@@ -563,7 +802,15 @@ def advance_cursor(
         if cpu_status == "pass":
             updated["last_cpu_green_sha"] = target_sha
             if patch_fingerprints:
-                updated["patch_fingerprints"] = dict(sorted(patch_fingerprints.items()))
+                for k, v in patch_fingerprints.items():
+                    assert_zero_sensitive_leaks(k)
+                    if SAFE_SYMBOL_RE.fullmatch(k) and (
+                        v == "additive" or re.fullmatch(r"[0-9a-f]{64}", v)
+                    ):
+                        updated["patch_fingerprints"][k] = v
+                updated["patch_fingerprints"] = dict(
+                    sorted(updated["patch_fingerprints"].items())
+                )
 
     # Hardware cursor advances ONLY when device smoke actually executed!
     if ppu_status in ("pass", "fail"):
@@ -574,19 +821,26 @@ def advance_cursor(
     if (
         selected_gear == "rc_qualify"
         and rc_tag
+        and RC_TAG_RE.fullmatch(rc_tag)
+        and status == "pass"
         and cpu_status == "pass"
         and ppu_status == "pass"
     ):
         if rc_tag not in updated["tested_rc_tags"]:
             updated["tested_rc_tags"].append(rc_tag)
 
-    if selected_gear == "probe":
+    if selected_gear == "probe" and (
+        cpu_status in ("pass", "fail") or ppu_status in ("pass", "fail")
+    ):
         updated["last_probe_record"] = {
             "gear": "probe",
             "upstream_sha": target_sha,
             "cpu_status": cpu_status,
             "ppu_status": ppu_status,
-            "ppu_skip_reason": ppu_skip_reason,
+            "ppu_skip_reason": ppu_skip_reason
+            if ppu_skip_reason in VALID_PPU_SKIP_REASONS
+            else "none",
+            "last_ppu_tested_sha": updated["last_ppu_tested_sha"],
             "last_ppu_green_sha": updated["last_ppu_green_sha"],
         }
     return updated
@@ -1125,12 +1379,14 @@ def prepare_pin_bump(
     repo_root: Path,
     target_sha: str,
     verified_pin_file: Path | None = None,
+    manifest_file: Path | None = None,
 ) -> dict[str, str]:
-    """Validate and write the daily small-step pin bump to ``vllm-main-verified.commit``."""
+    """Validate and atomically bump ``vllm-main-verified.commit`` and ``manifest.toml``."""
     target = _require_sha1(target_sha, "target_sha")
     pin_path = verified_pin_file or (
         repo_root / ".github" / "vllm-main-verified.commit"
     )
+    manifest_path = manifest_file or (repo_root / "csrc" / "upstream" / "manifest.toml")
     previous = _require_sha1(pin_path.read_text(encoding="utf-8"), "previous_pin")
     if target == previous:
         return {
@@ -1140,13 +1396,30 @@ def prepare_pin_bump(
             "title": "",
             "body": "",
         }
+
+    if manifest_path.is_file():
+        manifest_text = manifest_path.read_text(encoding="utf-8")
+        new_manifest_text, count = re.subn(
+            r'(?m)^upstream_ref\s*=\s*"[0-9a-f]{40}"\s*$',
+            f'upstream_ref = "{target}"',
+            manifest_text,
+        )
+        if count != 1:
+            raise ValueError(
+                f"expected exactly one 40-hex upstream_ref assignment in {manifest_path}"
+            )
+        manifest_path.write_text(new_manifest_text, encoding="utf-8")
+        if _load_toml(manifest_path).get("upstream_ref") != target:
+            raise ValueError(
+                "manifest.toml upstream_ref verification failed after bump"
+            )
+
     pin_path.write_text(target + "\n", encoding="utf-8")
     title = f"[CI][Pin] Advance verified upstream vLLM commit to {target[:12]}"
     body = (
         "## Summary\n\n"
-        f"- Advance `.github/vllm-main-verified.commit` from `{previous}` to probe-verified `{target}`.\n"
-        "- Keeps `csrc/upstream/manifest.toml` unchanged unless a kernel re-port is required.\n"
-        "- Validated via post-merge probe; full PR Fast Gate and Nightly Model Sanity apply before/after merge.\n"
+        f"- Advance `.github/vllm-main-verified.commit` and `csrc/upstream/manifest.toml` `upstream_ref` from `{previous}` to probe-verified `{target}`.\n"
+        "- Validated via post-merge probe (`check_patch_drift` + Tier-A kernel compatibility + PPU smoke); full PR Fast Gate and Nightly Model Sanity apply before/after merge.\n"
     )
     assert_zero_sensitive_leaks(title)
     assert_zero_sensitive_leaks(body)
@@ -1180,6 +1453,7 @@ def run_sdk_cpu_fast_check(
     env = dict(os.environ)
     env.pop("VLLM_VERSION", None)
     env.pop("VLLM_VERSION_OVERRIDE", None)
+    env.pop("VLLM_PPU_CANDIDATE_UPSTREAM_COMMIT", None)
     if target != pin:
         env["VLLM_SAIL_CANDIDATE_UPSTREAM_COMMIT"] = target
     else:
@@ -1371,14 +1645,18 @@ def run_sdk_cpu_fast_check(
 
 
 def _write_github_outputs(path: Path | None, values: dict[str, Any]) -> None:
-    if path is None:
-        return
-    with path.open("a", encoding="utf-8") as stream:
-        for key, raw in values.items():
-            val = "true" if raw is True else ("false" if raw is False else str(raw))
-            if "\n" in val or "\r" in val:
-                raise ValueError(f"multiline GitHub output forbidden for {key}")
-            stream.write(f"{key}={val}\n")
+    lines: list[str] = []
+    for key, raw in values.items():
+        val = "true" if raw is True else ("false" if raw is False else str(raw))
+        if "\n" in val or "\r" in val:
+            raise ValueError(f"multiline GitHub output forbidden for {key}")
+        lines.append(f"{key}={val}")
+    block = "\n".join(lines) + ("\n" if lines else "")
+    staging = [path] if path is not None else ()
+    assert_zero_sensitive_leaks(block, staging_paths=staging)
+    if path is not None:
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(block)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1399,6 +1677,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     p_route.add_argument("--upstream-ref", default="")
     p_route.add_argument("--cursor-file", type=Path, default=None)
     p_route.add_argument("--changed-files-file", type=Path, default=None)
+    p_route.add_argument("--changed-files-base-sha", default="")
     p_route.add_argument("--probe-history-file", type=Path, default=None)
     p_route.add_argument("--active-pr-runs", type=int, default=0)
     p_route.add_argument("--force", action="store_true")
@@ -1429,6 +1708,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     p_bump.add_argument("--target-sha", required=True)
     p_bump.add_argument("--output-json", type=Path, default=None)
     p_bump.add_argument("--github-output", type=Path, default=None)
+
+    p_resolve = sub.add_parser("resolve-outcome")
+    p_resolve.add_argument("--gear", choices=SELECTED_GEARS, required=True)
+    p_resolve.add_argument("--target-sha", default="")
+    p_resolve.add_argument("--run-cpu", default="false")
+    p_resolve.add_argument("--run-ppu", default="false")
+    p_resolve.add_argument("--ppu-skip-reason", default="none")
+    p_resolve.add_argument("--ops-image", default="")
+    p_resolve.add_argument("--route-result", default="success")
+    p_resolve.add_argument("--build-result", default="skipped")
+    p_resolve.add_argument("--cpu-result", default="skipped")
+    p_resolve.add_argument("--ppu-smoke-result", default="skipped")
+    p_resolve.add_argument("--rc-pin-result", default="skipped")
+    p_resolve.add_argument("--rc-fast-result", default="skipped")
+    p_resolve.add_argument("--rc-model-result", default="skipped")
+    p_resolve.add_argument("--rc-ops-select-result", default="skipped")
+    p_resolve.add_argument("--rc-ops-result", default="skipped")
+    p_resolve.add_argument("--bump-result", default="skipped")
+    p_resolve.add_argument("--github-output", type=Path, default=None)
 
     p_pub = sub.add_parser("publish")
     p_pub.add_argument("--gear", choices=SELECTED_GEARS, required=True)
@@ -1508,12 +1806,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             upstream_ref_override=args.upstream_ref,
             cursor=cursor,
             changed_paths_since_ppu=changed,
+            changed_files_base_sha=args.changed_files_base_sha,
             active_pr_runs=args.active_pr_runs,
             probe_history=history,
             force=args.force,
         )
+        decision_text = json.dumps(decision, indent=2, sort_keys=True)
+        assert_zero_sensitive_leaks(decision_text)
         _write_github_outputs(args.github_output, decision)
-        print(json.dumps(decision, indent=2, sort_keys=True))
+        print(decision_text)
         return 0
 
     if args.command == "cpu-check":
@@ -1652,11 +1953,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "prepare-pin-bump":
         res = prepare_pin_bump(repo_root=args.repo_root, target_sha=args.target_sha)
+        res_text = json.dumps(res, indent=2, sort_keys=True) + "\n"
+        staging = [args.output_json] if args.output_json is not None else ()
+        assert_zero_sensitive_leaks(res_text, staging_paths=staging)
         if args.output_json is not None:
             args.output_json.parent.mkdir(parents=True, exist_ok=True)
-            args.output_json.write_text(
-                json.dumps(res, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-            )
+            args.output_json.write_text(res_text, encoding="utf-8")
         _write_github_outputs(
             args.github_output,
             {
@@ -1666,7 +1968,32 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "title": res["title"],
             },
         )
-        print(json.dumps(res, indent=2, sort_keys=True))
+        print(res_text, end="")
+        return 0
+
+    if args.command == "resolve-outcome":
+        resolved = evaluate_workflow_outcome(
+            selected_gear=args.gear,
+            target_sha=args.target_sha.strip(),
+            run_cpu=args.run_cpu.strip().lower() == "true",
+            run_ppu=args.run_ppu.strip().lower() == "true",
+            ppu_skip_reason=args.ppu_skip_reason.strip() or "none",
+            ops_image=args.ops_image.strip(),
+            route_result=args.route_result.strip(),
+            build_result=args.build_result.strip(),
+            cpu_result=args.cpu_result.strip(),
+            ppu_smoke_result=args.ppu_smoke_result.strip(),
+            rc_pin_result=args.rc_pin_result.strip(),
+            rc_fast_result=args.rc_fast_result.strip(),
+            rc_model_result=args.rc_model_result.strip(),
+            rc_ops_select_result=args.rc_ops_select_result.strip(),
+            rc_ops_result=args.rc_ops_result.strip(),
+            bump_result=args.bump_result.strip(),
+        )
+        resolved_text = json.dumps(resolved, indent=2, sort_keys=True)
+        assert_zero_sensitive_leaks(resolved_text)
+        _write_github_outputs(args.github_output, resolved)
+        print(resolved_text)
         return 0
 
     if args.command == "publish":
@@ -1754,6 +2081,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             selected_gear=args.gear,
             target_sha=args.upstream_sha,
             rc_tag=args.rc_tag,
+            status=effective_status,
             cpu_status=args.cpu_status,
             ppu_status=args.ppu_status,
             ppu_skip_reason=args.ppu_skip_reason,

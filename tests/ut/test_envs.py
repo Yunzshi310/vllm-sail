@@ -458,9 +458,23 @@ def test_candidate_upstream_commit_requires_exact_40_hex_sha(monkeypatch):
     assert envs.VLLM_SAIL_CANDIDATE_UPSTREAM_COMMIT == sha_a
     monkeypatch.setenv("VLLM_SAIL_CANDIDATE_UPSTREAM_COMMIT", sha_b)
     assert envs.VLLM_PPU_CANDIDATE_UPSTREAM_COMMIT == sha_b
-    monkeypatch.setenv("VLLM_SAIL_CANDIDATE_UPSTREAM_COMMIT", " ")
-    assert envs.VLLM_SAIL_CANDIDATE_UPSTREAM_COMMIT is None
-    for invalid in ("*", "true", "1", "main", "8b10bda", "A" * 40, "g" * 40):
+    for invalid in (
+        "",
+        " ",
+        "\t\n",
+        "*",
+        "true",
+        "1",
+        "main",
+        "8b10bda",
+        "A" * 40,
+        "g" * 40,
+    ):
         monkeypatch.setenv("VLLM_SAIL_CANDIDATE_UPSTREAM_COMMIT", invalid)
         with pytest.raises(ValueError, match="VLLM_SAIL_CANDIDATE_UPSTREAM_COMMIT"):
+            _ = envs.VLLM_SAIL_CANDIDATE_UPSTREAM_COMMIT
+    monkeypatch.delenv("VLLM_SAIL_CANDIDATE_UPSTREAM_COMMIT")
+    for empty_alias in ("", "   "):
+        monkeypatch.setenv("VLLM_PPU_CANDIDATE_UPSTREAM_COMMIT", empty_alias)
+        with pytest.raises(ValueError, match="VLLM_PPU_CANDIDATE_UPSTREAM_COMMIT"):
             _ = envs.VLLM_SAIL_CANDIDATE_UPSTREAM_COMMIT

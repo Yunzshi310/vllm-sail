@@ -46,6 +46,16 @@ def _candidate_upstream_commit() -> str | None:
         raise RuntimeError(str(exc)) from exc
 
 
+def _raw_installed_vllm_version() -> str:
+    """Return the package's built-in ``vllm.version.__version__`` without env overrides."""
+    try:
+        from vllm.version import __version__
+
+        return __version__
+    except Exception:  # pragma: no cover - vllm always has a version in practice
+        return "unknown"
+
+
 def installed_vllm_version() -> str:
     """The installed vLLM version string.
 
@@ -60,12 +70,7 @@ def installed_vllm_version() -> str:
     if override:
         return override.strip()
 
-    try:
-        from vllm.version import __version__
-
-        return __version__
-    except Exception:  # pragma: no cover - vllm always has a version in practice
-        return "unknown"
+    return _raw_installed_vllm_version()
 
 
 def _version_key(version: str) -> tuple[int, ...] | None:
@@ -120,13 +125,16 @@ def vllm_version_at_least(target: str) -> bool:
     return current >= wanted
 
 
-def _installed_vllm_commit(version: str) -> str | None:
-    """Extract the verified 40-hex commit from SCM version or exact-tag _version."""
-    match = re.search(r"(?:\+|\.)g([0-9a-f]{40})(?=\.|$)", version)
+def _installed_vllm_commit(raw_version: str) -> str | None:
+    """Extract the verified 40-hex commit when no version env override is active."""
+    if (
+        os.getenv("VLLM_VERSION") is not None
+        or os.getenv("VLLM_VERSION_OVERRIDE") is not None
+    ):
+        return None
+    match = re.search(r"(?:\+|\.)g([0-9a-f]{40})(?=\.|$)", raw_version)
     if match is not None:
         return match.group(1)
-    if os.getenv("VLLM_VERSION") or os.getenv("VLLM_VERSION_OVERRIDE"):
-        return None
     for mod_name in ("vllm._version", "vllm.version"):
         try:
             mod = __import__(mod_name, fromlist=["__commit_id__"])
@@ -161,13 +169,19 @@ def check_vllm_compatibility(*, force: bool = False) -> None:
     version = installed_vllm_version()
     pin = _verified_upstream_commit()
     candidate = _candidate_upstream_commit()
+    has_override = (
+        os.getenv("VLLM_VERSION") is not None
+        or os.getenv("VLLM_VERSION_OVERRIDE") is not None
+    )
+    raw_version = version if not has_override else _raw_installed_vllm_version()
     if candidate is not None:
-        commit = _installed_vllm_commit(version)
+        commit = _installed_vllm_commit(raw_version)
         if commit != candidate:
             raise RuntimeError(
                 f"vllm-sail {_plugin_version()} candidate mode requires exact "
                 f"vLLM commit {candidate}, but the installed version is "
-                f"{version!r}. Build that exact candidate source with the full "
+                f"{version!r} (VLLM_VERSION / VLLM_VERSION_OVERRIDE must be unset). "
+                "Build that exact candidate source with the full "
                 "SCM commit hash and unset VLLM_VERSION and "
                 "VLLM_VERSION_OVERRIDE."
             )
@@ -184,7 +198,7 @@ def check_vllm_compatibility(*, force: bool = False) -> None:
         # Main and release tags may live on different branches. SCM's numeric
         # prefix then describes an older tag, while its full hash still names
         # the source precisely. An abbreviation cannot establish this identity.
-        commit = _installed_vllm_commit(version)
+        commit = _installed_vllm_commit(raw_version)
         if commit != pin:
             raise RuntimeError(
                 f"vllm-sail {_plugin_version()} requires verified vLLM commit "
