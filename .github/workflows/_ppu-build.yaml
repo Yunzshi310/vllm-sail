@@ -136,16 +136,27 @@ jobs:
         run: printf 'ready_epoch=%s\n' "$(date +%s)" >> "$GITHUB_OUTPUT"
 
       - name: Sanitize public build diagnostics
+        id: sanitize_diagnostics
         if: always() && inputs.diagnostics_mode == 'public'
         shell: bash
         run: |
+          set -euo pipefail
           rm -rf artifacts/logs
+          raw_tmp="$(mktemp "${RUNNER_TEMP:-/tmp}/raw-build-manifest.XXXXXX")"
+          if [ -f artifacts/build-manifest.txt ]; then
+            mv artifacts/build-manifest.txt "${raw_tmp}"
+          else
+            : > "${raw_tmp}"
+          fi
+          rm -f artifacts/build-manifest.txt
           python_bin="$(command -v python3 || command -v python)"
           "${python_bin}" scripts/ci/ppu_upstream_post_merge.py sanitize-build-manifest \
-            --manifest artifacts/build-manifest.txt
+            --input "${raw_tmp}" \
+            --output artifacts/build-manifest.txt
+          rm -f "${raw_tmp}"
 
       - name: Upload build diagnostics
-        if: always()
+        if: always() && (inputs.diagnostics_mode != 'public' || steps.sanitize_diagnostics.outcome == 'success')
         uses: actions/upload-artifact@v4
         with:
           name: ppu-build-diagnostics-${{ github.run_id }}

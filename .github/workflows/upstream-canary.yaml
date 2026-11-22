@@ -665,35 +665,11 @@ jobs:
           PY
           )"
           cp scripts/ci/ppu_ops_tests.json scripts/ci/ppu_ops_environment.json ops-selection/
-          python3 - <<'PY'
-          import os
-          from pathlib import Path
-          from scripts.ci.ppu_upstream_post_merge import extract_image_digest
-
-          build_image = os.environ["BUILD_IMAGE"].strip()
-          lines = []
-          recorded_digest = ""
-          for raw in Path("ops-build-diagnostics/build-manifest.txt").read_text(encoding="utf-8").splitlines():
-              k, sep, v = raw.partition("=")
-              if not sep:
-                  continue
-              if k == "build_image_digest":
-                  recorded_digest = v.strip()
-                  continue
-              if k != "build_image":
-                  lines.append(raw)
-          if recorded_digest != extract_image_digest(build_image):
-              raise SystemExit(
-                  f"Observed sanitized build image digest mismatch: {recorded_digest} != {extract_image_digest(build_image)}"
-              )
-          lines.append(f"build_image={build_image}")
-          Path("/tmp/rc-ops-build-manifest.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
-          PY
           python3 scripts/ci/ppu_ops_select.py select --repo . \
             --config ops-selection/ppu_ops_tests.json \
             --environment ops-selection/ppu_ops_environment.json \
             --changes ops-selection/changes.json \
-            --build-manifest /tmp/rc-ops-build-manifest.txt \
+            --build-manifest ops-build-diagnostics/build-manifest.txt \
             --wheel-manifest ops-wheels/wheel-manifest.json \
             --build-run-id "${GITHUB_RUN_ID}" \
             --build-image "${BUILD_IMAGE}" \
@@ -752,10 +728,20 @@ jobs:
         env:
           TARGET_SHA: ${{ needs.route.outputs.target_sha }}
         run: |
+          set -euo pipefail
+          verified="$(tr -d '[:space:]' < .github/vllm-main-verified.commit)"
+          git init -q /tmp/vllm-pin-ancestry
+          git -C /tmp/vllm-pin-ancestry remote add origin https://github.com/vllm-project/vllm.git
+          git -C /tmp/vllm-pin-ancestry fetch --quiet --depth=250 origin "${TARGET_SHA}"
+          if [[ "${TARGET_SHA}" != "${verified}" ]]; then
+            git -C /tmp/vllm-pin-ancestry fetch --quiet --depth=1 origin "${verified}" || true
+          fi
           python3 scripts/ci/ppu_upstream_post_merge.py prepare-pin-bump \
             --target-sha "${TARGET_SHA}" \
+            --vllm-repo /tmp/vllm-pin-ancestry \
             --output-json /tmp/pin-bump.json \
             --github-output "$GITHUB_OUTPUT"
+          rm -rf /tmp/vllm-pin-ancestry
 
       - name: Commit pin bump branch and open or update PR
         if: steps.prep.outputs.changed == 'true'

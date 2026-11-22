@@ -1710,3 +1710,213 @@ def test_review_r7_r8_moe_sum_schema_parity_and_sanitized_build_diagnostics(tmp_
     assert "/ppusw" not in cleaned
     assert f"build_image_digest=sha256:{'9' * 64}" in cleaned
     assert "status=succeeded" in cleaned
+
+
+def test_review_r2_sub1_no_pin_downgrade_fail_closed_manifest_and_rc_ops_digest(
+    tmp_path, monkeypatch
+):
+    from scripts.ci import ppu_ops_select
+
+    sha_a = VERIFIED_PIN
+    sha_b = _sha(801)
+    sha_c = _sha(802)
+
+    # 1. Counterexample 1: B then C pass probe -> C merges as current verified_pin ->
+    #    daily_pin_bump (both auto and manual override=B) must NOT downgrade C -> B!
+    cur1 = post_merge.advance_cursor(
+        None,
+        verified_pin=sha_a,
+        selected_gear="probe",
+        target_sha=sha_b,
+        status="pass",
+        cpu_status="pass",
+        ppu_status="pass",
+    )
+    cur2 = post_merge.advance_cursor(
+        cur1,
+        verified_pin=sha_a,
+        selected_gear="probe",
+        target_sha=sha_c,
+        status="pass",
+        cpu_status="pass",
+        ppu_status="pass",
+    )
+    # Before C merges (pin == A): selects C (and manual override=B selects forward B).
+    assert (
+        post_merge.route_three_gears(
+            ls_remote_data={"main_sha": sha_c, "tags": {}},
+            verified_pin=sha_a,
+            release_baseline_tag="v0.33.0",
+            requested_gear="daily_pin_bump",
+            cursor=cur2,
+        )["target_sha"]
+        == sha_c
+    )
+    assert (
+        post_merge.route_three_gears(
+            ls_remote_data={"main_sha": sha_c, "tags": {}},
+            verified_pin=sha_a,
+            release_baseline_tag="v0.33.0",
+            requested_gear="daily_pin_bump",
+            cursor=cur2,
+            upstream_ref_override=sha_b,
+        )["target_sha"]
+        == sha_b
+    )
+    # After C merges (verified_pin == C): auto AND manual override=B MUST return ""!
+    assert (
+        post_merge.route_three_gears(
+            ls_remote_data={"main_sha": sha_c, "tags": {}},
+            verified_pin=sha_c,
+            release_baseline_tag="v0.33.0",
+            requested_gear="daily_pin_bump",
+            cursor=cur2,
+        )["target_sha"]
+        == ""
+    )
+    assert (
+        post_merge.route_three_gears(
+            ls_remote_data={"main_sha": sha_c, "tags": {}},
+            verified_pin=sha_c,
+            release_baseline_tag="v0.33.0",
+            requested_gear="daily_pin_bump",
+            cursor=cur2,
+            upstream_ref_override=sha_b,
+        )["target_sha"]
+        == ""
+    )
+
+    # Also verify prepare_pin_bump rejects non-descendant target_sha when --vllm-repo is provided.
+    vllm_git = tmp_path / "vllm-ancestry"
+    vllm_git.mkdir()
+    subprocess.run(["git", "-C", str(vllm_git), "init", "-q"], check=True)
+    git_env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "Test",
+        "GIT_COMMITTER_NAME": "Test",
+        "GIT_AUTHOR_EMAIL": "test@example.org",
+        "GIT_COMMITTER_EMAIL": "test@example.org",
+    }
+    ancestry_shas: list[str] = []
+    for idx in range(2):
+        (vllm_git / "f.txt").write_text(f"{idx}\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(vllm_git), "add", "f.txt"], check=True)
+        subprocess.run(
+            ["git", "-C", str(vllm_git), "commit", "-qm", str(idx)],
+            check=True,
+            env=git_env,
+        )
+        ancestry_shas.append(
+            subprocess.check_output(
+                ["git", "-C", str(vllm_git), "rev-parse", "HEAD"], text=True
+            ).strip()
+        )
+    fake_sail = tmp_path / "sail-downgrade"
+    (fake_sail / ".github").mkdir(parents=True)
+    (fake_sail / "csrc" / "upstream").mkdir(parents=True)
+    pin_f = fake_sail / ".github" / "vllm-main-verified.commit"
+    man_f = fake_sail / "csrc" / "upstream" / "manifest.toml"
+    shutil.copyfile(REPO_ROOT / "csrc/upstream/manifest.toml", man_f)
+    # Current pin = newer commit ancestry_shas[1]; attempting to bump to older ancestry_shas[0] fails!
+    pin_f.write_text(ancestry_shas[1] + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="first-parent descendant"):
+        post_merge.prepare_pin_bump(
+            repo_root=fake_sail,
+            target_sha=ancestry_shas[0],
+            vllm_repo=vllm_git,
+        )
+    # Forward bump ancestry_shas[0] -> ancestry_shas[1] succeeds!
+    pin_f.write_text(ancestry_shas[0] + "\n", encoding="utf-8")
+    ok_bump = post_merge.prepare_pin_bump(
+        repo_root=fake_sail,
+        target_sha=ancestry_shas[1],
+        vllm_repo=vllm_git,
+    )
+    assert ok_bump["changed"] == "true"
+
+    # 2. Counterexample 2: Fault injection before rewrite in sanitize_build_manifest_file
+    #    wipes raw manifest (fail-closed), and _ppu-build.yaml gates public upload on sanitize success.
+    fault_manifest = tmp_path / "raw-fault-manifest.txt"
+    fault_manifest.write_text(
+        "status=succeeded\nbuild_image=download.t-head.cn/docker_release/pytorch@sha256:"
+        + "a" * 64
+        + "\n",
+        encoding="utf-8",
+    )
+    orig_read_text = Path.read_text
+
+    def _boom(self: Path, *a, **kw):
+        if self == fault_manifest:
+            raise OSError("simulated read failure before rewrite")
+        return orig_read_text(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "read_text", _boom)
+    with pytest.raises(OSError, match="simulated read failure"):
+        post_merge.sanitize_build_manifest_file(fault_manifest)
+    monkeypatch.setattr(Path, "read_text", orig_read_text)
+    assert not fault_manifest.exists()
+
+    build_wf = yaml.safe_load(
+        (REPO_ROOT / ".github/workflows/_ppu-build.yaml").read_text(encoding="utf-8")
+    )["jobs"]["build"]["steps"]
+    sanitize_step = next(
+        s for s in build_wf if s.get("name") == "Sanitize public build diagnostics"
+    )
+    upload_diag = next(
+        s for s in build_wf if s.get("name") == "Upload build diagnostics"
+    )
+    assert sanitize_step.get("id") == "sanitize_diagnostics"
+    assert "steps.sanitize_diagnostics.outcome == 'success'" in upload_diag["if"]
+
+    # 3. Counterexample 3: Both raw and sanitized build-manifest.txt are accepted by
+    #    ppu_ops_select.build_fingerprint (used by both rc-ops-select and ppu_ops_runner)!
+    sail_sha = _sha(810)
+    vllm_sha = _sha(811)
+    img_digest = "7" * 64
+    full_build_image = f"download.t-head.cn/docker_release/pytorch@sha256:{img_digest}"
+    wheel_man = {"commits": {"vllm": vllm_sha, "vllm-sail": sail_sha}}
+
+    raw_diag_file = tmp_path / "diag-raw.txt"
+    san_diag_file = tmp_path / "diag-sanitized.txt"
+    raw_diag_file.write_text(
+        "\n".join(
+            [
+                "status=succeeded",
+                f"vllm_commit={vllm_sha}",
+                f"vllm_sail_commit={sail_sha}",
+                f"build_image={full_build_image}",
+                "pytorch_sail_arch=ppu_15;ppu_10",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    shutil.copyfile(raw_diag_file, san_diag_file)
+    post_merge.sanitize_build_manifest_file(san_diag_file)
+    post_merge.assert_zero_sensitive_leaks(san_diag_file.read_text(encoding="utf-8"))
+
+    fp_raw = ppu_ops_select.build_fingerprint(
+        ppu_ops_select.read_diagnostics(raw_diag_file),
+        wheel_man,
+        tested_sha=sail_sha,
+        expected_vllm_commit=vllm_sha,
+        build_image=full_build_image,
+    )
+    fp_san = ppu_ops_select.build_fingerprint(
+        ppu_ops_select.read_diagnostics(san_diag_file),
+        wheel_man,
+        tested_sha=sail_sha,
+        expected_vllm_commit=vllm_sha,
+        build_image=full_build_image,
+    )
+    assert fp_san == fp_raw
+    # Wrong digest in sanitized manifest must still fail closed!
+    wrong_image = f"download.t-head.cn/docker_release/pytorch@sha256:{'8' * 64}"
+    with pytest.raises(ValueError, match="Observed build image mismatch"):
+        ppu_ops_select.build_fingerprint(
+            ppu_ops_select.read_diagnostics(san_diag_file),
+            wheel_man,
+            tested_sha=sail_sha,
+            expected_vllm_commit=vllm_sha,
+            build_image=wrong_image,
+        )

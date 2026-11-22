@@ -594,14 +594,18 @@ def select_pin_bump_candidate(
     *,
     verified_pin: str,
 ) -> str | None:
-    """Pick the latest healthy probe SHA eligible to advance verified_pin."""
+    """Pick the latest healthy probe SHA newer than verified_pin."""
     pin = _require_sha1(verified_pin, "verified_pin")
     for record in probe_records:
-        if record.get("gear") != "probe":
+        if not isinstance(record, dict) or record.get("gear") != "probe":
             continue
         sha = str(record.get("upstream_sha", "")).strip()
-        if not SHA1_RE.fullmatch(sha) or sha == pin:
+        if not SHA1_RE.fullmatch(sha):
             continue
+        # probe_records is ordered newest-to-oldest; reaching verified_pin means
+        # all remaining entries predate the current pin and must never downgrade it.
+        if sha == pin:
+            return None
         if record.get("cpu_status") != "pass":
             continue
         ppu_status = record.get("ppu_status")
@@ -722,6 +726,13 @@ def route_three_gears(
             history = list(state.get("probe_history") or [])
         if not history and state.get("last_probe_record"):
             history = [state["last_probe_record"]]
+        newer_than_pin: list[dict[str, Any]] = []
+        for rec in history:
+            if not isinstance(rec, dict) or rec.get("gear") != "probe":
+                continue
+            if str(rec.get("upstream_sha", "")).strip() == pin:
+                break
+            newer_than_pin.append(rec)
         if override:
             candidate = _require_sha1(override, "upstream_ref")
             if candidate == pin:
@@ -729,13 +740,12 @@ def route_three_gears(
             else:
                 matching = [
                     rec
-                    for rec in history
-                    if isinstance(rec, dict)
-                    and str(rec.get("upstream_sha", "")).strip() == candidate
+                    for rec in newer_than_pin
+                    if str(rec.get("upstream_sha", "")).strip() == candidate
                 ]
                 bump_sha = select_pin_bump_candidate(matching, verified_pin=pin) or ""
         else:
-            bump_sha = select_pin_bump_candidate(history, verified_pin=pin) or ""
+            bump_sha = select_pin_bump_candidate(newer_than_pin, verified_pin=pin) or ""
         return {
             "selected_gear": "daily_pin_bump",
             "target_sha": bump_sha,
@@ -1609,6 +1619,7 @@ def prepare_pin_bump(
     target_sha: str,
     verified_pin_file: Path | None = None,
     manifest_file: Path | None = None,
+    vllm_repo: Path | None = None,
 ) -> dict[str, str]:
     """Validate and atomically bump ``vllm-main-verified.commit`` and ``manifest.toml``."""
     target = _require_sha1(target_sha, "target_sha")
@@ -1625,6 +1636,12 @@ def prepare_pin_bump(
             "title": "",
             "body": "",
         }
+    if vllm_repo is not None:
+        forward_range = resolve_complete_first_parent_range(vllm_repo, previous, target)
+        if not forward_range:
+            raise ValueError(
+                "target_sha must be a strict first-parent descendant of previous_pin"
+            )
 
     if manifest_path.is_file():
         manifest_text = manifest_path.read_text(encoding="utf-8")
@@ -1661,58 +1678,86 @@ def prepare_pin_bump(
     }
 
 
-def sanitize_build_manifest_file(manifest_path: Path) -> str:
-    """Rewrite ``build-manifest.txt`` to an allowlisted public key-value set."""
-    if not manifest_path.is_file():
-        manifest_path.parent.mkdir(parents=True, exist_ok=True)
-        text = "status=missing\n"
-        assert_zero_sensitive_leaks(text, staging_paths=[manifest_path])
-        manifest_path.write_text(text, encoding="utf-8")
-        return text
-
-    raw_fields: dict[str, str] = {}
-    for raw_line in manifest_path.read_text(
-        encoding="utf-8", errors="replace"
-    ).splitlines():
-        key, sep, val = raw_line.partition("=")
-        if not sep or not key:
-            continue
-        raw_fields[key.strip()] = val.strip()
-
-    out_lines: list[str] = []
-    st = raw_fields.get("status", "unknown")
-    out_lines.append(
-        f"status={st if st in ('running', 'succeeded', 'failed') else 'unknown'}"
+def sanitize_build_manifest_file(
+    manifest_path: Path, *, output_path: Path | None = None
+) -> str:
+    """Rewrite ``build-manifest.txt`` to an allowlisted public key-value set (fail-closed)."""
+    dest_path = output_path or manifest_path
+    staging = (
+        [manifest_path, dest_path] if dest_path != manifest_path else [manifest_path]
     )
-    if re.fullmatch(r"[0-9]{1,3}", raw_fields.get("exit_code", "")):
-        out_lines.append(f"exit_code={raw_fields['exit_code']}")
-    for sha_key in (
-        "vllm_ref",
-        "candidate_vllm_commit",
-        "vllm_commit",
-        "vllm_sail_commit",
-    ):
-        val = raw_fields.get(sha_key, "")
-        if SHA1_RE.fullmatch(val):
-            out_lines.append(f"{sha_key}={val}")
-    for sha256_key in ("sdk_sha256", "torch_sha256"):
-        val = raw_fields.get(sha256_key, "")
-        if re.fullmatch(r"[0-9a-f]{64}", val):
-            out_lines.append(f"{sha256_key}={val}")
-    arch = raw_fields.get("pytorch_sail_arch", "")
-    if re.fullmatch(r"[A-Za-z0-9_;.-]{1,64}", arch):
-        out_lines.append(f"pytorch_sail_arch={arch}")
-    reuse = raw_fields.get("reuse_mode", "")
-    if reuse in ("native", "sail-native", "full"):
-        out_lines.append(f"reuse_mode={reuse}")
-    out_lines.append(
-        f"build_image_digest={extract_image_digest(raw_fields.get('build_image', ''))}"
-    )
+    try:
+        exists = manifest_path.is_file()
+        raw_content = (
+            manifest_path.read_text(encoding="utf-8", errors="replace")
+            if exists
+            else ""
+        )
+        # Remove raw source before writing dest so an interrupted/failed run
+        # never leaves unredacted diagnostics behind.
+        if manifest_path.exists() or manifest_path.is_symlink():
+            manifest_path.unlink(missing_ok=True)
+        if dest_path != manifest_path and (
+            dest_path.exists() or dest_path.is_symlink()
+        ):
+            dest_path.unlink(missing_ok=True)
 
-    sanitized_text = "\n".join(out_lines) + "\n"
-    assert_zero_sensitive_leaks(sanitized_text, staging_paths=[manifest_path])
-    manifest_path.write_text(sanitized_text, encoding="utf-8")
-    return sanitized_text
+        if not exists:
+            dest_path.parent.mkdir(parents=True, exist_ok=True)
+            text = "status=missing\n"
+            assert_zero_sensitive_leaks(text, staging_paths=staging)
+            dest_path.write_text(text, encoding="utf-8")
+            return text
+
+        raw_fields: dict[str, str] = {}
+        for raw_line in raw_content.splitlines():
+            key, sep, val = raw_line.partition("=")
+            if not sep or not key:
+                continue
+            raw_fields[key.strip()] = val.strip()
+
+        out_lines: list[str] = []
+        st = raw_fields.get("status", "unknown")
+        out_lines.append(
+            f"status={st if st in ('running', 'succeeded', 'failed') else 'unknown'}"
+        )
+        if re.fullmatch(r"[0-9]{1,3}", raw_fields.get("exit_code", "")):
+            out_lines.append(f"exit_code={raw_fields['exit_code']}")
+        for sha_key in (
+            "vllm_ref",
+            "candidate_vllm_commit",
+            "vllm_commit",
+            "vllm_sail_commit",
+        ):
+            val = raw_fields.get(sha_key, "")
+            if SHA1_RE.fullmatch(val):
+                out_lines.append(f"{sha_key}={val}")
+        for sha256_key in ("sdk_sha256", "torch_sha256"):
+            val = raw_fields.get(sha256_key, "")
+            if re.fullmatch(r"[0-9a-f]{64}", val):
+                out_lines.append(f"{sha256_key}={val}")
+        arch = raw_fields.get("pytorch_sail_arch", "")
+        if re.fullmatch(r"[A-Za-z0-9_;.-]{1,64}", arch):
+            out_lines.append(f"pytorch_sail_arch={arch}")
+        reuse = raw_fields.get("reuse_mode", "")
+        if reuse in ("native", "sail-native", "full"):
+            out_lines.append(f"reuse_mode={reuse}")
+        out_lines.append(
+            f"build_image_digest={extract_image_digest(raw_fields.get('build_image', ''))}"
+        )
+
+        sanitized_text = "\n".join(out_lines) + "\n"
+        assert_zero_sensitive_leaks(sanitized_text, staging_paths=staging)
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        dest_path.write_text(sanitized_text, encoding="utf-8")
+        return sanitized_text
+    except BaseException:
+        for path in staging:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
 
 
 def resolve_complete_first_parent_range(
@@ -2116,6 +2161,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     p_bump = sub.add_parser("prepare-pin-bump")
     p_bump.add_argument("--repo-root", type=Path, default=REPO_ROOT)
     p_bump.add_argument("--target-sha", required=True)
+    p_bump.add_argument("--vllm-repo", type=Path, default=None)
     p_bump.add_argument("--output-json", type=Path, default=None)
     p_bump.add_argument("--github-output", type=Path, default=None)
 
@@ -2167,12 +2213,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     p_pub.add_argument("--step-summary", type=Path, default=None)
 
     p_bman = sub.add_parser("sanitize-build-manifest")
-    p_bman.add_argument("--manifest", type=Path, required=True)
+    p_bman.add_argument("--manifest", type=Path, default=None)
+    p_bman.add_argument("--input", dest="input_path", type=Path, default=None)
+    p_bman.add_argument("--output", dest="output_path", type=Path, default=None)
 
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     if args.command == "sanitize-build-manifest":
-        sanitize_build_manifest_file(args.manifest)
+        src = args.input_path or args.manifest
+        dst = args.output_path or args.manifest
+        if src is None or dst is None:
+            raise ValueError(
+                "sanitize-build-manifest requires --manifest or both --input and --output"
+            )
+        sanitize_build_manifest_file(src, output_path=dst)
         return 0
 
     if args.command == "route":
@@ -2389,7 +2443,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if args.command == "prepare-pin-bump":
-        res = prepare_pin_bump(repo_root=args.repo_root, target_sha=args.target_sha)
+        res = prepare_pin_bump(
+            repo_root=args.repo_root,
+            target_sha=args.target_sha,
+            vllm_repo=args.vllm_repo,
+        )
         res_text = json.dumps(res, indent=2, sort_keys=True) + "\n"
         staging = [args.output_json] if args.output_json is not None else ()
         assert_zero_sensitive_leaks(res_text, staging_paths=staging)
