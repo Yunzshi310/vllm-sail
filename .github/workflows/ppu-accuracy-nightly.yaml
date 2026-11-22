@@ -276,10 +276,10 @@ jobs:
       # Reuse the exact SAIL commit the wheels were built from; the wrapper
       # refuses a checkout that disagrees with the wheel manifest.
       pr_head_sha: ${{ needs.select.outputs.target_sha }}
-      wheel_source_sha: ${{ inputs.skip_wheel_build == true && '' || needs.select.outputs.target_sha }}
+      wheel_source_sha: ${{ !inputs.skip_wheel_build && needs.select.outputs.target_sha || '' }}
       # _ppu-build.yaml names the artifact after the run that uploaded it,
       # which for a workflow_call is this nightly run.
-      build_run_id: ${{ inputs.skip_wheel_build == true && '' || github.run_id }}
+      build_run_id: ${{ !inputs.skip_wheel_build && github.run_id || '' }}
       models: ${{ matrix.model }}
       image_tag: ${{ inputs.image_tag }}
       image_digest: ${{ inputs.image_digest }}
@@ -303,8 +303,8 @@ jobs:
     with:
       pr_mode: false
       pr_head_sha: ${{ needs.select.outputs.target_sha }}
-      wheel_source_sha: ${{ inputs.skip_wheel_build == true && '' || needs.select.outputs.target_sha }}
-      build_run_id: ${{ inputs.skip_wheel_build == true && '' || github.run_id }}
+      wheel_source_sha: ${{ !inputs.skip_wheel_build && needs.select.outputs.target_sha || '' }}
+      build_run_id: ${{ !inputs.skip_wheel_build && github.run_id || '' }}
       models: ${{ needs.select.outputs.recipe_models }}
       image_tag: ${{ inputs.image_tag }}
       image_digest: ${{ inputs.image_digest }}

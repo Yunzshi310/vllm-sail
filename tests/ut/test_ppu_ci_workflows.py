@@ -1640,11 +1640,11 @@ def test_recipe_public_flag_controls_callers_and_gate(build_jobs, enabled):
     )
     assert (
         accuracy_nightly["recipe-model-sanity"]["with"]["wheel_source_sha"]
-        == "${{ inputs.skip_wheel_build == true && '' || needs.select.outputs.target_sha }}"
+        == "${{ !inputs.skip_wheel_build && needs.select.outputs.target_sha || '' }}"
     )
     assert (
         accuracy_nightly["recipe-model-sanity"]["with"]["build_run_id"]
-        == "${{ inputs.skip_wheel_build == true && '' || github.run_id }}"
+        == "${{ !inputs.skip_wheel_build && github.run_id || '' }}"
     )
     gate = build_jobs["gate"]["steps"][0]["run"].replace(
         "python - <<'PYTHON'", f"{sys.executable} - <<'PYTHON'"
@@ -1959,6 +1959,56 @@ def test_accuracy_nightly_devops_dispatch_dual_mode_and_cron_switch(tmp_path):
     assert expression(jobs["accuracy"]["if"], prebuilt_ctx) is False
     assert expression(jobs["recipe-model-sanity"]["if"], prebuilt_ctx) is True
 
+    # Verify GitHub Actions truthiness for skip_wheel_build ternary expressions
+    # across caller and leaf workflows ('' is falsy, so `true && '' || x` would break).
+    acc_leaf = workflow("_ppu-accuracy-tests.yaml")["jobs"]["accuracy"]["steps"]
+    acc_run = next(
+        s
+        for s in acc_leaf
+        if s.get("if") == "!inputs.pr_mode"
+        and "ppu_runtime_container.sh" in s.get("run", "")
+    )
+    rec_leaf = workflow("_ppu-recipe-model-sanity.yaml")["jobs"]["sanity"]["steps"]
+    rec_run = next(s for s in rec_leaf if s.get("id") == "recipe")
+    for skip, exp_run_id, exp_sha, exp_wheels in (
+        (True, "", "", ""),
+        (False, "12345", "a" * 40, "/tmp/wheels"),
+    ):
+        expr_ctx = {
+            "inputs.skip_wheel_build": skip,
+            "inputs.wheel_source_sha": "",
+            "inputs.pr_head_sha": "a" * 40,
+            "github.run_id": "12345",
+            "github.sha": "b" * 40,
+            "needs.select.outputs.target_sha": "a" * 40,
+            "steps.runtime.outputs.wheels": "/tmp/wheels",
+        }
+        assert (
+            expression(jobs["accuracy"]["with"]["build_run_id"], expr_ctx) == exp_run_id
+        )
+        assert (
+            expression(jobs["accuracy"]["with"]["wheel_source_sha"], expr_ctx)
+            == exp_sha
+        )
+        assert (
+            expression(jobs["recipe-model-sanity"]["with"]["build_run_id"], expr_ctx)
+            == exp_run_id
+        )
+        assert (
+            expression(
+                jobs["recipe-model-sanity"]["with"]["wheel_source_sha"], expr_ctx
+            )
+            == exp_sha
+        )
+        assert expression(acc_run["env"]["PPU_CI_WHEELS_DIR"], expr_ctx) == exp_wheels
+        assert (
+            expression(acc_run["env"]["PPU_CI_WHEEL_SOURCE_SHA"], expr_ctx) == exp_sha
+        )
+        assert expression(rec_run["env"]["PPU_CI_WHEELS_DIR"], expr_ctx) == exp_wheels
+        assert (
+            expression(rec_run["env"]["PPU_CI_WHEEL_SOURCE_SHA"], expr_ctx) == exp_sha
+        )
+
 
 def test_nightly_public_summary_exports_safe_image_digest_and_versions(tmp_path):
     steps = workflow("_ppu-recipe-model-sanity.yaml")["jobs"]["sanity"]["steps"]
@@ -2013,13 +2063,18 @@ def test_nightly_public_summary_exports_safe_image_digest_and_versions(tmp_path)
     assert "vllm=`0.10.2+sail`" in summary_text
     assert "vllm_sail=`0.34.0.dev1`" in summary_text
 
-    # Unsafe domain/path values in runtime-fingerprint.json must be dropped.
+    # Unsafe domain/IP/path values (including PEP 440 dotted local suffixes)
+    # in runtime-fingerprint.json must be dropped.
     (private_dir / "runtime-fingerprint.json").write_text(
         json.dumps(
             {
                 "install_mode": "evil",
                 "runtime_image_digest": "private.internal/repo" + digest,
-                "versions": {"vllm": "/private/path", "vllm_sail": "0.1.0"},
+                "versions": {
+                    "vllm": "0.10.2+registry.internal",
+                    "vllm_sail": "0.1.0",
+                    "torch": "2.13.0+10.1.2.3",
+                },
             }
         ),
         encoding="utf-8",
@@ -2049,14 +2104,10 @@ def test_nightly_public_summary_exports_safe_image_digest_and_versions(tmp_path)
     assert "install_mode" not in public2
     assert "runtime_image_digest" not in public2
     assert public2["runtime_versions"] == {"vllm_sail": "0.1.0"}
-    assert (
-        "private.internal"
-        not in (out2 / "summary.json").read_text() + summary2.read_text()
-    )
-    assert (
-        "/private/path"
-        not in (out2 / "summary.json").read_text() + summary2.read_text()
-    )
+    combined = (out2 / "summary.json").read_text() + summary2.read_text()
+    assert "private.internal" not in combined
+    assert "registry.internal" not in combined
+    assert "10.1.2.3" not in combined
 
 
 @pytest.mark.parametrize(

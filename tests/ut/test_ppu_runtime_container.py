@@ -255,6 +255,98 @@ exit 1
     assert "registry.internal" not in proc3.stdout + proc3.stderr
 
 
+def test_runtime_image_handles_multiple_repo_digests_without_stale_first_match(
+    tmp_path,
+):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    expected_id = "sha256:" + "1" * 64
+    older_digest = "sha256:" + "3" * 64
+    pulled_digest = "sha256:" + "2" * 64
+    docker = bin_dir / "docker"
+    docker.write_text(
+        f"""#!/usr/bin/env bash
+if [[ "$1" == "pull" ]]; then
+    if [[ "${{OMIT_PULL_DIGEST:-0}}" != "1" ]]; then
+        echo "Digest: {pulled_digest}"
+    fi
+    exit 0
+fi
+if [[ "$1" == "image" && "$2" == "inspect" ]]; then
+    if [[ "$*" == *"{{.Id}}"* ]]; then
+        echo "{expected_id}"
+        exit 0
+    fi
+    if [[ "$*" == *"RepoDigests"* ]]; then
+        printf '%s\\n%s\\n' \\
+            "registry.internal/team/vllm-nightly@{older_digest}" \\
+            "registry.internal/team/vllm-nightly@{pulled_digest}"
+        exit 0
+    fi
+fi
+exit 1
+""",
+        encoding="utf-8",
+    )
+    docker.chmod(0o755)
+    digest_out = tmp_path / "digest.txt"
+    base_env = {
+        **os.environ,
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "HOME": str(tmp_path),
+        "PPU_CI_RUNTIME_IMAGE": "registry.internal/team/vllm-nightly:base",
+        "PPU_CI_RUNTIME_DIGEST_OUT": str(digest_out),
+    }
+
+    # Tag override resolves the freshly pulled digest, not the older first RepoDigest.
+    proc_tag = subprocess.run(
+        ["bash", str(ROOT / "scripts/ci/ppu_runtime_image.sh")],
+        env={**base_env, "PPU_CI_RUNTIME_IMAGE_TAG": "nightly-20261122"},
+        capture_output=True,
+        text=True,
+    )
+    assert proc_tag.returncode == 0, proc_tag.stderr
+    assert digest_out.read_text().strip() == f"@{pulled_digest}"
+
+    # Pinned digest matching the second RepoDigests entry succeeds.
+    proc_pin = subprocess.run(
+        ["bash", str(ROOT / "scripts/ci/ppu_runtime_image.sh")],
+        env={
+            **base_env,
+            "PPU_CI_RUNTIME_IMAGE_TAG": "nightly-20261122",
+            "PPU_CI_RUNTIME_IMAGE_DIGEST": pulled_digest,
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert proc_pin.returncode == 0, proc_pin.stderr
+    assert digest_out.read_text().strip() == f"@{pulled_digest}"
+
+    # Ambiguous multi-RepoDigests without a pull Digest line fails closed on tag override.
+    proc_ambig = subprocess.run(
+        ["bash", str(ROOT / "scripts/ci/ppu_runtime_image.sh")],
+        env={
+            **base_env,
+            "OMIT_PULL_DIGEST": "1",
+            "PPU_CI_RUNTIME_IMAGE_TAG": "nightly-20261122",
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert proc_ambig.returncode == 2
+
+
+def test_runtime_container_mounts_trusted_ci_entrypoint_for_separate_target_source(
+    tmp_path,
+):
+    text = SCRIPT.read_text()
+    assert 'container_ci_dir="/trusted-ci"' in text
+    assert "target=/trusted-ci,readonly" in text
+    assert "--env PPU_CI_SOURCE_ROOT=/source" in text
+    assert '"${container_ci_dir}/ppu_e2e_recipe_sanity.sh"' in text
+    assert '"${container_ci_dir}/ppu_e2e_accuracy.sh"' in text
+
+
 def test_runtime_container_prebuilt_mode_guards_and_relaxed_wheels():
     text = SCRIPT.read_text()
     assert 'skip_wheel_install="${PPU_CI_SKIP_WHEEL_INSTALL:-false}"' in text

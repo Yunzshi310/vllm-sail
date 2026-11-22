@@ -58,28 +58,73 @@ repo_is_allowed() {
     return 1
 }
 
-extract_repo_digest() {
+resolve_repo_digest() {
     local ref=$1
     local expected_repo=$2
     local pull_log=${3:-}
-    local line digest=""
+    local requested_digest=${4:-}
+    local strict_override=${5:-false}
+    local line pulled_digest=""
+    local repo_digests=()
+
     while IFS= read -r line; do
         if [[ "${line}" == "${expected_repo}@"* ]]; then
             local candidate=${line#"${expected_repo}@"}
             if [[ "${candidate}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-                digest="${candidate}"
-                break
+                repo_digests+=("${candidate}")
             fi
         fi
     done < <(docker image inspect "${ref}" --format '{{range .RepoDigests}}{{println .}}{{end}}' 2>/dev/null || true)
-    if [[ -z "${digest}" && -n "${pull_log}" && -f "${pull_log}" ]]; then
+
+    if [[ -n "${pull_log}" && -f "${pull_log}" ]]; then
         local pulled
         pulled=$(awk '$1 == "Digest:" {print $2}' "${pull_log}" | tail -1 || true)
         if [[ "${pulled}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            digest="${pulled}"
+            pulled_digest="${pulled}"
         fi
     fi
-    printf '%s\n' "${digest}"
+
+    digest_in_list() {
+        local needle=$1 item
+        for item in "${repo_digests[@]}"; do
+            if [[ "${item}" == "${needle}" ]]; then
+                return 0
+            fi
+        done
+        return 1
+    }
+
+    if [[ -n "${requested_digest}" ]]; then
+        if [[ -n "${pulled_digest}" && "${pulled_digest}" != "${requested_digest}" ]]; then
+            return 1
+        fi
+        if (( ${#repo_digests[@]} > 0 )); then
+            digest_in_list "${requested_digest}" || return 1
+        elif [[ "${pulled_digest}" != "${requested_digest}" ]]; then
+            return 1
+        fi
+        printf '%s\n' "${requested_digest}"
+        return 0
+    fi
+
+    if [[ -n "${pulled_digest}" ]]; then
+        if (( ${#repo_digests[@]} > 0 )) && ! digest_in_list "${pulled_digest}"; then
+            return 1
+        fi
+        printf '%s\n' "${pulled_digest}"
+        return 0
+    fi
+
+    if (( ${#repo_digests[@]} == 1 )); then
+        printf '%s\n' "${repo_digests[0]}"
+        return 0
+    fi
+
+    if [[ "${strict_override}" == "true" ]]; then
+        return 1
+    fi
+    printf '\n'
+    return 0
 }
 
 default_repo=$(strip_image_repo "${PPU_CI_RUNTIME_IMAGE}")
@@ -104,7 +149,7 @@ if [[ -z "${image_tag}" && -z "${image_digest}" ]]; then
             exit 2
         }
     fi
-    resolved_digest=$(extract_repo_digest "${PPU_CI_RUNTIME_IMAGE}" "${default_repo}" "${pull_log}")
+    resolved_digest=$(resolve_repo_digest "${PPU_CI_RUNTIME_IMAGE}" "${default_repo}" "${pull_log}" "" "false" || true)
 else
     if [[ -n "${image_tag}" ]]; then
         if [[ "${image_tag}" == *".."* || ! "${image_tag}" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
@@ -143,15 +188,14 @@ else
         echo "Failed to inspect the requested PPU runtime image" >&2
         exit 2
     }
-    resolved_digest=$(extract_repo_digest "${pull_ref}" "${target_repo}" "${pull_log}")
+    if ! resolved_digest=$(resolve_repo_digest "${pull_ref}" "${target_repo}" "${pull_log}" "${image_digest}" "true"); then
+        echo "Docker did not resolve a verified repository digest for the requested PPU runtime image" >&2
+        exit 2
+    fi
     [[ "${resolved_digest}" =~ ^sha256:[0-9a-f]{64}$ ]] || {
         echo "Docker did not resolve a verified repository digest for the requested PPU runtime image" >&2
         exit 2
     }
-    if [[ -n "${image_digest}" && "${resolved_digest}" != "${image_digest}" ]]; then
-        echo "Pulled PPU runtime image digest does not match PPU_CI_RUNTIME_IMAGE_DIGEST" >&2
-        exit 2
-    fi
 fi
 
 [[ "${image_id}" =~ ^sha256:[0-9a-f]{64}$ ]] || {

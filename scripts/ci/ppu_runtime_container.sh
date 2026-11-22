@@ -108,6 +108,11 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+script_dir_real=$(realpath "${script_dir}")
+container_ci_dir="/source/scripts/ci"
+if [[ "${script_dir_real}" != "${source_dir}/scripts/ci" ]]; then
+    container_ci_dir="/trusted-ci"
+fi
 digest_file="${artifact_dir}/runtime-image-digest.txt"
 image_id=$(PPU_CI_RUNTIME_DIGEST_OUT="${digest_file}" bash "${script_dir}/ppu_runtime_image.sh" 9>&-)
 printf '%s\n' "${image_id}" >"${artifact_dir}/runtime-image-id.txt"
@@ -148,6 +153,12 @@ create=(
     --env PPU_CI_RUNTIME_IMAGE_ID="${image_id}"
     --env PPU_CI_RUNTIME_IMAGE_DIGEST="${runtime_image_digest}"
 )
+if [[ "${container_ci_dir}" == "/trusted-ci" ]]; then
+    create+=(
+        --mount "type=bind,source=${script_dir_real},target=/trusted-ci,readonly"
+        --env PPU_CI_SOURCE_ROOT=/source
+    )
+fi
 if [[ "${skip_wheel_install}" == "false" ]]; then
     create+=(
         --mount "type=bind,source=${wheels_dir},target=/wheels,readonly"
@@ -352,7 +363,7 @@ case "${mode}" in
         mount_snapshot_if_external "${model_snapshot}"
         create+=(
             --entrypoint bash "${image_id}"
-            /source/scripts/ci/ppu_e2e_accuracy.sh
+            "${container_ci_dir}/ppu_e2e_accuracy.sh"
         )
         ;;
     kernel-perf)
@@ -421,7 +432,7 @@ case "${mode}" in
         mount_snapshot_if_external "${model_snapshot}"
         create+=(
             --entrypoint bash "${image_id}"
-            /source/scripts/ci/ppu_e2e_recipe_sanity.sh
+            "${container_ci_dir}/ppu_e2e_recipe_sanity.sh"
         )
         ;;
 esac

@@ -3,7 +3,8 @@
 # Container entrypoint for recipe fast_sanity / model_sanity verification.
 set -Eeuo pipefail
 
-ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+CI_SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="${PPU_CI_SOURCE_ROOT:-$(cd -- "${CI_SCRIPT_DIR}/../.." && pwd)}"
 export HF_HOME="${HF_HOME:?HF_HOME must be set}"
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
@@ -48,7 +49,7 @@ sail_wheel=""
 if [[ "${SKIP_WHEEL_INSTALL}" == "false" ]]; then
     WHEELS_DIR="$(cd -- "${WHEELS_DIR}" && pwd)"
 fi
-verified_wheels="$(python -IB - "${ROOT_DIR}" "${WHEELS_DIR}" "${RESULTS_DIR}" \
+verified_wheels="$(python -IB - "${ROOT_DIR}" "${CI_SCRIPT_DIR}" "${WHEELS_DIR}" "${RESULTS_DIR}" \
     "${RECIPE_PATH}" "${POLICY_PATH}" "${TIER}" "${REQUIRE_PR_ARTIFACT:-false}" \
     "${PPU_RECIPE_SOURCE_SHA:?PPU_RECIPE_SOURCE_SHA is required}" \
     "${EXPECTED_VLLM_COMMIT:-}" \
@@ -64,6 +65,7 @@ from pathlib import Path
 
 (
     root,
+    ci_script_dir,
     wheels,
     results,
     recipe,
@@ -89,6 +91,7 @@ if image_id and not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
     raise SystemExit("Invalid runtime image ID")
 
 root = Path(root).resolve()
+ci_script_path = Path(ci_script_dir).resolve()
 manifest = None
 exact_source_match = False
 wheel_paths = []
@@ -108,7 +111,7 @@ else:
         raise SystemExit("SAIL wheel revision must match the recipe checkout outside PR fast_sanity")
 
     wheels_path = Path(wheels)
-    sys.path.insert(0, str(root / "scripts/ci"))
+    sys.path.insert(0, str(ci_script_path))
     from ppu_wheel_manifest import verify
 
     try:
@@ -184,7 +187,7 @@ fi
 
 record_phase runtime_dependencies
 export PIP_CONSTRAINT="/tmp/ppu-recipe-image-constraints.txt"
-python "${ROOT_DIR}/scripts/ci/ppu_image_stack.py" capture \
+python "${CI_SCRIPT_DIR}/ppu_image_stack.py" capture \
     --sdk /usr/local/PPU_SDK --output "/tmp/ppu-recipe-image-stack.json" \
     --constraints "${PIP_CONSTRAINT}"
 if [[ "${TIER}" == "model_sanity" ]]; then
@@ -210,7 +213,7 @@ elif [[ "${TIER}" == "model_sanity" ]]; then
     fi
 fi
 
-python "${ROOT_DIR}/scripts/ci/ppu_image_stack.py" verify \
+python "${CI_SCRIPT_DIR}/ppu_image_stack.py" verify \
     --sdk /usr/local/PPU_SDK --output "/tmp/ppu-recipe-image-stack.json"
 
 cd /tmp
@@ -235,6 +238,12 @@ assert current_platform.is_ppu(), f"expected PPU platform, got {current_platform
 assert torch.cuda.is_available(), "PPU device required"
 
 results_dir, skip_wheel_install, image_digest, image_id = sys.argv[1:5]
+SAFE_VERSION_RE = re.compile(
+    r"\d+(?:\.\d+){1,3}(?:(?:a|b|rc|\.post|\.dev)\d+){0,2}(?:\+[A-Za-z0-9_-]{1,24})?"
+)
+BASE_VERSION_RE = re.compile(
+    r"\d+(?:\.\d+){1,3}(?:(?:a|b|rc|\.post|\.dev)\d+){0,2}"
+)
 
 
 def safe_version(dist_name: str, fallback: str | None = None) -> str | None:
@@ -242,8 +251,14 @@ def safe_version(dist_name: str, fallback: str | None = None) -> str | None:
         value = metadata.version(dist_name)
     except metadata.PackageNotFoundError:
         value = fallback
-    if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,63}", value):
+    if not isinstance(value, str):
+        return None
+    if SAFE_VERSION_RE.fullmatch(value):
         return value
+    if "+" in value:
+        base = value.split("+", 1)[0]
+        if BASE_VERSION_RE.fullmatch(base):
+            return base
     return None
 
 

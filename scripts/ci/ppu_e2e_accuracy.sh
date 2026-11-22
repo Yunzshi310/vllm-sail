@@ -31,7 +31,8 @@
 #                      (default: /source/tests/e2e/models/_golden)
 set -Eeuo pipefail
 
-ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+CI_SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="${PPU_CI_SOURCE_ROOT:-$(cd -- "${CI_SCRIPT_DIR}/../.." && pwd)}"
 
 RESULTS_DIR="${RESULTS_DIR:?RESULTS_DIR is required}"
 ci_result_file="${RESULTS_DIR}/legacy-accuracy-result.json"
@@ -123,11 +124,11 @@ if [[ "${SKIP_WHEEL_INSTALL}" == "false" ]]; then
             --sail-commit "${EXPECTED_SAIL_COMMIT:?EXPECTED_SAIL_COMMIT is required}"
         )
     fi
-    python "${ROOT_DIR}/scripts/ci/ppu_wheel_manifest.py" "${verify_args[@]}"
+    python "${CI_SCRIPT_DIR}/ppu_wheel_manifest.py" "${verify_args[@]}"
 fi
 
 export PIP_CONSTRAINT="${RESULTS_DIR}/image-constraints.txt"
-python "${ROOT_DIR}/scripts/ci/ppu_image_stack.py" capture \
+python "${CI_SCRIPT_DIR}/ppu_image_stack.py" capture \
     --sdk /usr/local/PPU_SDK --output "${RESULTS_DIR}/image-stack.json" \
     --constraints "${PIP_CONSTRAINT}"
 
@@ -163,7 +164,7 @@ fi
 # Verify evalscope is importable
 python -c "from evalscope import TaskConfig, run_task; print('evalscope OK')"
 
-python "${ROOT_DIR}/scripts/ci/ppu_image_stack.py" verify \
+python "${CI_SCRIPT_DIR}/ppu_image_stack.py" verify \
     --sdk /usr/local/PPU_SDK --output "${RESULTS_DIR}/image-stack.json"
 
 # ------------------------------------------------------------------
@@ -186,12 +187,14 @@ from vllm_sail.compat import check_vllm_compatibility
 check_vllm_compatibility(force=True)
 assert current_platform.is_ppu(), f"expected PPU platform, got {current_platform}"
 assert torch.cuda.is_available(), "accuracy E2E pod requires a PPU device"
-print("Device:", current_platform.get_device_name(0))
-print("Capability:", current_platform.get_device_capability())
-print("vLLM:", vllm.__version__)
-print("vLLM SAIL:", vllm_sail.__version__)
 
 results_dir, skip_wheel_install, image_digest, image_id = sys.argv[1:5]
+SAFE_VERSION_RE = re.compile(
+    r"\d+(?:\.\d+){1,3}(?:(?:a|b|rc|\.post|\.dev)\d+){0,2}(?:\+[A-Za-z0-9_-]{1,24})?"
+)
+BASE_VERSION_RE = re.compile(
+    r"\d+(?:\.\d+){1,3}(?:(?:a|b|rc|\.post|\.dev)\d+){0,2}"
+)
 
 
 def safe_version(dist_name: str, fallback: str | None = None) -> str | None:
@@ -199,8 +202,14 @@ def safe_version(dist_name: str, fallback: str | None = None) -> str | None:
         value = metadata.version(dist_name)
     except metadata.PackageNotFoundError:
         value = fallback
-    if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,63}", value):
+    if not isinstance(value, str):
+        return None
+    if SAFE_VERSION_RE.fullmatch(value):
         return value
+    if "+" in value:
+        base = value.split("+", 1)[0]
+        if BASE_VERSION_RE.fullmatch(base):
+            return base
     return None
 
 
@@ -211,6 +220,10 @@ versions = {
 }
 if not versions["vllm"] or not versions["vllm_sail"]:
     raise SystemExit("Unable to determine installed vllm/vllm_sail versions")
+print("Device:", current_platform.get_device_name(0))
+print("Capability:", current_platform.get_device_capability())
+print("vLLM:", versions["vllm"])
+print("vLLM SAIL:", versions["vllm_sail"])
 fingerprint = {
     "schema": 1,
     "install_mode": "prebuilt_image" if skip_wheel_install == "true" else "wheel_overlay",
