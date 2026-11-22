@@ -974,6 +974,27 @@ def test_gate6_red_sha_repoll_docs_successor_and_rc_skipped_never_turn_green():
     )
     assert route_b["run_ppu"] is True
     assert route_b["ppu_skip_reason"] == "none"
+
+    # Even if a partial cursor dict omits top-level last_ppu_status, last_probe_record.ppu_status=="fail" still blocks skip!
+    legacy_shape = {
+        k: v
+        for k, v in cursor_a_force_red.items()
+        if k not in ("last_cpu_status", "last_ppu_status")
+    }
+    legacy_shape["last_probe_record"] = {
+        k: v
+        for k, v in cursor_a_force_red["last_probe_record"].items()
+        if k != "last_ppu_result_status"
+    }
+    route_b_legacy = post_merge.route_three_gears(
+        ls_remote_data={"main_sha": sha_b_docs, "tags": {}},
+        verified_pin=VERIFIED_PIN,
+        release_baseline_tag="v0.33.0",
+        schedule_cron=post_merge.PROBE_CRON,
+        cursor=legacy_shape,
+        changed_paths_since_ppu=["docs/design.md"],
+    )
+    assert route_b_legacy["run_ppu"] is True
     assert (
         post_merge.select_pin_bump_candidate(
             [

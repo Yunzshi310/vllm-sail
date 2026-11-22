@@ -416,9 +416,15 @@ def _sanitize_cursor(
     ppu_tested = _sha_field("last_ppu_tested_sha")
     ppu_green = _sha_field("last_ppu_green_sha")
 
+    raw_rec = cursor.get("last_probe_record")
+    rec_cpu_failed = isinstance(raw_rec, dict) and raw_rec.get("cpu_status") == "fail"
+    rec_ppu_failed = isinstance(raw_rec, dict) and raw_rec.get("ppu_status") == "fail"
+
     raw_cpu_st = cursor.get("last_cpu_status")
     if raw_cpu_st is None:
-        last_cpu_st = "pass" if cpu_checked == cpu_green else "fail"
+        last_cpu_st = (
+            "pass" if (cpu_checked == cpu_green and not rec_cpu_failed) else "fail"
+        )
     elif raw_cpu_st in ("pass", "fail"):
         last_cpu_st = raw_cpu_st
     else:
@@ -426,7 +432,9 @@ def _sanitize_cursor(
 
     raw_ppu_st = cursor.get("last_ppu_status")
     if raw_ppu_st is None:
-        last_ppu_st = "pass" if ppu_tested == ppu_green else "fail"
+        last_ppu_st = (
+            "pass" if (ppu_tested == ppu_green and not rec_ppu_failed) else "fail"
+        )
     elif raw_ppu_st in ("pass", "fail"):
         last_ppu_st = raw_ppu_st
     else:
