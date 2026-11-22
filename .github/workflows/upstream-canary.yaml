@@ -1,75 +1,1035 @@
-name: Upstream patch canary
+name: Upstream post-merge compatibility
 
 on:
   schedule:
-    # Weekly, off-peak, and deliberately not on a round minute.
-    - cron: "17 3 * * 2"
+    # Gear 1: post-merge probe every 5h (4-6h window, off-round minute).
+    - cron: "23 */5 * * *"
+    # Gear 2: daily 1x small-step pin bump.
+    - cron: "41 1 * * *"
   workflow_dispatch:
+    inputs:
+      gear:
+        description: Post-merge gear to execute
+        required: false
+        default: auto
+        type: choice
+        options:
+          - auto
+          - probe
+          - daily_pin_bump
+          - rc_qualify
+      upstream_ref:
+        description: Optional 40-char upstream vLLM SHA or vX.Y.0rc* tag override
+        required: false
+        default: ""
+        type: string
+      last_green_sha:
+        description: Optional 40-char last-known-good vLLM SHA override for bisection
+        required: false
+        default: ""
+        type: string
+      ops_image:
+        description: Optional digest-pinned operator runtime image for RC ops qualification
+        required: false
+        default: ""
+        type: string
+      force:
+        description: Re-run probe even when cursor already recorded target SHA
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
-  issues: write
+  actions: read
+cache-mode: none
+
+concurrency:
+  group: upstream-post-merge-${{ github.event.schedule || inputs.gear || 'auto' }}
+  cancel-in-progress: false
 
 jobs:
-  patch-drift:
+  route:
+    name: Poll upstream & select gear
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      selected_gear: ${{ steps.route.outputs.selected_gear }}
+      target_sha: ${{ steps.route.outputs.target_sha }}
+      rc_tag: ${{ steps.route.outputs.rc_tag }}
+      last_green_sha: ${{ steps.route.outputs.last_green_sha }}
+      last_ppu_tested_sha: ${{ steps.route.outputs.last_ppu_tested_sha }}
+      run_cpu: ${{ steps.route.outputs.run_cpu }}
+      run_ppu: ${{ steps.route.outputs.run_ppu }}
+      ppu_skip_reason: ${{ steps.route.outputs.ppu_skip_reason }}
+      native_reuse_run_id: ${{ steps.prior.outputs.native_reuse_run_id }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Check out vLLM SAIL
+        uses: actions/checkout@v4
         with:
-          python-version: "3.12"
-          cache: pip
-      - name: Install upstream vLLM main
-        run: |
-          python -m pip install -r requirements/dev.txt
-          python -m pip install "vllm @ git+https://github.com/vllm-project/vllm.git@main"
-      # This bounds an upstream bump: every changed patched body becomes an
-      # explicit review item instead of failing later on customer hardware.
-      - name: Check patched upstream source
-        id: drift
-        continue-on-error: true
-        # Preserve the checker's exit status across tee so drift is reported.
-        shell: bash
-        run: python tools/check_patch_drift.py 2>&1 | tee patch-drift.txt
-      - name: Open or update the upstream-drift issue
-        if: steps.drift.outcome == 'failure'
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Discover prior cursor, probe history, active PR CI, and donor wheel run
+        id: prior
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require("fs");
-            const title = "Upstream vLLM patch drift detected";
-            const report = fs.readFileSync("patch-drift.txt", "utf8");
-            const body = [
-              "The weekly upstream-main canary detected patch drift.",
-              "",
-              `Workflow: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
-              "",
-              "```text",
-              report.slice(0, 60000),
-              "```",
-            ].join("\n");
-            const {data: issues} = await github.rest.issues.listForRepo({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
+            fs.mkdirSync("state", { recursive: true });
+            const { owner, repo } = context.repo;
+
+            // 1. Count active PPU PR CI runs so post-merge probe yields priority.
+            let activePrRuns = 0;
+            for (const status of ["in_progress", "queued"]) {
+              const res = await github.rest.actions.listWorkflowRuns({
+                owner,
+                repo,
+                workflow_id: "ppu-pr-ci.yaml",
+                status,
+                per_page: 20,
+              }).catch(() => ({ data: { total_count: 0 } }));
+              activePrRuns += res.data.total_count || 0;
+            }
+            fs.writeFileSync("state/active-pr-runs.txt", String(activePrRuns));
+
+            // 2. Find latest trusted wheel donor run on main for SAIL native .so reuse.
+            let donorRunId = "";
+            const mainBuilds = await github.rest.actions.listWorkflowRuns({
+              owner,
+              repo,
+              workflow_id: "ppu-build-and-test.yaml",
+              branch: "main",
+              status: "completed",
+              per_page: 10,
+            }).catch(() => ({ data: { workflow_runs: [] } }));
+            for (const run of mainBuilds.data.workflow_runs || []) {
+              if (run.conclusion === "success") {
+                donorRunId = String(run.id);
+                break;
+              }
+            }
+            core.setOutput("native_reuse_run_id", donorRunId);
+
+            // 3. Download latest post-merge cursor & recent probe summaries if available.
+            const canaryRuns = await github.rest.actions.listWorkflowRuns({
+              owner,
+              repo,
+              workflow_id: "upstream-canary.yaml",
+              branch: "main",
+              status: "completed",
+              per_page: 15,
+            }).catch(() => ({ data: { workflow_runs: [] } }));
+
+            let cursorFound = false;
+            const probeHistory = [];
+            for (const run of canaryRuns.data.workflow_runs || []) {
+              if (run.id === context.runId) continue;
+              const arts = await github.rest.actions.listWorkflowRunArtifacts({
+                owner,
+                repo,
+                run_id: run.id,
+                per_page: 20,
+              }).catch(() => ({ data: { artifacts: [] } }));
+              const pubArt = (arts.data.artifacts || []).find(
+                a => !a.expired && a.name.startsWith("upstream-post-merge-public-")
+              );
+              if (!pubArt) continue;
+              core.setOutput("prior_canary_run_id", String(run.id));
+              core.setOutput("prior_public_artifact", pubArt.name);
+              cursorFound = true;
+              break;
+            }
+            if (!cursorFound) {
+              core.setOutput("prior_canary_run_id", "");
+              core.setOutput("prior_public_artifact", "");
+            }
+            fs.writeFileSync("state/probe-history.json", JSON.stringify(probeHistory));
+
+      - name: Restore prior cursor artifact when available
+        if: steps.prior.outputs.prior_canary_run_id != ''
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ steps.prior.outputs.prior_public_artifact }}
+          run-id: ${{ steps.prior.outputs.prior_canary_run_id }}
+          path: state/prior-public
+          github-token: ${{ github.token }}
+
+      - name: Poll upstream refs and compute changed paths for sliding window
+        id: route
+        env:
+          REQUESTED_GEAR: ${{ inputs.gear || 'auto' }}
+          SCHEDULE_CRON: ${{ github.event.schedule || '' }}
+          UPSTREAM_REF_OVERRIDE: ${{ inputs.upstream_ref || '' }}
+          LAST_GREEN_OVERRIDE: ${{ inputs.last_green_sha || '' }}
+          FORCE_PROBE: ${{ inputs.force || false }}
+        run: |
+          mkdir -p state
+          git ls-remote https://github.com/vllm-project/vllm.git refs/heads/main "refs/tags/v*" > state/ls-remote.txt
+          if [[ -f state/prior-public/cursor.json ]]; then
+            cp state/prior-public/cursor.json state/cursor.json
+          fi
+          if [[ -n "${LAST_GREEN_OVERRIDE}" ]]; then
+            python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          p = Path("state/cursor.json")
+          data = json.loads(p.read_text(encoding="utf-8")) if p.is_file() else {}
+          override = os.environ["LAST_GREEN_OVERRIDE"].strip()
+          data["last_ppu_green_sha"] = override
+          data["last_ppu_tested_sha"] = override
+          p.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+          PY
+          fi
+
+          # Pre-compute changed upstream paths since last_ppu_tested_sha for PPU skip allowlist.
+          verified="$(tr -d '[:space:]' < .github/vllm-main-verified.commit)"
+          base_ppu_sha="$(python3 -c 'import json, pathlib, sys; p=pathlib.Path("state/cursor.json"); print(json.loads(p.read_text()).get("last_ppu_tested_sha", sys.argv[1]) if p.is_file() else sys.argv[1])' "$verified")"
+          head_main_sha="$(awk '$2 == "refs/heads/main" { print $1 }' state/ls-remote.txt)"
+          target_for_diff="${UPSTREAM_REF_OVERRIDE:-$head_main_sha}"
+          if [[ "$target_for_diff" =~ ^[0-9a-f]{40}$ && "$base_ppu_sha" =~ ^[0-9a-f]{40}$ && "$target_for_diff" != "$base_ppu_sha" ]]; then
+            git init -q state/vllm-diff
+            if git -C state/vllm-diff fetch --quiet --depth=120 https://github.com/vllm-project/vllm.git "$target_for_diff" "$base_ppu_sha" 2>/dev/null; then
+              git -C state/vllm-diff diff --name-only "$base_ppu_sha" "$target_for_diff" > state/changed-files.txt || true
+            fi
+            rm -rf state/vllm-diff
+          fi
+
+          active_pr="$(cat state/active-pr-runs.txt 2>/dev/null || echo 0)"
+          force_arg=()
+          if [[ "${FORCE_PROBE}" == "true" ]]; then
+            force_arg=(--force)
+          fi
+          python3 scripts/ci/ppu_upstream_post_merge.py route \
+            --ls-remote-file state/ls-remote.txt \
+            --gear "${REQUESTED_GEAR}" \
+            --schedule-cron "${SCHEDULE_CRON}" \
+            --upstream-ref "${UPSTREAM_REF_OVERRIDE}" \
+            --cursor-file state/cursor.json \
+            --changed-files-file state/changed-files.txt \
+            --active-pr-runs "${active_pr}" \
+            "${force_arg[@]}" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Upload sanitized routing state for downstream jobs
+        uses: actions/upload-artifact@v4
+        with:
+          name: upstream-post-merge-route-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            state/cursor.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+  build:
+    name: Build candidate wheels & reuse SAIL .so
+    needs: route
+    if: >-
+      (needs.route.outputs.selected_gear == 'probe' || needs.route.outputs.selected_gear == 'rc_qualify') &&
+      needs.route.outputs.target_sha != '' &&
+      (needs.route.outputs.run_cpu == 'true' || needs.route.outputs.run_ppu == 'true')
+    uses: ./.github/workflows/_ppu-build.yaml
+    permissions:
+      contents: read
+      actions: read
+    with:
+      pr_head_sha: ${{ github.sha }}
+      vllm_ref: ${{ needs.route.outputs.target_sha }}
+      native_reuse_run_id: ${{ needs.route.outputs.native_reuse_run_id }}
+
+  cpu-fast-check:
+    name: SDK container CPU fast check & static bisect
+    needs: [route, build]
+    if: >-
+      needs.route.outputs.target_sha != '' &&
+      needs.route.outputs.run_cpu == 'true' &&
+      needs.build.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    container:
+      image: download.t-head.cn/docker_release/pytorch@sha256:a33a67832f7ec442c481421e94255518dd67e464406f8e610c15d2b594b21f80
+    env:
+      SAIL_PIP_INDEX_URL: https://mirrors.aliyun.com/pypi/simple/
+      TARGET_SHA: ${{ needs.route.outputs.target_sha }}
+      LAST_GREEN_SHA: ${{ needs.route.outputs.last_green_sha }}
+    steps:
+      - name: Disable internal GitHub mirror rewrite silently
+        shell: bash
+        run: |
+          config="${RUNNER_TEMP}/git-config-clean"
+          : > "$config"
+          printf 'GIT_CONFIG_GLOBAL=%s\n' "$config" >> "$GITHUB_ENV"
+          printf 'GIT_CONFIG_NOSYSTEM=1\n' >> "$GITHUB_ENV"
+          git config --system --unset-all 'url.https://github.com/.insteadOf' 2>/dev/null || true
+          for key in $(git config --system --name-only --get-regexp '^url\..*\.insteadof$' 2>/dev/null || true); do
+            git config --system --unset-all "$key" || true
+          done
+
+      - name: Check out vLLM SAIL
+        uses: actions/checkout@v4
+        with:
+          github-server-url: https://github.com
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Download built wheels & prior cursor
+        uses: actions/download-artifact@v4
+        with:
+          name: ppu-wheels-${{ github.run_id }}
+          path: /tmp/post-merge-wheels
+          run-id: ${{ github.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Download routing cursor if present
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: upstream-post-merge-route-${{ github.run_id }}-${{ github.run_attempt }}
+          path: /tmp/post-merge-route
+
+      - name: Install candidate wheels and execute SDK CPU fast check
+        id: check
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/post-merge-cpu
+          python3 scripts/ci/ppu_wheel_manifest.py verify /tmp/post-merge-wheels \
+            --sail-commit "${GITHUB_SHA}" \
+            --vllm-commit "${TARGET_SHA}" >/dev/null
+
+          python3 -m pip install -q --no-deps --force-reinstall \
+            /tmp/post-merge-wheels/vllm/*.whl \
+            /tmp/post-merge-wheels/vllm-sail/*.whl
+          python3 -m pip install -q --index-url "${SAIL_PIP_INDEX_URL}" -r requirements/dev.txt
+
+          git init -q /tmp/vllm-src
+          git -C /tmp/vllm-src remote add origin https://github.com/vllm-project/vllm.git
+          git -C /tmp/vllm-src fetch --quiet --depth=150 origin "${TARGET_SHA}"
+          if [[ -n "${LAST_GREEN_SHA}" && "${LAST_GREEN_SHA}" != "${TARGET_SHA}" ]]; then
+            git -C /tmp/vllm-src fetch --quiet --depth=150 origin "${LAST_GREEN_SHA}" || true
+          fi
+          git -C /tmp/vllm-src checkout --quiet --detach "${TARGET_SHA}"
+
+          baseline_arg=()
+          if [[ -f /tmp/post-merge-route/cursor.json ]]; then
+            cp /tmp/post-merge-route/cursor.json /tmp/post-merge-cpu/prev-baseline.json
+            baseline_arg=(--previous-baseline /tmp/post-merge-cpu/prev-baseline.json)
+          fi
+
+          set +e
+          python3 scripts/ci/ppu_upstream_post_merge.py cpu-check \
+            --vllm-src /tmp/vllm-src \
+            --sail-root "$PWD" \
+            --target-sha "${TARGET_SHA}" \
+            "${baseline_arg[@]}" \
+            --output-json /tmp/post-merge-cpu/cpu-result.json
+          rc=$?
+          set -e
+
+          if [[ "$rc" -ne 0 && -n "${LAST_GREEN_SHA}" && "${LAST_GREEN_SHA}" != "${TARGET_SHA}" ]]; then
+            SAIL_ROOT="$PWD"
+            export SAIL_ROOT
+            probe_cmd='
+              set -euo pipefail
+              git -C /tmp/vllm-src checkout --quiet --detach "${CANDIDATE_SHA}"
+              (
+                cd /tmp/vllm-src
+                python3 tools/use_existing_torch.py >/dev/null 2>&1 || true
+                VLLM_TARGET_DEVICE=empty python3 -m pip install -q --no-build-isolation --no-deps . >/dev/null 2>&1
+              ) || {
+                printf "{\"status\":\"fail\",\"stage\":\"wheel_build\",\"target_signature\":\"VLLM_TARGET_DEVICE=empty\",\"is_public_plugin_interface\":true}\n" > "${PROBE_RESULT_JSON}"
+                exit 1
+              }
+              base_arg=()
+              if [[ -f /tmp/post-merge-cpu/prev-baseline.json ]]; then
+                base_arg=(--previous-baseline /tmp/post-merge-cpu/prev-baseline.json)
+              fi
+              python3 "${SAIL_ROOT}/scripts/ci/ppu_upstream_post_merge.py" cpu-check \
+                --vllm-src /tmp/vllm-src \
+                --sail-root "${SAIL_ROOT}" \
+                --target-sha "${CANDIDATE_SHA}" \
+                "${base_arg[@]}" \
+                --output-json "${PROBE_RESULT_JSON}"
+            '
+            python3 scripts/ci/ppu_upstream_post_merge.py bisect \
+              --vllm-repo /tmp/vllm-src \
+              --last-green-sha "${LAST_GREEN_SHA}" \
+              --red-sha "${TARGET_SHA}" \
+              --probe-cmd "${probe_cmd}" \
+              --initial-red-json /tmp/post-merge-cpu/cpu-result.json \
+              --default-stage plugin_registration \
+              --output-json /tmp/post-merge-cpu/bisect-result.json >/dev/null
+          fi
+          exit "$rc"
+
+      - name: Upload sanitized CPU check & bisection metadata
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: upstream-post-merge-cpu-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            /tmp/post-merge-cpu/cpu-result.json
+            /tmp/post-merge-cpu/bisect-result.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+  ppu-probe-smoke:
+    name: PPU 1-card sliding-window smoke & bisect
+    needs: [route, build, cpu-fast-check]
+    if: >-
+      needs.route.outputs.selected_gear == 'probe' &&
+      needs.route.outputs.run_ppu == 'true' &&
+      needs.build.result == 'success' &&
+      (needs.route.outputs.run_cpu != 'true' || needs.cpu-fast-check.result == 'success')
+    runs-on: 8-ppu-m890p
+    timeout-minutes: 90
+    concurrency:
+      group: upstream-post-merge-ppu-slot
+      cancel-in-progress: false
+    env:
+      GIT_CONFIG_NOSYSTEM: "1"
+      TARGET_SHA: ${{ needs.route.outputs.target_sha }}
+      LAST_GREEN_SHA: ${{ needs.route.outputs.last_green_sha }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Prepare private runtime directories and Git configuration
+        id: runtime
+        run: |
+          config="$(mktemp "${RUNNER_TEMP}/git-config.XXXXXX")"
+          wheels="$(mktemp -d "${RUNNER_TEMP}/ppu-probe-wheels.XXXXXX")"
+          artifacts="$(mktemp -d "${RUNNER_TEMP}/ppu-probe-artifacts.XXXXXX")"
+          bisect_dir="$(mktemp -d "${RUNNER_TEMP}/ppu-probe-bisect.XXXXXX")"
+          source_rel=".ppu-probe-source-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          source="${GITHUB_WORKSPACE}/${source_rel}"
+          {
+            printf 'GIT_CONFIG_GLOBAL=%s\n' "$config"
+            printf 'wheels=%s\n' "$wheels"
+            printf 'artifacts=%s\n' "$artifacts"
+            printf 'bisect_dir=%s\n' "$bisect_dir"
+            printf 'source_rel=%s\n' "$source_rel"
+            printf 'source=%s\n' "$source"
+          } >> "$GITHUB_OUTPUT"
+          printf 'GIT_CONFIG_GLOBAL=%s\n' "$config" >> "$GITHUB_ENV"
+
+      - name: Check out vLLM SAIL
+        uses: actions/checkout@v4
+        with:
+          github-server-url: https://github.com
+          ref: ${{ github.sha }}
+          path: ${{ steps.runtime.outputs.source_rel }}
+          persist-credentials: false
+
+      - name: Download CI-built wheels
+        uses: actions/download-artifact@v4
+        with:
+          name: ppu-wheels-${{ github.run_id }}
+          path: ${{ steps.runtime.outputs.wheels }}
+          run-id: ${{ github.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Run 1-card Qwen3.8-27B TP1 smoke via unified Recipe executor (with bisect on red)
+        id: smoke
+        env:
+          PPU_CI_SOURCE_DIR: ${{ steps.runtime.outputs.source }}
+          PPU_CI_SOURCE_SHA: ${{ github.sha }}
+          PPU_CI_WHEELS_DIR: ${{ steps.runtime.outputs.wheels }}
+          PPU_CI_ARTIFACT_DIR: ${{ steps.runtime.outputs.artifacts }}
+          BISECT_DIR: ${{ steps.runtime.outputs.bisect_dir }}
+          PPU_CI_DEVICE_COUNT: "1"
+          PPU_CI_REQUIRE_PR_ARTIFACT: "false"
+          PPU_CI_WHEEL_SOURCE_SHA: ${{ github.sha }}
+          MODEL_ID: Qwen/Qwen3.8-27B
+          RECIPE_PATH: tests/ppu/recipes/Qwen/Qwen3.8-27B.yaml
+          POLICY_PATH: tests/ppu/policy/probes/qwen3.8-27b-tp1.yaml
+          TIER: fast_sanity
+        run: |
+          umask 077
+          verified="$(tr -d '[:space:]' < "${PPU_CI_SOURCE_DIR}/.github/vllm-main-verified.commit")"
+          export PPU_CI_EXPECTED_VLLM_COMMIT="${TARGET_SHA}"
+          if [[ "${TARGET_SHA}" != "${verified}" ]]; then
+            export PPU_CI_CANDIDATE_UPSTREAM_COMMIT="${TARGET_SHA}"
+          fi
+
+          set +e
+          bash "${PPU_CI_SOURCE_DIR}/scripts/ci/ppu_runtime_container.sh" recipe-sanity \
+            >"${PPU_CI_ARTIFACT_DIR}/launcher.log" 2>&1
+          rc=$?
+          set -e
+
+          if [[ "$rc" -ne 0 && -n "${LAST_GREEN_SHA}" && "${LAST_GREEN_SHA}" != "${TARGET_SHA}" ]]; then
+            git init -q "${BISECT_DIR}/vllm-src"
+            git -C "${BISECT_DIR}/vllm-src" remote add origin https://github.com/vllm-project/vllm.git
+            git -C "${BISECT_DIR}/vllm-src" fetch --quiet --depth=150 origin "${TARGET_SHA}" "${LAST_GREEN_SHA}" || true
+
+            probe_cmd='
+              set -euo pipefail
+              cand_wheels="$(mktemp -d "${BISECT_DIR}/wheels.XXXXXX")"
+              cand_art="$(mktemp -d "${BISECT_DIR}/art.XXXXXX")"
+              mkdir -p "${cand_wheels}/vllm" "${cand_wheels}/vllm-sail"
+              cp "${PPU_CI_WHEELS_DIR}"/vllm-sail/*.whl "${cand_wheels}/vllm-sail/"
+              docker run --rm \
+                -v "${BISECT_DIR}/vllm-src:/vllm-ro:ro" \
+                -v "${cand_wheels}/vllm:/out" \
+                download.t-head.cn/docker_release/pytorch@sha256:a33a67832f7ec442c481421e94255518dd67e464406f8e610c15d2b594b21f80 \
+                bash -ceu "
+                  cp -a /vllm-ro /tmp/vllm-build
+                  git -C /tmp/vllm-build checkout --quiet --detach ${CANDIDATE_SHA}
+                  cd /tmp/vllm-build
+                  python3 tools/use_existing_torch.py >/dev/null 2>&1 || true
+                  VLLM_TARGET_DEVICE=empty python3 -m pip wheel --no-build-isolation --no-deps --wheel-dir /out . >/dev/null 2>&1
+                " || {
+                  rm -rf "${cand_wheels}" "${cand_art}"
+                  printf "{\"status\":\"fail\",\"stage\":\"wheel_build\",\"target_signature\":\"VLLM_TARGET_DEVICE=empty\",\"is_public_plugin_interface\":true}\n" > "${PROBE_RESULT_JSON}"
+                  exit 1
+                }
+              python3 "${PPU_CI_SOURCE_DIR}/scripts/ci/ppu_wheel_manifest.py" create \
+                "${cand_wheels}" \
+                --sail-source "${PPU_CI_SOURCE_DIR}" \
+                --vllm-commit "${CANDIDATE_SHA}" >/dev/null
+
+              verified_pin="$(tr -d "[:space:]" < "${PPU_CI_SOURCE_DIR}/.github/vllm-main-verified.commit")"
+              export PPU_CI_WHEELS_DIR="${cand_wheels}"
+              export PPU_CI_ARTIFACT_DIR="${cand_art}"
+              export PPU_CI_EXPECTED_VLLM_COMMIT="${CANDIDATE_SHA}"
+              if [[ "${CANDIDATE_SHA}" != "${verified_pin}" ]]; then
+                export PPU_CI_CANDIDATE_UPSTREAM_COMMIT="${CANDIDATE_SHA}"
+              else
+                unset PPU_CI_CANDIDATE_UPSTREAM_COMMIT
+              fi
+              if bash "${PPU_CI_SOURCE_DIR}/scripts/ci/ppu_runtime_container.sh" recipe-sanity >/dev/null 2>&1; then
+                printf "{\"status\":\"pass\",\"stage\":\"ppu_probe_smoke\",\"target_signature\":\"Qwen/Qwen3.8-27B\"}\n" > "${PROBE_RESULT_JSON}"
+                rm -rf "${cand_wheels}" "${cand_art}"
+                exit 0
+              fi
+              rm -rf "${cand_wheels}" "${cand_art}"
+              printf "{\"status\":\"fail\",\"stage\":\"ppu_probe_smoke\",\"target_signature\":\"Qwen/Qwen3.8-27B\",\"is_public_plugin_interface\":false}\n" > "${PROBE_RESULT_JSON}"
+              exit 1
+            '
+            python3 "${PPU_CI_SOURCE_DIR}/scripts/ci/ppu_upstream_post_merge.py" bisect \
+              --vllm-repo "${BISECT_DIR}/vllm-src" \
+              --last-green-sha "${LAST_GREEN_SHA}" \
+              --red-sha "${TARGET_SHA}" \
+              --probe-cmd "${probe_cmd}" \
+              --default-stage ppu_probe_smoke \
+              --output-json "${BISECT_DIR}/bisect-result.json" >/dev/null || true
+          fi
+          exit "$rc"
+
+      - name: Retain private recipe probe diagnostics on runner
+        if: always() && steps.runtime.outcome == 'success'
+        env:
+          PPU_CI_SOURCE_DIR: ${{ steps.runtime.outputs.source }}
+          PPU_CI_SOURCE_SHA: ${{ github.sha }}
+          PPU_CI_ARTIFACT_DIR: ${{ steps.runtime.outputs.artifacts }}
+          TIER: fast_sanity
+          MODEL_KEY: qwen3.8-27b-tp1-probe
+          RECIPE_OUTCOME: ${{ steps.smoke.outcome }}
+        run: |
+          umask 077
+          python3 -I "${PPU_CI_SOURCE_DIR}/scripts/ci/ppu_recipe_retention.py" || true
+
+      - name: Upload sanitized PPU bisection metadata
+        if: always() && steps.runtime.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: upstream-post-merge-ppu-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.runtime.outputs.bisect_dir }}/bisect-result.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Remove temporary runner directories
+        if: always()
+        env:
+          GIT_CONFIG_TEMP: ${{ steps.runtime.outputs.GIT_CONFIG_GLOBAL }}
+          WHEELS_DIR: ${{ steps.runtime.outputs.wheels }}
+          ARTIFACT_DIR: ${{ steps.runtime.outputs.artifacts }}
+          BISECT_DIR: ${{ steps.runtime.outputs.bisect_dir }}
+          SOURCE_DIR: ${{ steps.runtime.outputs.source }}
+        run: |
+          rm -rf \
+            "${WHEELS_DIR:-}" \
+            "${ARTIFACT_DIR:-}" \
+            "${BISECT_DIR:-}" \
+            "${SOURCE_DIR:-}" \
+            "${GIT_CONFIG_TEMP:-}"
+
+  rc-pin-ut:
+    name: RC PPU pin unit tests
+    needs: [route, build, cpu-fast-check]
+    if: >-
+      needs.route.outputs.selected_gear == 'rc_qualify' &&
+      needs.route.outputs.target_sha != '' &&
+      needs.build.result == 'success' &&
+      needs.cpu-fast-check.result == 'success'
+    uses: ./.github/workflows/_ppu-pin-ut.yaml
+    permissions:
+      contents: read
+      actions: read
+    with:
+      pr_mode: false
+      build_run_id: ${{ github.run_id }}
+      vllm_ref: ${{ needs.route.outputs.target_sha }}
+
+  rc-fast-sanity:
+    name: RC PPU recipe fast sanity
+    needs: [route, build, cpu-fast-check]
+    if: >-
+      needs.route.outputs.selected_gear == 'rc_qualify' &&
+      needs.route.outputs.target_sha != '' &&
+      needs.build.result == 'success' &&
+      needs.cpu-fast-check.result == 'success'
+    uses: ./.github/workflows/_ppu-recipe-fast-sanity.yaml
+    permissions:
+      contents: read
+      actions: read
+    with:
+      pr_mode: false
+      build_run_id: ${{ github.run_id }}
+      ready_epoch: ${{ needs.build.outputs.ready_epoch }}
+      vllm_ref: ${{ needs.route.outputs.target_sha }}
+
+  rc-model-sanity:
+    name: RC PPU recipe model sanity
+    needs: [route, build, cpu-fast-check]
+    if: >-
+      needs.route.outputs.selected_gear == 'rc_qualify' &&
+      needs.route.outputs.target_sha != '' &&
+      needs.build.result == 'success' &&
+      needs.cpu-fast-check.result == 'success'
+    uses: ./.github/workflows/_ppu-recipe-model-sanity.yaml
+    permissions:
+      contents: read
+      actions: read
+    with:
+      pr_mode: false
+      build_run_id: ${{ github.run_id }}
+      vllm_ref: ${{ needs.route.outputs.target_sha }}
+
+  rc-ops-select:
+    name: RC PPU operator test selection
+    needs: [route, build, cpu-fast-check]
+    if: >-
+      needs.route.outputs.selected_gear == 'rc_qualify' &&
+      needs.route.outputs.target_sha != '' &&
+      inputs.ops_image != '' &&
+      needs.build.result == 'success' &&
+      needs.cpu-fast-check.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      matrix: ${{ steps.select.outputs.matrix }}
+      has_tests: ${{ steps.select.outputs.has_tests }}
+      runtime_image: ${{ steps.select.outputs.runtime_image }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ppu-wheels-${{ github.run_id }}
+          path: ops-wheels
+          run-id: ${{ github.run_id }}
+          github-token: ${{ github.token }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ppu-build-diagnostics-${{ github.run_id }}
+          path: ops-build-diagnostics
+          run-id: ${{ github.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Generate full RC operator test selection
+        id: select
+        env:
+          BUILD_IMAGE: ${{ needs.build.outputs.image }}
+          OPS_IMAGE_OVERRIDE: ${{ inputs.ops_image }}
+          EXPECTED_VLLM_COMMIT: ${{ needs.route.outputs.target_sha }}
+        run: |
+          mkdir -p ops-selection
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          from scripts.ci.ppu_ops_select import (
+              collect_changes,
+              digest_image,
+              github_outputs,
+              validate_config,
+              validate_environment,
+              write_json,
+          )
+          root = Path.cwd()
+          env_cfg = json.loads((root / "scripts/ci/ppu_ops_environment.json").read_bytes())
+          validate_config(json.loads((root / "scripts/ci/ppu_ops_tests.json").read_bytes()), root)
+          validate_environment(env_cfg)
+          runtime = digest_image(os.environ["OPS_IMAGE_OVERRIDE"])
+          github_outputs({"runtime_image": runtime})
+          write_json("ops-selection/changes.json", collect_changes(root, None, None, os.environ["GITHUB_SHA"]))
+          PY
+          cp scripts/ci/ppu_ops_tests.json scripts/ci/ppu_ops_environment.json ops-selection/
+          python3 scripts/ci/ppu_ops_select.py select --repo . \
+            --config ops-selection/ppu_ops_tests.json \
+            --environment ops-selection/ppu_ops_environment.json \
+            --changes ops-selection/changes.json \
+            --build-manifest ops-build-diagnostics/build-manifest.txt \
+            --wheel-manifest ops-wheels/wheel-manifest.json \
+            --build-run-id "${GITHUB_RUN_ID}" \
+            --build-image "${BUILD_IMAGE}" \
+            --runtime-image "${{ steps.select.outputs.runtime_image || inputs.ops_image }}" \
+            --expected-vllm-commit "${EXPECTED_VLLM_COMMIT}" \
+            --scope full \
+            --output ops-selection/selection.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ppu-ops-selection-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ops-selection/
+          if-no-files-found: error
+          retention-days: 14
+
+  rc-ops-tests:
+    name: RC PPU operator qualification
+    needs: [route, build, rc-ops-select]
+    if: >-
+      needs.route.outputs.selected_gear == 'rc_qualify' &&
+      needs.rc-ops-select.result == 'success' &&
+      needs.rc-ops-select.outputs.has_tests == 'true'
+    uses: ./.github/workflows/_ppu-ops-tests.yaml
+    permissions:
+      contents: read
+      actions: read
+    with:
+      build_run_id: ${{ github.run_id }}
+      matrix: ${{ needs.rc-ops-select.outputs.matrix }}
+      selection_artifact: ppu-ops-selection-${{ github.run_id }}-${{ github.run_attempt }}
+      build_image: ${{ needs.build.outputs.image }}
+      expected_vllm_commit: ${{ needs.route.outputs.target_sha }}
+      image: ${{ needs.rc-ops-select.outputs.runtime_image }}
+
+  daily-pin-bump:
+    name: Open or update daily verified-pin PR
+    needs: route
+    if: >-
+      needs.route.outputs.selected_gear == 'daily_pin_bump' &&
+      needs.route.outputs.target_sha != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: read
+    steps:
+      - name: Check out vLLM SAIL
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Prepare small-step verified pin bump metadata
+        id: prep
+        env:
+          TARGET_SHA: ${{ needs.route.outputs.target_sha }}
+        run: |
+          python3 scripts/ci/ppu_upstream_post_merge.py prepare-pin-bump \
+            --target-sha "${TARGET_SHA}" \
+            --output-json /tmp/pin-bump.json \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Commit pin bump branch and open or update PR
+        if: steps.prep.outputs.changed == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require("fs");
+            const meta = JSON.parse(fs.readFileSync("/tmp/pin-bump.json", "utf8"));
+            const { owner, repo } = context.repo;
+            const branch = "ci/auto-pin-bump-vllm-main";
+            const refName = `heads/${branch}`;
+            const filePath = ".github/vllm-main-verified.commit";
+
+            try {
+              await github.rest.git.getRef({ owner, repo, ref: refName });
+              await github.rest.git.updateRef({
+                owner,
+                repo,
+                ref: refName,
+                sha: context.sha,
+                force: true,
+              });
+            } catch (err) {
+              if (err.status !== 404) throw err;
+              await github.rest.git.createRef({
+                owner,
+                repo,
+                ref: `refs/${refName}`,
+                sha: context.sha,
+              });
+            }
+
+            const existingFile = await github.rest.repos.getContent({
+              owner,
+              repo,
+              path: filePath,
+              ref: branch,
+            });
+
+            await github.rest.repos.createOrUpdateFileContents({
+              owner,
+              repo,
+              path: filePath,
+              message: `${meta.title}\n\nSigned-off-by: github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>`,
+              content: Buffer.from(`${meta.new_pin}\n`, "utf8").toString("base64"),
+              sha: existingFile.data.sha,
+              branch,
+            });
+
+            const { data: openPrs } = await github.rest.pulls.list({
+              owner,
+              repo,
+              state: "open",
+              head: `${owner}:${branch}`,
+              base: "main",
+            });
+
+            if (openPrs.length > 0) {
+              await github.rest.pulls.update({
+                owner,
+                repo,
+                pull_number: openPrs[0].number,
+                title: meta.title,
+                body: meta.body,
+              });
+            } else {
+              await github.rest.pulls.create({
+                owner,
+                repo,
+                title: meta.title,
+                head: branch,
+                base: "main",
+                body: meta.body,
+              });
+            }
+
+  publish-and-triage:
+    name: Publish allowlisted summary & dual-track triage
+    if: always()
+    needs:
+      - route
+      - build
+      - cpu-fast-check
+      - ppu-probe-smoke
+      - rc-pin-ut
+      - rc-fast-sanity
+      - rc-model-sanity
+      - rc-ops-tests
+      - daily-pin-bump
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+    steps:
+      - name: Check out vLLM SAIL
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Download route, CPU, and PPU metadata artifacts
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: upstream-post-merge-*-${{ github.run_id }}-${{ github.run_attempt }}
+          path: /tmp/post-merge-meta
+          merge-multiple: true
+
+      - name: Render and mechanically verify public Console, Summary, Artifact, and Issue payloads
+        id: publish
+        env:
+          SELECTED_GEAR: ${{ needs.route.outputs.selected_gear || 'probe' }}
+          TARGET_SHA: ${{ needs.route.outputs.target_sha || '' }}
+          RC_TAG: ${{ needs.route.outputs.rc_tag || '' }}
+          RUN_CPU: ${{ needs.route.outputs.run_cpu || 'false' }}
+          RUN_PPU: ${{ needs.route.outputs.run_ppu || 'false' }}
+          PPU_SKIP_REASON: ${{ needs.route.outputs.ppu_skip_reason || 'none' }}
+          BUILD_IMAGE: ${{ needs.build.outputs.image || '' }}
+          ROUTE_RESULT: ${{ needs.route.result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          CPU_RESULT: ${{ needs.cpu-fast-check.result }}
+          PPU_SMOKE_RESULT: ${{ needs.ppu-probe-smoke.result }}
+          RC_PIN_RESULT: ${{ needs.rc-pin-ut.result }}
+          RC_FAST_RESULT: ${{ needs.rc-fast-sanity.result }}
+          RC_MODEL_RESULT: ${{ needs.rc-model-sanity.result }}
+          RC_OPS_RESULT: ${{ needs.rc-ops-tests.result }}
+          BUMP_RESULT: ${{ needs.daily-pin-bump.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/post-merge-public
+
+          if [[ "${ROUTE_RESULT}" != "success" ]]; then
+            status="infra_error"
+            cpu_status="not_run"
+            ppu_status="not_run"
+            fail_stage="route"
+          elif [[ "${SELECTED_GEAR}" == "daily_pin_bump" ]]; then
+            cpu_status="not_run"
+            ppu_status="not_run"
+            fail_stage="none"
+            if [[ -z "${TARGET_SHA}" ]]; then
+              status="noop"
+            elif [[ "${BUMP_RESULT}" == "success" ]]; then
+              status="pass"
+            else
+              status="infra_error"
+            fi
+          elif [[ -z "${TARGET_SHA}" ]]; then
+            status="noop"
+            cpu_status="not_run"
+            ppu_status="not_run"
+            fail_stage="none"
+          else
+            fail_stage="none"
+            if [[ "${BUILD_RESULT}" == "failure" || "${BUILD_RESULT}" == "cancelled" ]]; then
+              status="fail"
+              cpu_status="not_run"
+              ppu_status="not_run"
+              fail_stage="wheel_build"
+            else
+              if [[ "${RUN_CPU}" == "true" ]]; then
+                cpu_status=$([[ "${CPU_RESULT}" == "success" ]] && echo "pass" || echo "fail")
+              else
+                cpu_status="not_run"
+              fi
+
+              if [[ "${SELECTED_GEAR}" == "probe" ]]; then
+                if [[ "${cpu_status}" == "fail" ]]; then
+                  ppu_status="skipped"
+                  PPU_SKIP_REASON="cpu_fast_check_failed"
+                elif [[ "${RUN_PPU}" == "true" ]]; then
+                  ppu_status=$([[ "${PPU_SMOKE_RESULT}" == "success" ]] && echo "pass" || echo "fail")
+                else
+                  ppu_status="skipped"
+                fi
+                if [[ "${cpu_status}" == "fail" || "${ppu_status}" == "fail" ]]; then
+                  status="fail"
+                  [[ "${ppu_status}" == "fail" ]] && fail_stage="ppu_probe_smoke"
+                elif [[ "${PPU_SKIP_REASON}" == "deferred_for_sail_pr_ci" ]]; then
+                  status="deferred"
+                else
+                  status="pass"
+                fi
+              else
+                # rc_qualify
+                rc_fail=0
+                for pair in "rc_pin_ut:${RC_PIN_RESULT}" "rc_fast_sanity:${RC_FAST_RESULT}" "rc_model_sanity:${RC_MODEL_RESULT}" "rc_ops_tests:${RC_OPS_RESULT}"; do
+                  st_name="${pair%%:*}"
+                  st_val="${pair#*:}"
+                  if [[ "${st_val}" == "failure" || "${st_val}" == "cancelled" ]]; then
+                    rc_fail=1
+                    fail_stage="${st_name}"
+                    break
+                  fi
+                done
+                if [[ "${cpu_status}" == "fail" ]]; then
+                  ppu_status="skipped"
+                  status="fail"
+                elif [[ "${rc_fail}" -eq 1 ]]; then
+                  ppu_status="fail"
+                  status="fail"
+                else
+                  ppu_status="pass"
+                  status="pass"
+                fi
+              fi
+            fi
+          fi
+
+          extra_args=()
+          if [[ -f /tmp/post-merge-meta/cursor.json ]]; then
+            extra_args+=(--cursor-in /tmp/post-merge-meta/cursor.json)
+          fi
+          if [[ -f /tmp/post-merge-meta/cpu-result.json ]]; then
+            extra_args+=(--cpu-result-json /tmp/post-merge-meta/cpu-result.json)
+          fi
+          if [[ -f /tmp/post-merge-meta/bisect-result.json ]]; then
+            extra_args+=(--bisect-result-json /tmp/post-merge-meta/bisect-result.json)
+          fi
+
+          python3 scripts/ci/ppu_upstream_post_merge.py publish \
+            --gear "${SELECTED_GEAR}" \
+            --status "${status}" \
+            --sail-sha "${GITHUB_SHA}" \
+            --upstream-sha "${TARGET_SHA}" \
+            --build-image "${BUILD_IMAGE}" \
+            --rc-tag "${RC_TAG}" \
+            --cpu-status "${cpu_status}" \
+            --ppu-status "${ppu_status}" \
+            --ppu-skip-reason "${PPU_SKIP_REASON}" \
+            --failure-stage "${fail_stage}" \
+            --run-url "${RUN_URL}" \
+            --public-dir /tmp/post-merge-public \
+            --step-summary "${GITHUB_STEP_SUMMARY}" \
+            "${extra_args[@]}"
+          printf 'final_status=%s\n' "${status}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload allowlisted public summary and cursor artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: upstream-post-merge-public-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            /tmp/post-merge-public/public-summary.json
+            /tmp/post-merge-public/issue-payload.json
+            /tmp/post-merge-public/cursor.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Open or update bucketed vllm-sail issue for internal patch drift
+        if: always() && steps.publish.outcome == 'success'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require("fs");
+            const payloadPath = "/tmp/post-merge-public/issue-payload.json";
+            if (!fs.existsSync(payloadPath)) return;
+            const payload = JSON.parse(fs.readFileSync(payloadPath, "utf8"));
+            if (!payload.should_file_sail_issue || !payload.title || !payload.body) return;
+
+            const { owner, repo } = context.repo;
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner,
+              repo,
               state: "open",
               per_page: 100,
             });
-            const existing = issues.find(issue => issue.title === title);
+            const existing = issues.find(item => !item.pull_request && item.title === payload.title);
             if (existing) {
               await github.rest.issues.update({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
+                owner,
+                repo,
                 issue_number: existing.number,
-                body,
+                body: payload.body,
               });
             } else {
               await github.rest.issues.create({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                title,
-                body,
+                owner,
+                repo,
+                title: payload.title,
+                body: payload.body,
               });
             }
-      - name: Fail the canary after filing the issue
-        if: steps.drift.outcome == 'failure'
-        run: exit 1
+
+      - name: Fail workflow when compatibility regression or infra error occurred
+        if: always()
+        env:
+          FINAL_STATUS: ${{ steps.publish.outputs.final_status }}
+        run: |
+          case "${FINAL_STATUS}" in
+            pass|skipped|deferred|noop) exit 0 ;;
+            *) exit 1 ;;
+          esac

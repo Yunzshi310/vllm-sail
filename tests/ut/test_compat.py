@@ -320,3 +320,49 @@ def test_exact_main_pin_cannot_be_replaced_with_a_numeric_override(compat, monke
     monkeypatch.setenv("VLLM_VERSION", "0.31.0")
     with pytest.raises(RuntimeError, match="requires verified vLLM commit"):
         compat.check_vllm_compatibility(force=True)
+
+
+def test_candidate_upstream_commit_allows_exact_match_without_touching_manifest(
+    compat, monkeypatch, caplog
+):
+    candidate = "e29c741da8d11e2ae7ba381bb78b6f703812cae1"
+    monkeypatch.delenv("VLLM_VERSION", raising=False)
+    monkeypatch.setattr(compat, "_verified_upstream_commit", lambda: PIN)
+    monkeypatch.setenv("VLLM_SAIL_CANDIDATE_UPSTREAM_COMMIT", candidate)
+    monkeypatch.setattr(
+        compat,
+        "installed_vllm_version",
+        lambda: f"0.33.0rc1.dev4+g{candidate}.d20261122.empty",
+    )
+    with caplog.at_level(logging.WARNING):
+        compat.check_vllm_compatibility(force=True)
+    assert compat._checked is True
+    assert "candidate mode" in caplog.text
+    assert candidate in caplog.text
+    assert PIN in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("env_val", "installed", "err_match"),
+    [
+        ("*", f"0.33.0.dev1+g{'a' * 40}.empty", "40-character lowercase"),
+        ("true", f"0.33.0.dev1+g{'a' * 40}.empty", "40-character lowercase"),
+        ("8b10bda", "0.33.0.dev1+g8b10bda.empty", "40-character lowercase"),
+        (
+            "a" * 40,
+            f"0.33.0.dev1+g{'b' * 40}.empty",
+            "candidate mode requires exact vLLM commit",
+        ),
+        ("a" * 40, "0.33.0", "candidate mode requires exact vLLM commit"),
+    ],
+)
+def test_candidate_upstream_commit_rejects_wildcards_and_mismatches(
+    compat, monkeypatch, env_val, installed, err_match
+):
+    monkeypatch.delenv("VLLM_VERSION", raising=False)
+    monkeypatch.setattr(compat, "_verified_upstream_commit", lambda: PIN)
+    monkeypatch.setenv("VLLM_SAIL_CANDIDATE_UPSTREAM_COMMIT", env_val)
+    monkeypatch.setattr(compat, "installed_vllm_version", lambda: installed)
+    with pytest.raises(RuntimeError, match=err_match):
+        compat.check_vllm_compatibility(force=True)
+    assert compat._checked is False

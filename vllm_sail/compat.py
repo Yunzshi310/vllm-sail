@@ -36,6 +36,16 @@ def _verified_upstream_commit() -> str | None:
     return ref if re.fullmatch(r"[0-9a-f]{40}", ref) else None
 
 
+def _candidate_upstream_commit() -> str | None:
+    """Read an explicit 40-hex candidate upstream commit override, if set."""
+    from vllm_sail import envs
+
+    try:
+        return envs.VLLM_SAIL_CANDIDATE_UPSTREAM_COMMIT
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
+
+
 def installed_vllm_version() -> str:
     """The installed vLLM version string.
 
@@ -110,6 +120,26 @@ def vllm_version_at_least(target: str) -> bool:
     return current >= wanted
 
 
+def _installed_vllm_commit(version: str) -> str | None:
+    """Extract the verified 40-hex commit from SCM version or exact-tag _version."""
+    match = re.search(r"(?:\+|\.)g([0-9a-f]{40})(?=\.|$)", version)
+    if match is not None:
+        return match.group(1)
+    if os.getenv("VLLM_VERSION") or os.getenv("VLLM_VERSION_OVERRIDE"):
+        return None
+    for mod_name in ("vllm._version", "vllm.version"):
+        try:
+            mod = __import__(mod_name, fromlist=["__commit_id__"])
+            raw = getattr(mod, "__commit_id__", None)
+        except Exception:
+            continue
+        if isinstance(raw, str):
+            cid = re.fullmatch(r"g?([0-9a-f]{40})(?:\.d\d+)?", raw.strip())
+            if cid is not None:
+                return cid.group(1)
+    return None
+
+
 def check_vllm_compatibility(*, force: bool = False) -> None:
     """Validate the installed vLLM against its exact pin or release range.
 
@@ -130,12 +160,32 @@ def check_vllm_compatibility(*, force: bool = False) -> None:
 
     version = installed_vllm_version()
     pin = _verified_upstream_commit()
+    candidate = _candidate_upstream_commit()
+    if candidate is not None:
+        commit = _installed_vllm_commit(version)
+        if commit != candidate:
+            raise RuntimeError(
+                f"vllm-sail {_plugin_version()} candidate mode requires exact "
+                f"vLLM commit {candidate}, but the installed version is "
+                f"{version!r}. Build that exact candidate source with the full "
+                "SCM commit hash and unset VLLM_VERSION and "
+                "VLLM_VERSION_OVERRIDE."
+            )
+        _checked = True
+        logger.warning(
+            "vllm-sail %s is running in candidate mode against upstream vLLM "
+            "commit %s (verified manifest ref remains %s).",
+            _plugin_version(),
+            candidate,
+            pin or f">={MIN_VLLM_VERSION},<{MAX_VLLM_VERSION_EXCLUSIVE}",
+        )
+        return
     if pin is not None:
         # Main and release tags may live on different branches. SCM's numeric
         # prefix then describes an older tag, while its full hash still names
         # the source precisely. An abbreviation cannot establish this identity.
-        commit = re.search(r"(?:\+|\.)g([0-9a-f]{40})(?=\.|$)", version)
-        if commit is None or commit.group(1) != pin:
+        commit = _installed_vllm_commit(version)
+        if commit != pin:
             raise RuntimeError(
                 f"vllm-sail {_plugin_version()} requires verified vLLM commit "
                 f"{pin}, but the installed version is {version!r}. Build that "

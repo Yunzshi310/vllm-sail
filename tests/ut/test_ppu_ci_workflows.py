@@ -1087,7 +1087,9 @@ def test_pr_wheel_verification_runs_inside_the_runtime_container():
     for script in (pin_script, model_script):
         assert '--vllm-commit "${EXPECTED_VLLM_COMMIT}"' in script
         assert '--sail-commit "${EXPECTED_SAIL_COMMIT}"' in script
-    assert "PPU PIN UT SKIP" in pin_script
+    assert "PPU PIN UT SKIP" not in pin_script
+    assert "PPU PIN UT UNVERIFIED" in pin_script
+    assert "PPU E2E SMOKE UNVERIFIED" in model_script
 
     # perf_regression.sh also verifies commits when the env vars are set
     perf_script = (ROOT / "scripts/ci/perf_regression.sh").read_text()
@@ -1667,19 +1669,26 @@ def test_recipe_public_flag_controls_callers_and_gate(build_jobs, enabled):
 
 
 def test_recipe_model_sanity_has_one_scheduled_entry():
-    callers = []
+    callers = {}
     for path in WORKFLOWS.iterdir():
         if path.suffix not in {".yaml", ".yml"}:
             continue
         config = workflow(path.name)
         if "schedule" not in config[True]:
             continue
-        if any(
-            job.get("uses") == "./.github/workflows/_ppu-recipe-model-sanity.yaml"
+        ms_jobs = [
+            job
             for job in config["jobs"].values()
-        ):
-            callers.append(path.name)
-    assert callers == ["ppu-accuracy-nightly.yaml"]
+            if job.get("uses") == "./.github/workflows/_ppu-recipe-model-sanity.yaml"
+        ]
+        if ms_jobs:
+            callers[path.name] = ms_jobs
+    assert set(callers) <= {"ppu-accuracy-nightly.yaml", "upstream-canary.yaml"}
+    assert "ppu-accuracy-nightly.yaml" in callers
+    if "upstream-canary.yaml" in callers:
+        assert all(
+            "rc_qualify" in job.get("if", "") for job in callers["upstream-canary.yaml"]
+        )
 
 
 @pytest.mark.parametrize(

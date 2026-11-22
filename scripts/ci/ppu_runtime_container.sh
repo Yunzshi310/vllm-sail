@@ -30,9 +30,21 @@ git -C "${source_dir}" rev-parse --is-inside-work-tree >/dev/null
     echo "PPU_CI_REQUIRE_PR_ARTIFACT must be true or false" >&2
     exit 2
 }
-expected_vllm_commit=$(tr -d '[:space:]' < "${source_dir}/.github/vllm-main-verified.commit")
+verified_vllm_commit=$(tr -d '[:space:]' < "${source_dir}/.github/vllm-main-verified.commit")
+candidate_vllm_commit="${PPU_CI_CANDIDATE_UPSTREAM_COMMIT:-}"
+if [[ -n "${candidate_vllm_commit}" ]]; then
+    [[ "${candidate_vllm_commit}" =~ ^[0-9a-f]{40}$ ]] || {
+        echo "PPU_CI_CANDIDATE_UPSTREAM_COMMIT must be an immutable SHA-1 value" >&2
+        exit 2
+    }
+    if [[ -n "${PPU_CI_EXPECTED_VLLM_COMMIT:-}" && "${PPU_CI_EXPECTED_VLLM_COMMIT}" != "${candidate_vllm_commit}" ]]; then
+        echo "PPU_CI_EXPECTED_VLLM_COMMIT must match PPU_CI_CANDIDATE_UPSTREAM_COMMIT" >&2
+        exit 2
+    fi
+fi
+expected_vllm_commit="${PPU_CI_EXPECTED_VLLM_COMMIT:-${candidate_vllm_commit:-${verified_vllm_commit}}}"
 expected_sail_commit="${PPU_CI_WHEEL_SOURCE_SHA:-${PPU_CI_SOURCE_SHA}}"
-for commit in "${expected_vllm_commit}" "${expected_sail_commit}"; do
+for commit in "${verified_vllm_commit}" "${expected_vllm_commit}" "${expected_sail_commit}"; do
     [[ "${commit}" =~ ^[0-9a-f]{40}$ ]] || {
         echo "PPU CI expected commits must be immutable SHA-1 values" >&2
         exit 2
@@ -111,6 +123,9 @@ create=(
     --env EXPECTED_SAIL_COMMIT="${expected_sail_commit}"
 )
 create+=("${device_args[@]}")
+if [[ -n "${candidate_vllm_commit}" ]]; then
+    create+=(--env VLLM_SAIL_CANDIDATE_UPSTREAM_COMMIT="${candidate_vllm_commit}")
+fi
 
 # Resolve a catalog model id to the concrete snapshot directory of the offline
 # HF cache and echo that absolute path. The cache is a view tree: snapshots/
