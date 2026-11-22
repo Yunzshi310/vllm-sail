@@ -370,8 +370,10 @@ def _sanitize_cursor(
             "schema": 1,
             "last_cpu_checked_sha": pin,
             "last_cpu_green_sha": pin,
+            "last_cpu_status": "pass",
             "last_ppu_tested_sha": pin,
             "last_ppu_green_sha": pin,
+            "last_ppu_status": "pass",
             "tested_rc_tags": [],
             "patch_fingerprints": {},
         }
@@ -409,12 +411,35 @@ def _sanitize_cursor(
             raise ValueError(f"invalid patch fingerprint hash for {k!r}")
         clean_fps[k] = v
 
+    cpu_checked = _sha_field("last_cpu_checked_sha")
+    cpu_green = _sha_field("last_cpu_green_sha")
+    ppu_tested = _sha_field("last_ppu_tested_sha")
+    ppu_green = _sha_field("last_ppu_green_sha")
+
+    raw_cpu_st = cursor.get("last_cpu_status")
+    if raw_cpu_st is None:
+        last_cpu_st = "pass" if cpu_checked == cpu_green else "fail"
+    elif raw_cpu_st in ("pass", "fail"):
+        last_cpu_st = raw_cpu_st
+    else:
+        raise ValueError(f"invalid last_cpu_status in cursor: {raw_cpu_st!r}")
+
+    raw_ppu_st = cursor.get("last_ppu_status")
+    if raw_ppu_st is None:
+        last_ppu_st = "pass" if ppu_tested == ppu_green else "fail"
+    elif raw_ppu_st in ("pass", "fail"):
+        last_ppu_st = raw_ppu_st
+    else:
+        raise ValueError(f"invalid last_ppu_status in cursor: {raw_ppu_st!r}")
+
     sanitized: dict[str, Any] = {
         "schema": 1,
-        "last_cpu_checked_sha": _sha_field("last_cpu_checked_sha"),
-        "last_cpu_green_sha": _sha_field("last_cpu_green_sha"),
-        "last_ppu_tested_sha": _sha_field("last_ppu_tested_sha"),
-        "last_ppu_green_sha": _sha_field("last_ppu_green_sha"),
+        "last_cpu_checked_sha": cpu_checked,
+        "last_cpu_green_sha": cpu_green,
+        "last_cpu_status": last_cpu_st,
+        "last_ppu_tested_sha": ppu_tested,
+        "last_ppu_green_sha": ppu_green,
+        "last_ppu_status": last_ppu_st,
         "tested_rc_tags": tested_rcs,
         "patch_fingerprints": dict(sorted(clean_fps.items())),
     }
@@ -437,12 +462,20 @@ def _sanitize_cursor(
         cpu_st = str(rec.get("cpu_status", "not_run"))
         ppu_st = str(rec.get("ppu_status", "not_run"))
         skip_rs = str(rec.get("ppu_skip_reason", "none"))
+        rec_ppu_res = str(
+            rec.get(
+                "last_ppu_result_status",
+                "pass" if tested_sha == green_sha and last_ppu_st == "pass" else "fail",
+            )
+        )
         if cpu_st not in ("pass", "fail", "not_run", "infra_error"):
             raise ValueError("invalid last_probe_record.cpu_status")
         if ppu_st not in ("pass", "fail", "skipped", "not_run", "infra_error"):
             raise ValueError("invalid last_probe_record.ppu_status")
         if skip_rs not in VALID_PPU_SKIP_REASONS:
             raise ValueError("invalid last_probe_record.ppu_skip_reason")
+        if rec_ppu_res not in ("pass", "fail"):
+            raise ValueError("invalid last_probe_record.last_ppu_result_status")
         sanitized["last_probe_record"] = {
             "gear": "probe",
             "upstream_sha": up_sha,
@@ -451,6 +484,7 @@ def _sanitize_cursor(
             "ppu_skip_reason": skip_rs,
             "last_ppu_tested_sha": tested_sha,
             "last_ppu_green_sha": green_sha,
+            "last_ppu_result_status": rec_ppu_res,
         }
     return sanitized
 
@@ -474,15 +508,17 @@ def select_pin_bump_candidate(
         skip_reason = record.get("ppu_skip_reason", "none")
         last_ppu_green = str(record.get("last_ppu_green_sha", "")).strip()
         last_ppu_tested = str(record.get("last_ppu_tested_sha", last_ppu_green)).strip()
+        last_ppu_res = str(record.get("last_ppu_result_status", "pass")).strip()
         if ppu_status == "pass":
             return sha
         # A docs-only successor is promotable ONLY when PPU is currently green
-        # (no intervening failed PPU SHA between last_ppu_green_sha and sha).
+        # (including after any force re-run on last_ppu_tested_sha).
         if (
             ppu_status == "skipped"
             and skip_reason == "allowlisted_non_ppu_changes"
             and SHA1_RE.fullmatch(last_ppu_green)
             and last_ppu_tested == last_ppu_green
+            and last_ppu_res == "pass"
         ):
             return sha
     return None
@@ -604,17 +640,26 @@ def route_three_gears(
             raise ValueError("git ls-remote output did not contain refs/heads/main")
         target_sha = _require_sha1(main_sha, "main_sha")
 
-    # Skip checks ONLY when target_sha was previously verified GREEN (never on red).
-    run_cpu = bool(force or target_sha != last_cpu_green)
+    # Skip checks ONLY when target_sha and the latest CPU/PPU outcomes are GREEN.
+    run_cpu = bool(
+        force or target_sha != last_cpu_green or state["last_cpu_status"] != "pass"
+    )
     ppu_diff_base_ok = (not changed_files_base_sha) or (
         _require_sha1(changed_files_base_sha, "changed_files_base_sha")
         == last_ppu_green
     )
-    if not force and target_sha == last_cpu_green and target_sha == last_ppu_green:
+    if (
+        not force
+        and target_sha == last_cpu_green
+        and target_sha == last_ppu_green
+        and state["last_cpu_status"] == "pass"
+        and state["last_ppu_status"] == "pass"
+    ):
         run_ppu = False
         skip_reason = "already_tested"
     elif (
-        last_ppu_tested == last_ppu_green
+        state["last_ppu_status"] == "pass"
+        and last_ppu_tested == last_ppu_green
         and ppu_diff_base_ok
         and should_skip_ppu_for_paths(changed_paths_since_ppu)
     ):
@@ -799,6 +844,7 @@ def advance_cursor(
 
     if cpu_status in ("pass", "fail"):
         updated["last_cpu_checked_sha"] = target_sha
+        updated["last_cpu_status"] = cpu_status
         if cpu_status == "pass":
             updated["last_cpu_green_sha"] = target_sha
             if patch_fingerprints:
@@ -815,6 +861,7 @@ def advance_cursor(
     # Hardware cursor advances ONLY when device smoke actually executed!
     if ppu_status in ("pass", "fail"):
         updated["last_ppu_tested_sha"] = target_sha
+        updated["last_ppu_status"] = ppu_status
         if ppu_status == "pass":
             updated["last_ppu_green_sha"] = target_sha
 
@@ -842,6 +889,7 @@ def advance_cursor(
             else "none",
             "last_ppu_tested_sha": updated["last_ppu_tested_sha"],
             "last_ppu_green_sha": updated["last_ppu_green_sha"],
+            "last_ppu_result_status": updated["last_ppu_status"],
         }
     return updated
 

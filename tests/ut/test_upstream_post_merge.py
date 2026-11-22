@@ -931,6 +931,68 @@ def test_gate6_red_sha_repoll_docs_successor_and_rc_skipped_never_turn_green():
         is None
     )
 
+    # 2.5 Exact Round-2 residual case: SHA A passes PPU first, then force-rerun on A fails PPU.
+    #     Neither re-polling A nor docs-only successor B may skip PPU or be promoted!
+    sha_a = _sha(503)
+    sha_b_docs = _sha(504)
+    cursor_a_green = post_merge.advance_cursor(
+        None,
+        verified_pin=VERIFIED_PIN,
+        selected_gear="probe",
+        target_sha=sha_a,
+        status="pass",
+        cpu_status="pass",
+        ppu_status="pass",
+    )
+    cursor_a_force_red = post_merge.advance_cursor(
+        cursor_a_green,
+        verified_pin=VERIFIED_PIN,
+        selected_gear="probe",
+        target_sha=sha_a,
+        status="fail",
+        cpu_status="pass",
+        ppu_status="fail",
+    )
+    assert cursor_a_force_red["last_ppu_status"] == "fail"
+    repoll_a = post_merge.route_three_gears(
+        ls_remote_data={"main_sha": sha_a, "tags": {}},
+        verified_pin=VERIFIED_PIN,
+        release_baseline_tag="v0.33.0",
+        schedule_cron=post_merge.PROBE_CRON,
+        cursor=cursor_a_force_red,
+    )
+    assert repoll_a["run_ppu"] is True
+    assert repoll_a["ppu_skip_reason"] == "none"
+
+    route_b = post_merge.route_three_gears(
+        ls_remote_data={"main_sha": sha_b_docs, "tags": {}},
+        verified_pin=VERIFIED_PIN,
+        release_baseline_tag="v0.33.0",
+        schedule_cron=post_merge.PROBE_CRON,
+        cursor=cursor_a_force_red,
+        changed_paths_since_ppu=["docs/design.md"],
+    )
+    assert route_b["run_ppu"] is True
+    assert route_b["ppu_skip_reason"] == "none"
+    assert (
+        post_merge.select_pin_bump_candidate(
+            [
+                {
+                    "gear": "probe",
+                    "upstream_sha": sha_b_docs,
+                    "cpu_status": "pass",
+                    "ppu_status": "skipped",
+                    "ppu_skip_reason": "allowlisted_non_ppu_changes",
+                    "last_ppu_tested_sha": sha_a,
+                    "last_ppu_green_sha": sha_a,
+                    "last_ppu_result_status": "fail",
+                }
+            ],
+            verified_pin=VERIFIED_PIN,
+        )
+        is None
+    )
+
     # 3. Workflow outcome reducer: skipped RC gate or failed ops-select fails closed!
     rc_skipped = post_merge.evaluate_workflow_outcome(
         selected_gear="rc_qualify",
