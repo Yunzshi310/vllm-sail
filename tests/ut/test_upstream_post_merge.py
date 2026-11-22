@@ -1865,8 +1865,23 @@ def test_review_r2_sub1_no_pin_downgrade_fail_closed_manifest_and_rc_ops_digest(
     upload_diag = next(
         s for s in build_wf if s.get("name") == "Upload build diagnostics"
     )
+    upload_public_diag = next(
+        s
+        for s in build_wf
+        if s.get("name") == "Upload sanitized public build diagnostics"
+    )
     assert sanitize_step.get("id") == "sanitize_diagnostics"
-    assert "steps.sanitize_diagnostics.outcome == 'success'" in upload_diag["if"]
+    assert "inputs.diagnostics_mode != 'public'" in upload_diag["if"]
+    assert r"\n" not in upload_diag["with"]["path"]
+    assert "${{" not in upload_diag["with"]["path"]
+    assert [
+        line.strip()
+        for line in upload_diag["with"]["path"].splitlines()
+        if line.strip()
+    ] == ["artifacts/logs/**", "artifacts/build-manifest.txt"]
+    assert "inputs.diagnostics_mode == 'public'" in upload_public_diag["if"]
+    assert "steps.sanitize_diagnostics.outcome == 'success'" in upload_public_diag["if"]
+    assert upload_public_diag["with"]["path"].strip() == "artifacts/build-manifest.txt"
 
     # 3. Counterexample 3: Both raw and sanitized build-manifest.txt are accepted by
     #    ppu_ops_select.build_fingerprint (used by both rc-ops-select and ppu_ops_runner)!
