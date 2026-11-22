@@ -304,3 +304,87 @@ def test_verify_rejects_null_native_metadata_and_empty_extensions(
     replacement.replace(sail)
     with pytest.raises(ValueError, match="empty native extension"):
         manifest.wheel_records(tmp_path)
+
+
+def test_create_packages_deterministic_recipes_archive_and_binds_tree_sha256(
+    tmp_path: Path,
+) -> None:
+    import hashlib
+    import shutil
+    import tarfile
+
+    make_wheels(tmp_path)
+    commit = "b" * 40
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "create",
+            str(tmp_path),
+            "--vllm-commit",
+            commit,
+            "--sail-source",
+            str(ROOT),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    archive_path = tmp_path / manifest.RECIPES_ARCHIVE
+    assert archive_path.is_file()
+    first_bytes = archive_path.read_bytes()
+    second_archive = tmp_path / "second-recipes.tar.gz"
+    second_sha = manifest.build_recipes_archive(ROOT, second_archive)
+    assert second_archive.read_bytes() == first_bytes
+
+    with tarfile.open(archive_path, "r:gz") as tar:
+        members = {
+            member.name: hashlib.sha256(tar.extractfile(member).read()).hexdigest()
+            for member in tar.getmembers()
+            if member.isfile()
+        }
+    assert "tests/ppu/recipes/deepseek-ai/DeepSeek-V4-Flash.yaml" in members
+    assert "tests/ppu/recipes/zai-org/GLM-5.3.yaml" in members
+    assert "scripts/ci/ppu_recipe.py" in members
+    expected_canonical = json.dumps(
+        sorted([name, sha] for name, sha in members.items()),
+        sort_keys=True,
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    expected_tree_sha = hashlib.sha256(expected_canonical).hexdigest()
+    assert second_sha == expected_tree_sha
+
+    verified = manifest.verify(tmp_path, vllm_commit=commit, require_recipes=True)
+    assert verified["recipe_tree_sha256"] == expected_tree_sha
+
+    # Tampered archive bytes or missing archive must fail closed.
+    tampered_dir = tmp_path / "tampered"
+    shutil.copytree(tmp_path, tampered_dir, ignore=shutil.ignore_patterns("tampered"))
+    with tarfile.open(tampered_dir / manifest.RECIPES_ARCHIVE, "w:gz") as tar:
+        payload = b"schema_version: ppu-serving/v1\n"
+        info = tarfile.TarInfo("tests/ppu/recipes/tampered.yaml")
+        info.size = len(payload)
+        info.mode = 0o644
+        import io
+
+        tar.addfile(info, io.BytesIO(payload))
+    with pytest.raises(ValueError, match="differ from build manifest"):
+        manifest.verify(tampered_dir, vllm_commit=commit)
+
+    (tampered_dir / manifest.RECIPES_ARCHIVE).unlink()
+    with pytest.raises(ValueError, match="recipes.tar.gz is missing"):
+        manifest.verify(tampered_dir, vllm_commit=commit)
+
+    # Legacy manifest without recipe_tree_sha256 passes default verify, fails --require-recipes,
+    # and rejects an unrecorded recipes.tar.gz dropped beside it.
+    legacy_dir = tmp_path / "legacy"
+    legacy_dir.mkdir()
+    make_wheels(legacy_dir)
+    record(legacy_dir)
+    assert manifest.verify(legacy_dir)["schema"] == 1
+    with pytest.raises(ValueError, match="lacks recipe_tree_sha256"):
+        manifest.verify(legacy_dir, require_recipes=True)
+    shutil.copyfile(archive_path, legacy_dir / manifest.RECIPES_ARCHIVE)
+    with pytest.raises(ValueError, match="invalid recipe_tree_sha256"):
+        manifest.verify(legacy_dir)
