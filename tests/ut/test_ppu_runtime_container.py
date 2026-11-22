@@ -347,6 +347,68 @@ def test_runtime_container_mounts_trusted_ci_entrypoint_for_separate_target_sour
     assert '"${container_ci_dir}/ppu_e2e_accuracy.sh"' in text
 
 
+def test_accuracy_self_check_redacts_raw_version_on_compat_failure(tmp_path):
+    script_text = (ROOT / "scripts/ci/ppu_e2e_accuracy.sh").read_text(encoding="utf-8")
+    marker = 'python - "${RESULTS_DIR}" "${SKIP_WHEEL_INSTALL}" "${PPU_CI_RUNTIME_IMAGE_DIGEST:-}" "${PPU_CI_RUNTIME_IMAGE_ID:-}" <<\'PY\'\n'
+    block = script_text.split(marker, 1)[1].split("\nPY\n", 1)[0]
+
+    stubs = tmp_path / "stubs"
+    (stubs / "vllm").mkdir(parents=True)
+    (stubs / "vllm_sail").mkdir(parents=True)
+    (stubs / "torch.py").write_text(
+        '__version__ = "2.13.0+10.1.2.3"\n'
+        "class cuda:\n"
+        "    @staticmethod\n"
+        "    def is_available(): return True\n",
+        encoding="utf-8",
+    )
+    (stubs / "vllm/__init__.py").write_text(
+        '__version__ = "0.10.2+registry.internal"\n', encoding="utf-8"
+    )
+    (stubs / "vllm/platforms.py").write_text(
+        "class _P:\n"
+        "    def is_ppu(self): return True\n"
+        '    def get_device_name(self, idx): return "ZW-M890P"\n'
+        "    def get_device_capability(self): return (9, 0)\n"
+        "current_platform = _P()\n",
+        encoding="utf-8",
+    )
+    (stubs / "vllm_sail/__init__.py").write_text(
+        '__version__ = "0.34.0.dev1+internal.host"\n', encoding="utf-8"
+    )
+    (stubs / "vllm_sail/compat.py").write_text(
+        "def check_vllm_compatibility(force=True):\n"
+        "    raise RuntimeError(\"installed version is '0.10.2+registry.internal'\")\n",
+        encoding="utf-8",
+    )
+
+    import sys
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            block,
+            str(tmp_path),
+            "true",
+            "@sha256:" + "a" * 64,
+            "sha256:" + "b" * 64,
+        ],
+        cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": str(stubs)},
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode != 0
+    combined = proc.stdout + proc.stderr
+    assert "vLLM compatibility check failed (RuntimeError)" in combined
+    assert "vllm=0.10.2" in combined
+    assert "vllm_sail=0.34.0.dev1" in combined
+    assert "registry.internal" not in combined
+    assert "internal.host" not in combined
+    assert "10.1.2.3" not in combined
+
+
 def test_runtime_container_prebuilt_mode_guards_and_relaxed_wheels():
     text = SCRIPT.read_text()
     assert 'skip_wheel_install="${PPU_CI_SKIP_WHEEL_INSTALL:-false}"' in text

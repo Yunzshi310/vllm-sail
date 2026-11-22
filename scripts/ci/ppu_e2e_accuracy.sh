@@ -184,10 +184,6 @@ import vllm_sail
 from vllm.platforms import current_platform
 from vllm_sail.compat import check_vllm_compatibility
 
-check_vllm_compatibility(force=True)
-assert current_platform.is_ppu(), f"expected PPU platform, got {current_platform}"
-assert torch.cuda.is_available(), "accuracy E2E pod requires a PPU device"
-
 results_dir, skip_wheel_install, image_digest, image_id = sys.argv[1:5]
 SAFE_VERSION_RE = re.compile(
     r"\d+(?:\.\d+){1,3}(?:(?:a|b|rc|\.post|\.dev)\d+){0,2}(?:\+[A-Za-z0-9_-]{1,24})?"
@@ -218,6 +214,16 @@ versions = {
     "vllm_sail": safe_version("vllm-sail", getattr(vllm_sail, "__version__", None)),
     "torch": safe_version("torch", getattr(torch, "__version__", None)),
 }
+try:
+    check_vllm_compatibility(force=True)
+except Exception as exc:
+    raise SystemExit(
+        f"vLLM compatibility check failed ({type(exc).__name__}): "
+        f"vllm={versions['vllm'] or 'unknown'}, "
+        f"vllm_sail={versions['vllm_sail'] or 'unknown'}"
+    ) from None
+assert current_platform.is_ppu(), f"expected PPU platform, got {current_platform}"
+assert torch.cuda.is_available(), "accuracy E2E pod requires a PPU device"
 if not versions["vllm"] or not versions["vllm_sail"]:
     raise SystemExit("Unable to determine installed vllm/vllm_sail versions")
 print("Device:", current_platform.get_device_name(0))
