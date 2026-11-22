@@ -249,3 +249,72 @@ def test_recipes_tree_digest_is_stable_and_covers_unselected_recipes(run_recipe)
     other_recipe = source / RECIPES / "deepseek-ai/DeepSeek-V4-Flash.yaml"
     other_recipe.write_bytes(other_recipe.read_bytes() + b"\n")
     assert digest() != original
+
+
+def test_prebuilt_image_mode_skips_wheel_install_and_records_digest(run_recipe):
+    run, _, _, results = run_recipe
+    image_digest = "@sha256:" + "d" * 64
+    image_id = "sha256:" + "e" * 64
+    proc, calls, _ = run(
+        TIER="model_sanity",
+        WHEELS_DIR="",
+        PPU_CI_SKIP_WHEEL_INSTALL="true",
+        PPU_CI_RUNTIME_IMAGE_DIGEST=image_digest,
+        PPU_CI_RUNTIME_IMAGE_ID=image_id,
+    )
+    assert proc.returncode == 0, proc.stderr
+    evidence = json.loads((results / "provenance.json").read_text())
+    assert evidence["install_mode"] == "prebuilt_image"
+    assert evidence["runtime_image_digest"] == image_digest
+    assert evidence["runtime_image_id"] == image_id
+    assert "wheels" not in evidence
+    assert not any("--force-reinstall" in call for call in calls)
+
+
+@pytest.mark.parametrize(
+    "bad_overrides,expected_msg",
+    [
+        (
+            {
+                "WHEELS_DIR": "",
+                "PPU_CI_SKIP_WHEEL_INSTALL": "true",
+                "PPU_CI_RUNTIME_IMAGE_DIGEST": "",
+            },
+            "verified runtime image digest",
+        ),
+        (
+            {
+                "WHEELS_DIR": "",
+                "PPU_CI_SKIP_WHEEL_INSTALL": "true",
+                "PPU_CI_RUNTIME_IMAGE_DIGEST": "private.internal/repo@sha256:"
+                + "d" * 64,
+            },
+            "Invalid runtime image digest",
+        ),
+        (
+            {
+                "WHEELS_DIR": "",
+                "PPU_CI_SKIP_WHEEL_INSTALL": "true",
+                "REQUIRE_PR_ARTIFACT": "true",
+                "PPU_CI_RUNTIME_IMAGE_DIGEST": "@sha256:" + "d" * 64,
+            },
+            "not allowed in PR mode",
+        ),
+        (
+            {
+                "PPU_CI_SKIP_WHEEL_INSTALL": "true",
+                "PPU_CI_RUNTIME_IMAGE_DIGEST": "@sha256:" + "d" * 64,
+            },
+            "WHEELS_DIR must be empty",
+        ),
+    ],
+)
+def test_prebuilt_image_mode_rejects_unsafe_inputs(
+    run_recipe, bad_overrides, expected_msg
+):
+    run, _, _, results = run_recipe
+    proc, calls, _ = run(TIER="model_sanity", **bad_overrides)
+    assert proc.returncode != 0
+    assert expected_msg in proc.stderr
+    assert calls == []
+    assert not (results / "provenance.json").exists()

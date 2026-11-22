@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
+import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -107,3 +109,167 @@ def test_runtime_wrapper_serializes_jobs_and_verifies_source_identity():
     assert '--env EXPECTED_SAIL_COMMIT="${expected_sail_commit}"' in text
     assert "docker stop --time=2" in text
     assert "docker rm --force" in text
+
+
+@pytest.mark.parametrize(
+    "bad_env",
+    [
+        {"PPU_CI_RUNTIME_IMAGE_TAG": "evil.example/vllm-sail:latest"},
+        {"PPU_CI_RUNTIME_IMAGE_TAG": "team/vllm-sail:nightly"},
+        {"PPU_CI_RUNTIME_IMAGE_TAG": "nightly@sha256:" + "a" * 64},
+        {"PPU_CI_RUNTIME_IMAGE_TAG": "../escape"},
+        {"PPU_CI_RUNTIME_IMAGE_TAG": "-flag"},
+        {"PPU_CI_RUNTIME_IMAGE_TAG": ".hidden"},
+        {"PPU_CI_RUNTIME_IMAGE_TAG": "has space"},
+        {"PPU_CI_RUNTIME_IMAGE_TAG": "t" * 129},
+        {"PPU_CI_RUNTIME_IMAGE_DIGEST": "sha256:short"},
+        {"PPU_CI_RUNTIME_IMAGE_DIGEST": "sha256:" + "A" * 64},
+        {"PPU_CI_RUNTIME_IMAGE_DIGEST": "evil.example/repo@sha256:" + "a" * 64},
+        {
+            "PPU_CI_RUNTIME_IMAGE_TAG": "nightly-20261122",
+            "PPU_CI_RUNTIME_IMAGE_REPO": "evil.example/other",
+            "PPU_CI_RUNTIME_IMAGE_ALLOWED_REPOS": "registry.internal/team/",
+        },
+        {
+            "PPU_CI_RUNTIME_IMAGE_TAG": "nightly-20261122",
+            "PPU_CI_RUNTIME_IMAGE_REPO": "registry.internal/other/vllm",
+        },
+    ],
+)
+def test_runtime_image_rejects_illegal_tag_digest_and_cross_repo(tmp_path, bad_env):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    docker_log = tmp_path / "docker.log"
+    docker = bin_dir / "docker"
+    docker.write_text(
+        f'#!/usr/bin/env bash\necho "$*" >> {docker_log}\nexit 0\n',
+        encoding="utf-8",
+    )
+    docker.chmod(0o755)
+
+    proc = subprocess.run(
+        ["bash", str(ROOT / "scripts/ci/ppu_runtime_image.sh")],
+        env={
+            **os.environ,
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "HOME": str(tmp_path),
+            "PPU_CI_RUNTIME_IMAGE": "registry.internal/team/vllm:base",
+            **bad_env,
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 2
+    assert not docker_log.exists()
+    assert "registry.internal" not in proc.stdout + proc.stderr
+
+
+def test_runtime_image_forces_pull_and_verifies_digest_without_leaking_repo(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    docker_log = tmp_path / "docker.log"
+    expected_id = "sha256:" + "1" * 64
+    expected_digest = "sha256:" + "2" * 64
+    wrong_digest = "sha256:" + "3" * 64
+    docker = bin_dir / "docker"
+    docker.write_text(
+        f"""#!/usr/bin/env bash
+echo "$*" >> "{docker_log}"
+if [[ "$1" == "pull" ]]; then
+    echo "Digest: {expected_digest}"
+    exit 0
+fi
+if [[ "$1" == "image" && "$2" == "inspect" ]]; then
+    if [[ "$*" == *"{{.Id}}"* ]]; then
+        echo "{expected_id}"
+        exit 0
+    fi
+    if [[ "$*" == *"RepoDigests"* ]]; then
+        echo "${{FAKE_REPO_DIGEST:-registry.internal/team/vllm-nightly@{expected_digest}}}"
+        exit 0
+    fi
+fi
+exit 1
+""",
+        encoding="utf-8",
+    )
+    docker.chmod(0o755)
+    digest_out = tmp_path / "digest.txt"
+
+    base_env = {
+        **os.environ,
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "HOME": str(tmp_path),
+        "PPU_CI_RUNTIME_IMAGE": "registry.internal/team/vllm-base:base",
+        "PPU_CI_RUNTIME_IMAGE_REPO": "registry.internal/team/vllm-nightly",
+        "PPU_CI_RUNTIME_IMAGE_ALLOWED_REPOS": "registry.internal/team/",
+        "PPU_CI_RUNTIME_DIGEST_OUT": str(digest_out),
+    }
+
+    # Tag-only override forces docker pull and records redacted @sha256 digest.
+    proc = subprocess.run(
+        ["bash", str(ROOT / "scripts/ci/ppu_runtime_image.sh")],
+        env={**base_env, "PPU_CI_RUNTIME_IMAGE_TAG": "nightly-20261122"},
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == expected_id
+    assert digest_out.read_text().strip() == f"@{expected_digest}"
+    assert "registry.internal" not in proc.stdout + proc.stderr + digest_out.read_text()
+    assert (
+        "pull registry.internal/team/vllm-nightly:nightly-20261122"
+        in docker_log.read_text()
+    )
+
+    # Tag + matching digest pulls by immutable @sha256 and succeeds.
+    docker_log.unlink()
+    proc2 = subprocess.run(
+        ["bash", str(ROOT / "scripts/ci/ppu_runtime_image.sh")],
+        env={
+            **base_env,
+            "PPU_CI_RUNTIME_IMAGE_TAG": "nightly-20261122",
+            "PPU_CI_RUNTIME_IMAGE_DIGEST": expected_digest,
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert proc2.returncode == 0, proc2.stderr
+    assert (
+        f"pull registry.internal/team/vllm-nightly@{expected_digest}"
+        in docker_log.read_text()
+    )
+
+    # Mismatched digest fails closed.
+    proc3 = subprocess.run(
+        ["bash", str(ROOT / "scripts/ci/ppu_runtime_image.sh")],
+        env={
+            **base_env,
+            "PPU_CI_RUNTIME_IMAGE_TAG": "nightly-20261122",
+            "PPU_CI_RUNTIME_IMAGE_DIGEST": wrong_digest,
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert proc3.returncode == 2
+    assert "registry.internal" not in proc3.stdout + proc3.stderr
+
+
+def test_runtime_container_prebuilt_mode_guards_and_relaxed_wheels():
+    text = SCRIPT.read_text()
+    assert 'skip_wheel_install="${PPU_CI_SKIP_WHEEL_INSTALL:-false}"' in text
+    assert (
+        "PPU_CI_SKIP_WHEEL_INSTALL is only supported for recipe-sanity and model-accuracy"
+        in text
+    )
+    assert (
+        "PPU_CI_SKIP_WHEEL_INSTALL is not allowed when PPU_CI_REQUIRE_PR_ARTIFACT is true"
+        in text
+    )
+    assert (
+        "PPU_CI_WHEELS_DIR must be unset when PPU_CI_SKIP_WHEEL_INSTALL is true" in text
+    )
+    assert "Prebuilt image mode requires a verified runtime image digest" in text
+    assert '--env PPU_CI_SKIP_WHEEL_INSTALL="${skip_wheel_install}"' in text
+    assert '--env PPU_CI_RUNTIME_IMAGE_DIGEST="${runtime_image_digest}"' in text
+    assert '--env PPU_CI_RUNTIME_IMAGE_ID="${image_id}"' in text

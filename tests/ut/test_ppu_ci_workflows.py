@@ -1597,11 +1597,13 @@ def test_recipe_public_flag_controls_callers_and_gate(build_jobs, enabled):
         "github.event_name": "workflow_dispatch",
         "inputs.existing_build_run_id": "",
         "inputs.wheel_source_sha": "",
+        "inputs.skip_wheel_build": False,
         "needs.runtime-image.result": "success",
         "needs.runtime-image.outputs.recipe_sanity": "true",
         "needs.build.result": "success",
         "needs.select.result": "success",
         "needs.select.outputs.recipe_models": "glm-5.3",
+        "needs.select.outputs.run_recipe": "true",
     }
     fast_manual = workflow("ppu-recipe-fast-sanity.yaml")["jobs"]
     fast_leaf = workflow("_ppu-recipe-fast-sanity.yaml")["jobs"]
@@ -1638,11 +1640,11 @@ def test_recipe_public_flag_controls_callers_and_gate(build_jobs, enabled):
     )
     assert (
         accuracy_nightly["recipe-model-sanity"]["with"]["wheel_source_sha"]
-        == "${{ github.sha }}"
+        == "${{ inputs.skip_wheel_build == true && '' || needs.select.outputs.target_sha }}"
     )
     assert (
         accuracy_nightly["recipe-model-sanity"]["with"]["build_run_id"]
-        == "${{ github.run_id }}"
+        == "${{ inputs.skip_wheel_build == true && '' || github.run_id }}"
     )
     gate = build_jobs["gate"]["steps"][0]["run"].replace(
         "python - <<'PYTHON'", f"{sys.executable} - <<'PYTHON'"
@@ -1783,9 +1785,11 @@ def test_accuracy_nightly_routes_selected_models(
     context = {
         "github.event_name": event,
         "vars.PPU_RECIPE_PUBLIC_ENABLED": str(recipe_enabled).lower(),
+        "inputs.skip_wheel_build": False,
         "needs.build.result": "success",
         "needs.select.result": "success",
         "needs.select.outputs.recipe_models": values.get("recipe_models", ""),
+        "needs.select.outputs.run_recipe": values.get("run_recipe", "false"),
         "needs.select.outputs.matrix": legacy_matrix,
     }
     assert expression(jobs["accuracy"]["if"], context) == (legacy_cases != [])
@@ -1808,6 +1812,251 @@ def test_accuracy_nightly_routes_selected_models(
     assert bool(expression(recipe["if"], context)) == (recipe_slugs is not None)
     assert recipe["with"]["models"] == "${{ needs.select.outputs.recipe_models }}"
     assert values.get("recipe_models", "") == (recipe_slugs or "")
+
+
+def test_accuracy_nightly_devops_dispatch_dual_mode_and_cron_switch(tmp_path):
+    wf = workflow("ppu-accuracy-nightly.yaml")
+    inputs = wf[True]["workflow_dispatch"]["inputs"]
+    assert set(inputs) == {
+        "models",
+        "target_ref",
+        "image_tag",
+        "image_digest",
+        "skip_wheel_build",
+    }
+    for name, spec in inputs.items():
+        default = str(spec.get("default", ""))
+        assert "/" not in default and ":" not in default and "docker_" not in default, (
+            name
+        )
+
+    jobs = wf["jobs"]
+    # Schedule kill-switch disables cron when PPU_NIGHTLY_SCHEDULE_DISABLED == 'true',
+    # while still allowing manual/DevOps workflow_dispatch.
+    assert (
+        expression(
+            jobs["select"]["if"],
+            {
+                "github.event_name": "schedule",
+                "vars.PPU_NIGHTLY_SCHEDULE_DISABLED": "true",
+            },
+        )
+        is False
+    )
+    assert (
+        expression(
+            jobs["select"]["if"],
+            {"github.event_name": "schedule", "vars.PPU_NIGHTLY_SCHEDULE_DISABLED": ""},
+        )
+        is True
+    )
+    assert (
+        expression(
+            jobs["select"]["if"],
+            {
+                "github.event_name": "workflow_dispatch",
+                "vars.PPU_NIGHTLY_SCHEDULE_DISABLED": "true",
+            },
+        )
+        is True
+    )
+
+    # Validate dispatch inputs rejects illegal tags, digests, target_ref, and
+    # skip_wheel_build without an image override.
+    validate_step = jobs["select"]["steps"][0]
+    valid_digest = "sha256:" + "a" * 64
+    for bad_env in (
+        {"IMAGE_TAG": "evil.example/vllm:nightly"},
+        {"IMAGE_TAG": "org/vllm-sail:v1"},
+        {"IMAGE_TAG": "nightly@sha256:" + "a" * 64},
+        {"IMAGE_TAG": "../escape"},
+        {"IMAGE_TAG": "-leading-dash"},
+        {"IMAGE_TAG": "a" * 129},
+        {"IMAGE_DIGEST": "sha256:nothex"},
+        {"IMAGE_DIGEST": "evil.example/vllm@" + valid_digest},
+        {"TARGET_REF": "refs/pull/123/head"},
+        {"TARGET_REF": "-flag"},
+        {"TARGET_REF": "main..other"},
+        {"SKIP_WHEEL_BUILD": "true"},
+    ):
+        proc = subprocess.run(
+            ["bash", "-e", "-c", validate_step["run"]],
+            env={
+                **os.environ,
+                "TARGET_REF": "",
+                "IMAGE_TAG": "",
+                "IMAGE_DIGEST": "",
+                "SKIP_WHEEL_BUILD": "false",
+                **bad_env,
+            },
+            capture_output=True,
+            text=True,
+        )
+        assert proc.returncode != 0, bad_env
+
+    for good_env in (
+        {"IMAGE_TAG": "nightly-20261122-rc1", "SKIP_WHEEL_BUILD": "false"},
+        {
+            "IMAGE_TAG": "nightly-20261122-rc1",
+            "IMAGE_DIGEST": valid_digest,
+            "TARGET_REF": "main",
+            "SKIP_WHEEL_BUILD": "true",
+        },
+    ):
+        proc = subprocess.run(
+            ["bash", "-e", "-c", validate_step["run"]],
+            env={
+                **os.environ,
+                "TARGET_REF": "",
+                "IMAGE_TAG": "",
+                "IMAGE_DIGEST": "",
+                "SKIP_WHEEL_BUILD": "false",
+                **good_env,
+            },
+            capture_output=True,
+            text=True,
+        )
+        assert proc.returncode == 0, (good_env, proc.stderr)
+
+    # skip_wheel_build=true + blank models routes directly to Recipe model_sanity
+    # and skips build + legacy accuracy.
+    selector = next(
+        step for step in jobs["select"]["steps"] if step.get("id") == "select"
+    )
+    output = tmp_path / "prebuilt-output"
+    script = selector["run"].replace("python3 -", f'"{sys.executable}" -', 1)
+    proc = subprocess.run(
+        ["bash", "-e", "-c", script],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "MODELS": "",
+            "RECIPE_PUBLIC_ENABLED": "true",
+            "SCHEDULED_RECIPE_ENABLED": "false",
+            "SKIP_WHEEL_BUILD": "true",
+            "GITHUB_OUTPUT": str(output),
+        },
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    values = dict(line.split("=", 1) for line in output.read_text().splitlines())
+    assert values["matrix"] == ""
+    assert values["recipe_models"] == ""
+    assert values["run_recipe"] == "true"
+    assert len(values["target_sha"]) == 40
+    prebuilt_ctx = {
+        "github.event_name": "workflow_dispatch",
+        "vars.PPU_RECIPE_PUBLIC_ENABLED": "true",
+        "inputs.skip_wheel_build": True,
+        "needs.select.result": "success",
+        "needs.build.result": "skipped",
+        "needs.select.outputs.matrix": values["matrix"],
+        "needs.select.outputs.recipe_models": values["recipe_models"],
+        "needs.select.outputs.run_recipe": values["run_recipe"],
+    }
+    assert expression(jobs["build"]["if"], prebuilt_ctx) is False
+    assert expression(jobs["accuracy"]["if"], prebuilt_ctx) is False
+    assert expression(jobs["recipe-model-sanity"]["if"], prebuilt_ctx) is True
+
+
+def test_nightly_public_summary_exports_safe_image_digest_and_versions(tmp_path):
+    steps = workflow("_ppu-recipe-model-sanity.yaml")["jobs"]["sanity"]["steps"]
+    publish = next(step for step in steps if step.get("id") == "publish")
+    private_dir = tmp_path / "private"
+    (private_dir / "results").mkdir(parents=True)
+    digest = "@sha256:" + "b" * 64
+    (private_dir / "runtime-fingerprint.json").write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "install_mode": "prebuilt_image",
+                "runtime_image_digest": digest,
+                "versions": {
+                    "vllm": "0.10.2+sail",
+                    "vllm_sail": "0.34.0.dev1",
+                    "torch": "2.13.0",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    job_summary = tmp_path / "job-summary.md"
+    subprocess.run(
+        ["bash", "-e", "-c", publish["run"]],
+        env={
+            **os.environ,
+            "RECIPE_OUTCOME": "success",
+            "RETENTION_OUTCOME": "success",
+            "RETENTION": "retained",
+            "MODEL_KEY": "glm-5.3",
+            "TIER": "model_sanity",
+            "PPU_CI_SOURCE_DIR": str(ROOT),
+            "PRIVATE_DIR": str(private_dir),
+            "PUBLIC_DIR": str(tmp_path),
+            "GITHUB_STEP_SUMMARY": str(job_summary),
+        },
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    public = json.loads((tmp_path / "summary.json").read_text())
+    assert public["install_mode"] == "prebuilt_image"
+    assert public["runtime_image_digest"] == digest
+    assert public["runtime_versions"] == {
+        "vllm": "0.10.2+sail",
+        "vllm_sail": "0.34.0.dev1",
+        "torch": "2.13.0",
+    }
+    summary_text = job_summary.read_text()
+    assert digest in summary_text
+    assert "vllm=`0.10.2+sail`" in summary_text
+    assert "vllm_sail=`0.34.0.dev1`" in summary_text
+
+    # Unsafe domain/path values in runtime-fingerprint.json must be dropped.
+    (private_dir / "runtime-fingerprint.json").write_text(
+        json.dumps(
+            {
+                "install_mode": "evil",
+                "runtime_image_digest": "private.internal/repo" + digest,
+                "versions": {"vllm": "/private/path", "vllm_sail": "0.1.0"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    out2 = tmp_path / "out2"
+    out2.mkdir()
+    summary2 = tmp_path / "job-summary-2.md"
+    subprocess.run(
+        ["bash", "-e", "-c", publish["run"]],
+        env={
+            **os.environ,
+            "RECIPE_OUTCOME": "success",
+            "RETENTION_OUTCOME": "success",
+            "RETENTION": "retained",
+            "MODEL_KEY": "glm-5.3",
+            "TIER": "model_sanity",
+            "PPU_CI_SOURCE_DIR": str(ROOT),
+            "PRIVATE_DIR": str(private_dir),
+            "PUBLIC_DIR": str(out2),
+            "GITHUB_STEP_SUMMARY": str(summary2),
+        },
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    public2 = json.loads((out2 / "summary.json").read_text())
+    assert "install_mode" not in public2
+    assert "runtime_image_digest" not in public2
+    assert public2["runtime_versions"] == {"vllm_sail": "0.1.0"}
+    assert (
+        "private.internal"
+        not in (out2 / "summary.json").read_text() + summary2.read_text()
+    )
+    assert (
+        "/private/path"
+        not in (out2 / "summary.json").read_text() + summary2.read_text()
+    )
 
 
 @pytest.mark.parametrize(
