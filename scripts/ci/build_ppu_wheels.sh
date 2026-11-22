@@ -71,7 +71,12 @@ BUILD_JOBS="${BUILD_JOBS:-${default_jobs}}"
 
 mkdir -p "${VLLM_WHEEL_DIR}" "${SAIL_WHEEL_DIR}" "${LOG_DIR}"
 : >"${MANIFEST}"
-exec > >(tee -a "${LOG_DIR}/build.log") 2>&1
+SANITIZE_PUBLIC_BUILD="${VLLM_SAIL_SANITIZE_PUBLIC_BUILD:-0}"
+if [[ "${SANITIZE_PUBLIC_BUILD}" == "1" ]]; then
+    exec 3>&1 >"${LOG_DIR}/build.log" 2>&1
+else
+    exec > >(tee -a "${LOG_DIR}/build.log") 2>&1
+fi
 
 WORK_DIR="$(mktemp -d)"
 cleanup() {
@@ -81,6 +86,9 @@ on_error() {
     local status=$?
     trap - ERR
     printf 'status=failed\nexit_code=%s\n' "${status}" >>"${MANIFEST}"
+    if [[ "${SANITIZE_PUBLIC_BUILD}" == "1" ]]; then
+        printf 'build_ppu_wheels status=failed exit_code=%s\n' "${status}" >&3
+    fi
     exit "${status}"
 }
 trap cleanup EXIT
@@ -408,3 +416,6 @@ python "${ROOT_DIR}/scripts/ci/ppu_image_stack.py" verify \
 } >>"${MANIFEST}"
 printf 'Build succeeded.\nvLLM: %s\nvLLM SAIL: %s\nManifest: %s\n' \
     "${vllm_wheels[0]}" "${sail_wheels[0]}" "${MANIFEST}"
+if [[ "${SANITIZE_PUBLIC_BUILD}" == "1" ]]; then
+    printf 'build_ppu_wheels status=succeeded vllm_commit=%s\n' "${VLLM_COMMIT}" >&3
+fi

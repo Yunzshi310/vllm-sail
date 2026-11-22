@@ -19,6 +19,11 @@ sys.path.insert(0, str(ROOT))
 from tools._common import PatchEnvironmentError, load_patch_records  # noqa: E402
 
 
+def opaque_target_id(target: str) -> str:
+    """Return a deterministic, public-safe opaque identifier for a patch target."""
+    return f"t_{hashlib.sha256(target.encode('utf-8')).hexdigest()[:24]}"
+
+
 def _fingerprints(records: list[Any]) -> dict[str, str]:
     result: dict[str, str] = {}
     for record in records:
@@ -35,11 +40,14 @@ def _read_mapping_file(path: Path, label: str) -> dict[str, str] | None:
         data = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError as exc:
         raise ValueError(f"{label} is missing: {path}") from exc
-    if isinstance(data, dict) and isinstance(data.get("patch_fingerprints"), dict):
-        fp = data["patch_fingerprints"]
-        if not fp:
-            return None
-        data = fp
+    if isinstance(data, dict):
+        for envelope_key in ("opaque_fingerprints", "patch_fingerprints"):
+            if isinstance(data.get(envelope_key), dict):
+                fp = data[envelope_key]
+                if not fp:
+                    return None
+                data = fp
+                break
     if not isinstance(data, dict) or not all(
         isinstance(key, str) and isinstance(value, str) for key, value in data.items()
     ):
@@ -82,11 +90,17 @@ def evaluate_drift(
         incremental_drifted = list(drifted)
         known_soft_drifted: list[str] = []
     else:
+
+        def _prev_hash(target: str) -> str | None:
+            if target in previous:
+                return previous[target]
+            return previous.get(opaque_target_id(target))
+
         incremental_drifted = sorted(
-            target for target in drifted if previous.get(target) != current[target]
+            target for target in drifted if _prev_hash(target) != current[target]
         )
         known_soft_drifted = sorted(
-            target for target in drifted if previous.get(target) == current[target]
+            target for target in drifted if _prev_hash(target) == current[target]
         )
     if not (added or removed or drifted):
         status = "clean"
@@ -94,6 +108,7 @@ def evaluate_drift(
         status = "incremental_drift"
     else:
         status = "known_soft_drift"
+    opaque = dict(sorted((opaque_target_id(k), v) for k, v in current.items()))
     return {
         "status": status,
         "targets_count": len(current),
@@ -103,6 +118,7 @@ def evaluate_drift(
         "incremental_drifted": incremental_drifted,
         "known_soft_drifted": known_soft_drifted,
         "fingerprints": current,
+        "opaque_fingerprints": opaque,
     }
 
 

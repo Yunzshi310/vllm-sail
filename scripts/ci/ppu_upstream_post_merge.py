@@ -41,6 +41,7 @@ PROBE_CRON = "23 */5 * * *"
 DAILY_PIN_CRON = "41 1 * * *"
 
 SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
+OPAQUE_PATCH_KEY_RE = re.compile(r"^t_[0-9a-f]{24}$")
 IMAGE_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
 RC_TAG_RE = re.compile(r"^v(\d+)\.(\d+)\.0rc(\d+)$")
 RELEASE_LINE_RE = re.compile(r"^v?(\d+)\.(\d+)(?:\.(\d+))?")
@@ -257,6 +258,12 @@ def assert_zero_sensitive_leaks(
             )
 
 
+def opaque_target_id(target: str) -> str:
+    """Return a deterministic opaque identifier ``t_<24hex>`` for a patch target."""
+    digest = hashlib.sha256(target.encode("utf-8")).hexdigest()[:24]
+    return f"t_{digest}"
+
+
 def _sanitize_symbol(value: str, fallback: str = "unspecified") -> str:
     cleaned = value.strip()
     if not cleaned:
@@ -271,6 +278,18 @@ def _sanitize_symbol(value: str, fallback: str = "unspecified") -> str:
     except RedactionViolationError:
         return fallback
     return cleaned
+
+
+def _sanitize_patch_target_signature(
+    value: str, fallback: str = "patch_baseline"
+) -> str:
+    cleaned = value.strip()
+    if not cleaned:
+        return fallback
+    direct = _sanitize_symbol(cleaned, "")
+    if direct:
+        return direct
+    return f"opaque_target:{opaque_target_id(cleaned)}"
 
 
 # ---------------------------------------------------------------------------
@@ -312,19 +331,26 @@ def select_newest_rc_tag(
     *,
     release_baseline_tag: str,
     tested_rc_tags: Sequence[str] = (),
+    rc_tag_states: dict[str, dict[str, str]] | None = None,
+    include_failed: bool = False,
 ) -> tuple[str, str] | None:
-    """Return ``(rc_tag, commit_sha)`` for the newest untested ``vX.Y.0rc*``."""
+    """Return ``(rc_tag, commit_sha)`` for the newest eligible ``vX.Y.0rc*``."""
     base_match = RELEASE_LINE_RE.match(release_baseline_tag.strip())
     if not base_match:
         raise ValueError(f"invalid release baseline tag: {release_baseline_tag!r}")
     base_line = (int(base_match.group(1)), int(base_match.group(2)))
     tested = set(tested_rc_tags)
+    states = rc_tag_states or {}
 
     candidates: list[tuple[tuple[int, int, int], str, str]] = []
     for tag, sha in tags.items():
         match = RC_TAG_RE.fullmatch(tag)
         if not match or tag in tested:
             continue
+        prior = states.get(tag)
+        if isinstance(prior, dict) and prior.get("sha") == sha:
+            if prior.get("status") == "pass" or not include_failed:
+                continue
         major, minor, rc_num = (
             int(match.group(1)),
             int(match.group(2)),
@@ -360,6 +386,56 @@ def should_skip_ppu_for_paths(changed_paths: Sequence[str] | None) -> bool:
     return all(is_safe_ppu_skip_path(path) for path in changed_paths)
 
 
+def _sanitize_probe_record(
+    rec: Any,
+    *,
+    default_ppu_green: str,
+    default_ppu_tested: str,
+    default_ppu_status: str,
+    label: str = "last_probe_record",
+) -> dict[str, str]:
+    if not isinstance(rec, dict):
+        raise ValueError(f"{label} must be an object")
+    up_sha = _require_sha1(str(rec.get("upstream_sha", "")), f"{label}.upstream_sha")
+    green_sha = _require_sha1(
+        str(rec.get("last_ppu_green_sha", default_ppu_green)),
+        f"{label}.last_ppu_green_sha",
+    )
+    tested_sha = _require_sha1(
+        str(rec.get("last_ppu_tested_sha", default_ppu_tested)),
+        f"{label}.last_ppu_tested_sha",
+    )
+    cpu_st = str(rec.get("cpu_status", "not_run"))
+    ppu_st = str(rec.get("ppu_status", "not_run"))
+    skip_rs = str(rec.get("ppu_skip_reason", "none"))
+    rec_ppu_res = str(
+        rec.get(
+            "last_ppu_result_status",
+            "pass"
+            if tested_sha == green_sha and default_ppu_status == "pass"
+            else "fail",
+        )
+    )
+    if cpu_st not in ("pass", "fail", "not_run", "infra_error"):
+        raise ValueError(f"invalid {label}.cpu_status")
+    if ppu_st not in ("pass", "fail", "skipped", "not_run", "infra_error"):
+        raise ValueError(f"invalid {label}.ppu_status")
+    if skip_rs not in VALID_PPU_SKIP_REASONS:
+        raise ValueError(f"invalid {label}.ppu_skip_reason")
+    if rec_ppu_res not in ("pass", "fail"):
+        raise ValueError(f"invalid {label}.last_ppu_result_status")
+    return {
+        "gear": "probe",
+        "upstream_sha": up_sha,
+        "cpu_status": cpu_st,
+        "ppu_status": ppu_st,
+        "ppu_skip_reason": skip_rs,
+        "last_ppu_tested_sha": tested_sha,
+        "last_ppu_green_sha": green_sha,
+        "last_ppu_result_status": rec_ppu_res,
+    }
+
+
 def _sanitize_cursor(
     cursor: dict[str, Any] | None, *, verified_pin: str
 ) -> dict[str, Any]:
@@ -375,7 +451,9 @@ def _sanitize_cursor(
             "last_ppu_green_sha": pin,
             "last_ppu_status": "pass",
             "tested_rc_tags": [],
+            "rc_tag_states": {},
             "patch_fingerprints": {},
+            "probe_history": [],
         }
     if not isinstance(cursor, dict):
         raise ValueError("cursor must be a JSON object")
@@ -395,7 +473,27 @@ def _sanitize_cursor(
     for item in raw_rcs:
         if not isinstance(item, str) or not RC_TAG_RE.fullmatch(item.strip()):
             raise ValueError(f"invalid RC tag in cursor: {item!r}")
-        tested_rcs.append(item.strip())
+        tag_clean = item.strip()
+        if tag_clean not in tested_rcs:
+            tested_rcs.append(tag_clean)
+
+    raw_rc_states = cursor.get("rc_tag_states") or {}
+    if not isinstance(raw_rc_states, dict):
+        raise ValueError("rc_tag_states must be an object")
+    clean_rc_states: dict[str, dict[str, str]] = {}
+    for raw_tag, raw_entry in raw_rc_states.items():
+        if not isinstance(raw_tag, str) or not RC_TAG_RE.fullmatch(raw_tag.strip()):
+            raise ValueError(f"invalid RC tag key in rc_tag_states: {raw_tag!r}")
+        if not isinstance(raw_entry, dict):
+            raise ValueError("rc_tag_states entry must be an object")
+        rc_sha = _require_sha1(str(raw_entry.get("sha", "")), "rc_tag_states.sha")
+        rc_st = str(raw_entry.get("status", "fail"))
+        if rc_st not in ("pass", "fail", "infra_error"):
+            raise ValueError(f"invalid rc_tag_states status: {rc_st!r}")
+        tag_clean = raw_tag.strip()
+        clean_rc_states[tag_clean] = {"sha": rc_sha, "status": rc_st}
+        if rc_st == "pass" and tag_clean not in tested_rcs:
+            tested_rcs.append(tag_clean)
 
     raw_fps = cursor.get("patch_fingerprints") or {}
     if not isinstance(raw_fps, dict):
@@ -405,7 +503,7 @@ def _sanitize_cursor(
         if not isinstance(k, str) or not isinstance(v, str):
             raise ValueError("patch_fingerprints entries must be strings")
         assert_zero_sensitive_leaks(k)
-        if not SAFE_SYMBOL_RE.fullmatch(k):
+        if not OPAQUE_PATCH_KEY_RE.fullmatch(k) and not SAFE_SYMBOL_RE.fullmatch(k):
             raise ValueError(f"invalid patch target key in cursor: {k!r}")
         if v != "additive" and not re.fullmatch(r"[0-9a-f]{64}", v):
             raise ValueError(f"invalid patch fingerprint hash for {k!r}")
@@ -449,51 +547,45 @@ def _sanitize_cursor(
         "last_ppu_green_sha": ppu_green,
         "last_ppu_status": last_ppu_st,
         "tested_rc_tags": tested_rcs,
+        "rc_tag_states": dict(sorted(clean_rc_states.items())),
         "patch_fingerprints": dict(sorted(clean_fps.items())),
+        "probe_history": [],
     }
 
-    rec = cursor.get("last_probe_record")
-    if rec is not None:
-        if not isinstance(rec, dict):
-            raise ValueError("last_probe_record must be an object")
-        up_sha = _require_sha1(
-            str(rec.get("upstream_sha", "")), "last_probe_record.upstream_sha"
+    clean_history: list[dict[str, str]] = []
+    seen_shas: set[str] = set()
+    if raw_rec is not None:
+        clean_last = _sanitize_probe_record(
+            raw_rec,
+            default_ppu_green=ppu_green,
+            default_ppu_tested=ppu_tested,
+            default_ppu_status=last_ppu_st,
+            label="last_probe_record",
         )
-        green_sha = _require_sha1(
-            str(rec.get("last_ppu_green_sha", sanitized["last_ppu_green_sha"])),
-            "last_probe_record.last_ppu_green_sha",
+        sanitized["last_probe_record"] = clean_last
+        clean_history.append(clean_last)
+        seen_shas.add(clean_last["upstream_sha"])
+
+    raw_hist = cursor.get("probe_history") or []
+    if not isinstance(raw_hist, list):
+        raise ValueError("probe_history must be a list")
+    for idx, item in enumerate(raw_hist):
+        clean_item = _sanitize_probe_record(
+            item,
+            default_ppu_green=ppu_green,
+            default_ppu_tested=ppu_tested,
+            default_ppu_status=last_ppu_st,
+            label=f"probe_history[{idx}]",
         )
-        tested_sha = _require_sha1(
-            str(rec.get("last_ppu_tested_sha", sanitized["last_ppu_tested_sha"])),
-            "last_probe_record.last_ppu_tested_sha",
-        )
-        cpu_st = str(rec.get("cpu_status", "not_run"))
-        ppu_st = str(rec.get("ppu_status", "not_run"))
-        skip_rs = str(rec.get("ppu_skip_reason", "none"))
-        rec_ppu_res = str(
-            rec.get(
-                "last_ppu_result_status",
-                "pass" if tested_sha == green_sha and last_ppu_st == "pass" else "fail",
-            )
-        )
-        if cpu_st not in ("pass", "fail", "not_run", "infra_error"):
-            raise ValueError("invalid last_probe_record.cpu_status")
-        if ppu_st not in ("pass", "fail", "skipped", "not_run", "infra_error"):
-            raise ValueError("invalid last_probe_record.ppu_status")
-        if skip_rs not in VALID_PPU_SKIP_REASONS:
-            raise ValueError("invalid last_probe_record.ppu_skip_reason")
-        if rec_ppu_res not in ("pass", "fail"):
-            raise ValueError("invalid last_probe_record.last_ppu_result_status")
-        sanitized["last_probe_record"] = {
-            "gear": "probe",
-            "upstream_sha": up_sha,
-            "cpu_status": cpu_st,
-            "ppu_status": ppu_st,
-            "ppu_skip_reason": skip_rs,
-            "last_ppu_tested_sha": tested_sha,
-            "last_ppu_green_sha": green_sha,
-            "last_ppu_result_status": rec_ppu_res,
-        }
+        if clean_item["upstream_sha"] not in seen_shas:
+            clean_history.append(clean_item)
+            seen_shas.add(clean_item["upstream_sha"])
+        if len(clean_history) >= 20:
+            break
+
+    sanitized["probe_history"] = clean_history
+    if clean_history and "last_probe_record" not in sanitized:
+        sanitized["last_probe_record"] = clean_history[0]
     return sanitized
 
 
@@ -574,6 +666,8 @@ def route_three_gears(
                 tags,
                 release_baseline_tag=release_baseline_tag,
                 tested_rc_tags=tested_rcs,
+                rc_tag_states=state["rc_tag_states"],
+                include_failed=force,
             )
             if rc_hit is not None and not override:
                 effective_gear = "rc_qualify"
@@ -595,7 +689,9 @@ def route_three_gears(
                 rc_hit = select_newest_rc_tag(
                     tags,
                     release_baseline_tag=release_baseline_tag,
-                    tested_rc_tags=tested_rcs,
+                    tested_rc_tags=() if force else tested_rcs,
+                    rc_tag_states=state["rc_tag_states"],
+                    include_failed=force,
                 )
                 if rc_hit is None:
                     return {
@@ -621,13 +717,24 @@ def route_three_gears(
         }
 
     if effective_gear == "daily_pin_bump":
+        history = list(probe_history)
+        if not history:
+            history = list(state.get("probe_history") or [])
+        if not history and state.get("last_probe_record"):
+            history = [state["last_probe_record"]]
         if override:
             candidate = _require_sha1(override, "upstream_ref")
-            bump_sha = "" if candidate == pin else candidate
+            if candidate == pin:
+                bump_sha = ""
+            else:
+                matching = [
+                    rec
+                    for rec in history
+                    if isinstance(rec, dict)
+                    and str(rec.get("upstream_sha", "")).strip() == candidate
+                ]
+                bump_sha = select_pin_bump_candidate(matching, verified_pin=pin) or ""
         else:
-            history = list(probe_history)
-            if not history and state.get("last_probe_record"):
-                history = [state["last_probe_record"]]
             bump_sha = select_pin_bump_candidate(history, verified_pin=pin) or ""
         return {
             "selected_gear": "daily_pin_bump",
@@ -850,47 +957,90 @@ def advance_cursor(
     if status == "noop" or not target_sha or not SHA1_RE.fullmatch(target_sha):
         return updated
 
-    if cpu_status in ("pass", "fail"):
+    if selected_gear == "daily_pin_bump":
+        return updated
+
+    if selected_gear == "rc_qualify":
+        # RC qualification runs on release-branch commits and must NEVER mutate
+        # main-branch CPU/PPU cursors, patch fingerprints, or bisection baselines.
+        if rc_tag and RC_TAG_RE.fullmatch(rc_tag):
+            rc_passed = (
+                status == "pass" and cpu_status == "pass" and ppu_status == "pass"
+            )
+            rc_st = (
+                "pass"
+                if rc_passed
+                else ("infra_error" if status == "infra_error" else "fail")
+            )
+            updated["rc_tag_states"][rc_tag] = {
+                "sha": target_sha,
+                "status": rc_st,
+            }
+            updated["rc_tag_states"] = dict(sorted(updated["rc_tag_states"].items()))
+            if rc_passed:
+                if rc_tag not in updated["tested_rc_tags"]:
+                    updated["tested_rc_tags"].append(rc_tag)
+            elif rc_tag in updated["tested_rc_tags"]:
+                updated["tested_rc_tags"] = [
+                    t for t in updated["tested_rc_tags"] if t != rc_tag
+                ]
+        return updated
+
+    pre_lane_failure = (
+        status in ("fail", "infra_error")
+        and cpu_status not in ("pass", "fail")
+        and ppu_status not in ("pass", "fail")
+    )
+
+    if pre_lane_failure:
         updated["last_cpu_checked_sha"] = target_sha
-        updated["last_cpu_status"] = cpu_status
+        updated["last_cpu_status"] = "fail"
+        if updated["last_ppu_tested_sha"] == target_sha:
+            updated["last_ppu_status"] = "fail"
+    elif cpu_status in ("pass", "fail", "infra_error"):
+        updated["last_cpu_checked_sha"] = target_sha
+        updated["last_cpu_status"] = "pass" if cpu_status == "pass" else "fail"
         if cpu_status == "pass":
             updated["last_cpu_green_sha"] = target_sha
             if patch_fingerprints:
                 for k, v in patch_fingerprints.items():
                     assert_zero_sensitive_leaks(k)
-                    if SAFE_SYMBOL_RE.fullmatch(k) and (
-                        v == "additive" or re.fullmatch(r"[0-9a-f]{64}", v)
-                    ):
+                    if (
+                        OPAQUE_PATCH_KEY_RE.fullmatch(k) or SAFE_SYMBOL_RE.fullmatch(k)
+                    ) and (v == "additive" or re.fullmatch(r"[0-9a-f]{64}", v)):
                         updated["patch_fingerprints"][k] = v
                 updated["patch_fingerprints"] = dict(
                     sorted(updated["patch_fingerprints"].items())
                 )
 
     # Hardware cursor advances ONLY when device smoke actually executed!
-    if ppu_status in ("pass", "fail"):
+    if ppu_status in ("pass", "fail", "infra_error"):
         updated["last_ppu_tested_sha"] = target_sha
-        updated["last_ppu_status"] = ppu_status
+        updated["last_ppu_status"] = "pass" if ppu_status == "pass" else "fail"
         if ppu_status == "pass":
             updated["last_ppu_green_sha"] = target_sha
 
-    if (
-        selected_gear == "rc_qualify"
-        and rc_tag
-        and RC_TAG_RE.fullmatch(rc_tag)
-        and status == "pass"
-        and cpu_status == "pass"
-        and ppu_status == "pass"
-    ):
-        if rc_tag not in updated["tested_rc_tags"]:
-            updated["tested_rc_tags"].append(rc_tag)
-
     if selected_gear == "probe" and (
-        cpu_status in ("pass", "fail") or ppu_status in ("pass", "fail")
+        pre_lane_failure
+        or cpu_status in ("pass", "fail", "infra_error")
+        or ppu_status in ("pass", "fail", "infra_error")
     ):
-        updated["last_probe_record"] = {
+        if pre_lane_failure:
+            rec_cpu = "infra_error" if status == "infra_error" else "fail"
+        elif (
+            cpu_status == "not_run"
+            and status in ("pass", "deferred")
+            and updated["last_cpu_green_sha"] == target_sha
+            and updated["last_cpu_status"] == "pass"
+        ):
+            rec_cpu = "pass"
+        else:
+            rec_cpu = cpu_status
+
+        new_rec = {
             "gear": "probe",
             "upstream_sha": target_sha,
-            "cpu_status": cpu_status,
+            "cpu_status": rec_cpu,
             "ppu_status": ppu_status,
             "ppu_skip_reason": ppu_skip_reason
             if ppu_skip_reason in VALID_PPU_SKIP_REASONS
@@ -899,6 +1049,23 @@ def advance_cursor(
             "last_ppu_green_sha": updated["last_ppu_green_sha"],
             "last_ppu_result_status": updated["last_ppu_status"],
         }
+        updated["last_probe_record"] = new_rec
+        merged_history: list[dict[str, str]] = [new_rec]
+        for old_rec in updated.get("probe_history") or []:
+            if old_rec.get("upstream_sha") == target_sha:
+                continue
+            item = dict(old_rec)
+            if (
+                item.get("ppu_status") == "skipped"
+                and item.get("last_ppu_green_sha") == target_sha
+                and updated["last_ppu_status"] != "pass"
+            ):
+                item["last_ppu_tested_sha"] = updated["last_ppu_tested_sha"]
+                item["last_ppu_result_status"] = "fail"
+            merged_history.append(item)
+            if len(merged_history) >= 20:
+                break
+        updated["probe_history"] = merged_history
     return updated
 
 
@@ -906,16 +1073,21 @@ def advance_cursor(
 # 2. Tier-A Kernel Manifest & Binding Schema Checker (stdlib, no GPU/sailify)
 # ---------------------------------------------------------------------------
 
-_OPS_DEF_RE = re.compile(r'ops\.def\(\s*((?:"(?:[^"\\]|\\.)*"\s*)+)\)', re.DOTALL)
+_OPS_DEF_RE = re.compile(
+    r'\b[A-Za-z_][A-Za-z0-9_]*\.def\(\s*((?:"(?:[^"\\]|\\.)*"\s*)+)\s*[,)]',
+    re.DOTALL,
+)
 _STRING_LIT_RE = re.compile(r'"((?:[^"\\]|\\.)*)"')
 
 
 def extract_ops_defs(cpp_text: str) -> dict[str, str]:
-    """Extract ``{op_name: normalized_schema}`` from ``ops.def("...")`` calls."""
+    """Extract ``{op_name: normalized_schema}`` from C++ TorchLibrary ``.def(...)`` calls."""
     schemas: dict[str, str] = {}
     for match in _OPS_DEF_RE.finditer(cpp_text):
         concatenated = "".join(_STRING_LIT_RE.findall(match.group(1)))
         normalized = " ".join(concatenated.split())
+        if "(" not in normalized or "->" not in normalized:
+            continue
         op_name = normalized.split("(", 1)[0].strip()
         if op_name:
             schemas[op_name] = normalized
@@ -925,7 +1097,7 @@ def extract_ops_defs(cpp_text: str) -> dict[str, str]:
 def check_kernel_manifest_compatibility(
     vllm_src: Path, sail_root: Path = REPO_ROOT
 ) -> list[str]:
-    """Check Tier-A kernel source existence and C++ ``ops.def`` schema parity."""
+    """Check Tier-A kernel source existence and C++ TorchLibrary schema parity."""
     manifest_path = sail_root / "csrc" / "upstream" / "manifest.toml"
     manifest = _load_toml(manifest_path)
     compiled_tiers = set(manifest.get("compiled_tiers") or ["a"])
@@ -953,6 +1125,8 @@ def check_kernel_manifest_compatibility(
             vendored_schemas.update(
                 extract_ops_defs(sail_file.read_text(encoding="utf-8"))
             )
+        else:
+            problems.append(f"missing_vendored_binding_file:{sail_rel}")
         if not up_file.is_file():
             problems.append(f"missing_binding_file:{up_rel}")
         else:
@@ -963,6 +1137,7 @@ def check_kernel_manifest_compatibility(
     for op_key in sorted(compiled_ops):
         base_op = op_key.split(".", 1)[0]
         if base_op not in vendored_schemas:
+            problems.append(f"unverified_vendored_op_schema:{base_op}")
             continue
         if base_op not in upstream_schemas:
             problems.append(f"missing_op_schema:{base_op}")
@@ -1285,9 +1460,7 @@ def publish_sanitized_channels(
         }
     )
 
-    safe_first_bad = (
-        first_failing_sha if SHA1_RE.fullmatch(first_failing_sha) else up_sha
-    )
+    safe_first_bad = first_failing_sha if SHA1_RE.fullmatch(first_failing_sha) else ""
     safe_last_good = last_good_sha if SHA1_RE.fullmatch(last_good_sha) else pin
 
     reproducer_md = ""
@@ -1341,7 +1514,7 @@ def publish_sanitized_channels(
             "known_soft_drift_count": max(0, min(int(known_soft_drift_count), 10000)),
         },
         "bisect": {
-            "first_failing_sha": safe_first_bad if status == "fail" else None,
+            "first_failing_sha": (safe_first_bad or None) if status == "fail" else None,
             "last_good_sha": safe_last_good if status == "fail" else None,
             "steps": max(0, min(int(bisect_steps), 64)),
         },
@@ -1488,6 +1661,175 @@ def prepare_pin_bump(
     }
 
 
+def sanitize_build_manifest_file(manifest_path: Path) -> str:
+    """Rewrite ``build-manifest.txt`` to an allowlisted public key-value set."""
+    if not manifest_path.is_file():
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        text = "status=missing\n"
+        assert_zero_sensitive_leaks(text, staging_paths=[manifest_path])
+        manifest_path.write_text(text, encoding="utf-8")
+        return text
+
+    raw_fields: dict[str, str] = {}
+    for raw_line in manifest_path.read_text(
+        encoding="utf-8", errors="replace"
+    ).splitlines():
+        key, sep, val = raw_line.partition("=")
+        if not sep or not key:
+            continue
+        raw_fields[key.strip()] = val.strip()
+
+    out_lines: list[str] = []
+    st = raw_fields.get("status", "unknown")
+    out_lines.append(
+        f"status={st if st in ('running', 'succeeded', 'failed') else 'unknown'}"
+    )
+    if re.fullmatch(r"[0-9]{1,3}", raw_fields.get("exit_code", "")):
+        out_lines.append(f"exit_code={raw_fields['exit_code']}")
+    for sha_key in (
+        "vllm_ref",
+        "candidate_vllm_commit",
+        "vllm_commit",
+        "vllm_sail_commit",
+    ):
+        val = raw_fields.get(sha_key, "")
+        if SHA1_RE.fullmatch(val):
+            out_lines.append(f"{sha_key}={val}")
+    for sha256_key in ("sdk_sha256", "torch_sha256"):
+        val = raw_fields.get(sha256_key, "")
+        if re.fullmatch(r"[0-9a-f]{64}", val):
+            out_lines.append(f"{sha256_key}={val}")
+    arch = raw_fields.get("pytorch_sail_arch", "")
+    if re.fullmatch(r"[A-Za-z0-9_;.-]{1,64}", arch):
+        out_lines.append(f"pytorch_sail_arch={arch}")
+    reuse = raw_fields.get("reuse_mode", "")
+    if reuse in ("native", "sail-native", "full"):
+        out_lines.append(f"reuse_mode={reuse}")
+    out_lines.append(
+        f"build_image_digest={extract_image_digest(raw_fields.get('build_image', ''))}"
+    )
+
+    sanitized_text = "\n".join(out_lines) + "\n"
+    assert_zero_sensitive_leaks(sanitized_text, staging_paths=[manifest_path])
+    manifest_path.write_text(sanitized_text, encoding="utf-8")
+    return sanitized_text
+
+
+def resolve_complete_first_parent_range(
+    vllm_repo: Path,
+    last_green_sha: str,
+    red_sha: str,
+    *,
+    max_deepen_rounds: int = 8,
+    deepen_step: int = 250,
+) -> list[str] | None:
+    """Return ``(last_green_sha..red_sha]`` iff the unbroken first-parent chain is verified."""
+    green = _require_sha1(last_green_sha, "last_green_sha")
+    red = _require_sha1(red_sha, "red_sha")
+    if green == red:
+        return []
+
+    def _walk() -> list[str] | None:
+        has_green = subprocess.run(
+            ["git", "-C", str(vllm_repo), "cat-file", "-e", f"{green}^{{commit}}"],
+            capture_output=True,
+        )
+        if has_green.returncode != 0:
+            return None
+        rev = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(vllm_repo),
+                "rev-list",
+                "--first-parent",
+                "--parents",
+                red,
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if rev.returncode != 0:
+            return None
+        chain: list[str] = []
+        for raw_line in rev.stdout.splitlines():
+            parts = raw_line.split()
+            if not parts:
+                continue
+            sha = parts[0]
+            if not SHA1_RE.fullmatch(sha):
+                return None
+            if sha == green:
+                if not chain:
+                    return []
+                chain.reverse()
+                return chain
+            chain.append(sha)
+            if len(parts) < 2:
+                # Hit root commit or .git/shallow graft boundary before green.
+                return None
+        return None
+
+    complete = _walk()
+    if complete is not None:
+        return complete
+
+    remote_check = subprocess.run(
+        ["git", "-C", str(vllm_repo), "remote", "get-url", "origin"],
+        capture_output=True,
+        text=True,
+    )
+    if remote_check.returncode != 0:
+        return None
+
+    for _ in range(max_deepen_rounds):
+        is_shallow = subprocess.run(
+            ["git", "-C", str(vllm_repo), "rev-parse", "--is-shallow-repository"],
+            capture_output=True,
+            text=True,
+        )
+        if is_shallow.returncode == 0 and is_shallow.stdout.strip() == "false":
+            # Full history is already fetched; green is not a first-parent ancestor of red.
+            return _walk()
+        fetch_proc = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(vllm_repo),
+                "fetch",
+                "--quiet",
+                f"--deepen={deepen_step}",
+                "origin",
+                red,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if fetch_proc.returncode != 0:
+            break
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(vllm_repo),
+                "fetch",
+                "--quiet",
+                "--depth=1",
+                "origin",
+                green,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        complete = _walk()
+        if complete is not None:
+            return complete
+
+    return _walk()
+
+
 # ---------------------------------------------------------------------------
 # 6. SDK Container CPU Fast Check Runner
 # ---------------------------------------------------------------------------
@@ -1520,10 +1862,15 @@ def run_sdk_cpu_fast_check(
     patch_fingerprints: dict[str, str] = {}
 
     def _write_result(outcome: ProbeOutcome) -> int:
+        safe_sig = (
+            _sanitize_patch_target_signature(outcome.target_signature, "patch_baseline")
+            if outcome.stage == "patch_drift"
+            else _sanitize_symbol(outcome.target_signature, "none")
+        )
         payload = {
             "status": outcome.status,
             "stage": outcome.stage,
-            "target_signature": _sanitize_symbol(outcome.target_signature, "none"),
+            "target_signature": safe_sig,
             "is_public_plugin_interface": outcome.is_public_plugin_interface,
             "known_soft_drift_count": known_soft_count,
             "patch_fingerprints": patch_fingerprints,
@@ -1624,7 +1971,14 @@ def run_sdk_cpu_fast_check(
     if drift_json.is_file():
         drift_data = json.loads(drift_json.read_text(encoding="utf-8"))
         known_soft_count = len(drift_data.get("known_soft_drifted") or [])
-        patch_fingerprints = dict(drift_data.get("fingerprints") or {})
+        raw_opaque = drift_data.get("opaque_fingerprints")
+        if isinstance(raw_opaque, dict):
+            patch_fingerprints = {str(k): str(v) for k, v in sorted(raw_opaque.items())}
+        else:
+            patch_fingerprints = {
+                opaque_target_id(str(k)): str(v)
+                for k, v in sorted((drift_data.get("fingerprints") or {}).items())
+            }
         drift_json.unlink(missing_ok=True)
     else:
         drift_data = {}
@@ -1812,7 +2166,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     p_pub.add_argument("--public-dir", type=Path, required=True)
     p_pub.add_argument("--step-summary", type=Path, default=None)
 
+    p_bman = sub.add_parser("sanitize-build-manifest")
+    p_bman.add_argument("--manifest", type=Path, required=True)
+
     args = parser.parse_args(list(argv) if argv is not None else None)
+
+    if args.command == "sanitize-build-manifest":
+        sanitize_build_manifest_file(args.manifest)
+        return 0
 
     if args.command == "route":
         if args.ls_remote_file is not None:
@@ -1887,31 +2248,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "bisect":
         green = _require_sha1(args.last_green_sha, "last_green_sha")
         red = _require_sha1(args.red_sha, "red_sha")
-        rev = subprocess.run(
-            [
-                "git",
-                "-C",
-                str(args.vllm_repo),
-                "rev-list",
-                "--first-parent",
-                "--reverse",
-                f"{green}..{red}",
-            ],
-            capture_output=True,
-            text=True,
-        )
-        commits = (
-            [
-                line.strip()
-                for line in rev.stdout.splitlines()
-                if SHA1_RE.fullmatch(line.strip())
-            ]
-            if rev.returncode == 0
-            else []
-        )
-        if not commits or commits[-1] != red:
-            commits = [red]
-
         initial_red = None
         if args.initial_red_json and args.initial_red_json.is_file():
             init_data = json.loads(args.initial_red_json.read_text(encoding="utf-8"))
@@ -1927,6 +2263,51 @@ def main(argv: Sequence[str] | None = None) -> int:
                     init_data.get("is_public_plugin_interface")
                 ),
             )
+
+        commits = resolve_complete_first_parent_range(args.vllm_repo, green, red)
+        if not commits:
+            fallback_outcome = initial_red or ProbeOutcome(
+                status="fail",
+                stage=args.default_stage,
+                target_signature="window_head",
+            )
+            serializable = {
+                "bisect_status": "unresolved_history",
+                "first_failing_sha": "",
+                "last_good_sha": green,
+                "steps_executed": 0,
+                "probe_steps_on_range": 0,
+                "stage": fallback_outcome.stage
+                if fallback_outcome.stage in VALID_STAGES
+                else args.default_stage,
+                "target_signature": _sanitize_symbol(
+                    fallback_outcome.target_signature, "unspecified"
+                ),
+                "is_public_plugin_interface": bool(
+                    fallback_outcome.is_public_plugin_interface
+                ),
+                "history": [],
+            }
+            text = json.dumps(serializable, indent=2, sort_keys=True) + "\n"
+            args.output_json.parent.mkdir(parents=True, exist_ok=True)
+            assert_zero_sensitive_leaks(text, staging_paths=[args.output_json])
+            args.output_json.write_text(text, encoding="utf-8")
+            _write_github_outputs(
+                args.github_output,
+                {
+                    "bisect_status": serializable["bisect_status"],
+                    "first_failing_sha": serializable["first_failing_sha"],
+                    "last_good_sha": serializable["last_good_sha"],
+                    "steps_executed": serializable["steps_executed"],
+                    "stage": serializable["stage"],
+                    "target_signature": serializable["target_signature"],
+                    "is_public_plugin_interface": serializable[
+                        "is_public_plugin_interface"
+                    ],
+                },
+            )
+            print(text, end="")
+            return 0
 
         def _shell_probe(candidate_sha: str) -> ProbeOutcome:
             probe_json = args.output_json.parent / f"probe-{candidate_sha[:12]}.json"
@@ -2070,11 +2451,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             "aborted_infra_error",
         ):
             effective_status = "infra_error"
-        failure_stage = (
-            args.failure_stage
-            if args.failure_stage != "none"
-            else str(bisect_meta.get("stage") or cpu_meta.get("stage") or "none")
-        )
+        measured_stage = str(
+            bisect_meta.get("stage") or cpu_meta.get("stage") or ""
+        ).strip()
+        if measured_stage in VALID_STAGES and measured_stage != "none":
+            failure_stage = measured_stage
+        elif args.failure_stage in VALID_STAGES:
+            failure_stage = args.failure_stage
+        else:
+            failure_stage = "none"
         target_sig = args.target_signature or str(
             bisect_meta.get("target_signature")
             or cpu_meta.get("target_signature")
@@ -2126,27 +2511,30 @@ def main(argv: Sequence[str] | None = None) -> int:
             public_dir=args.public_dir,
             step_summary_path=args.step_summary,
         )
-        prev_cursor = (
-            json.loads(args.cursor_in.read_text(encoding="utf-8"))
-            if args.cursor_in and args.cursor_in.is_file()
-            else None
-        )
-        next_cursor = advance_cursor(
-            prev_cursor,
-            verified_pin=verified_pin,
-            selected_gear=args.gear,
-            target_sha=args.upstream_sha,
-            rc_tag=args.rc_tag,
-            status=effective_status,
-            cpu_status=args.cpu_status,
-            ppu_status=args.ppu_status,
-            ppu_skip_reason=args.ppu_skip_reason,
-            patch_fingerprints=patch_fps,
-        )
         cursor_path = args.public_dir / "cursor.json"
-        cursor_text = json.dumps(next_cursor, indent=2, sort_keys=True) + "\n"
-        assert_zero_sensitive_leaks(cursor_text, staging_paths=[cursor_path])
-        cursor_path.write_text(cursor_text, encoding="utf-8")
+        if args.gear in ("probe", "rc_qualify") and effective_status != "noop":
+            prev_cursor = (
+                json.loads(args.cursor_in.read_text(encoding="utf-8"))
+                if args.cursor_in and args.cursor_in.is_file()
+                else None
+            )
+            next_cursor = advance_cursor(
+                prev_cursor,
+                verified_pin=verified_pin,
+                selected_gear=args.gear,
+                target_sha=args.upstream_sha,
+                rc_tag=args.rc_tag,
+                status=effective_status,
+                cpu_status=args.cpu_status,
+                ppu_status=args.ppu_status,
+                ppu_skip_reason=args.ppu_skip_reason,
+                patch_fingerprints=patch_fps,
+            )
+            cursor_text = json.dumps(next_cursor, indent=2, sort_keys=True) + "\n"
+            assert_zero_sensitive_leaks(cursor_text, staging_paths=[cursor_path])
+            cursor_path.write_text(cursor_text, encoding="utf-8")
+        else:
+            cursor_path.unlink(missing_ok=True)
         print(published["console"])
         return 0
 

@@ -44,7 +44,7 @@ permissions:
   actions: read
 
 concurrency:
-  group: upstream-post-merge-${{ github.event.schedule || inputs.gear || 'auto' }}
+  group: upstream-post-merge-state
   cancel-in-progress: false
 
 jobs:
@@ -61,7 +61,7 @@ jobs:
       run_cpu: ${{ steps.route.outputs.run_cpu }}
       run_ppu: ${{ steps.route.outputs.run_ppu }}
       ppu_skip_reason: ${{ steps.route.outputs.ppu_skip_reason }}
-      native_reuse_run_id: ${{ steps.prior.outputs.native_reuse_run_id }}
+      native_reuse_run_id: ${{ steps.donor.outputs.run_id }}
     steps:
       - name: Check out vLLM SAIL
         uses: actions/checkout@v4
@@ -69,7 +69,13 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
 
-      - name: Discover prior cursor, probe history, active PR CI, and donor wheel run
+      - name: Find verified Nightly wheel donor on default branch
+        id: donor
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 -m scripts.ci.ppu_preview_wheel_donor
+
+      - name: Discover prior cursor and active PR CI runs
         id: prior
         uses: actions/github-script@v7
         with:
@@ -92,36 +98,17 @@ jobs:
             }
             fs.writeFileSync("state/active-pr-runs.txt", String(activePrRuns));
 
-            // 2. Find latest trusted wheel donor run on main for SAIL native .so reuse.
-            let donorRunId = "";
-            const mainBuilds = await github.rest.actions.listWorkflowRuns({
-              owner,
-              repo,
-              workflow_id: "ppu-build-and-test.yaml",
-              branch: "main",
-              status: "completed",
-              per_page: 10,
-            }).catch(() => ({ data: { workflow_runs: [] } }));
-            for (const run of mainBuilds.data.workflow_runs || []) {
-              if (run.conclusion === "success") {
-                donorRunId = String(run.id);
-                break;
-              }
-            }
-            core.setOutput("native_reuse_run_id", donorRunId);
-
-            // 3. Download latest post-merge cursor & recent probe summaries if available.
+            // 2. Download latest post-merge cursor artifact written by probe/rc_qualify.
             const canaryRuns = await github.rest.actions.listWorkflowRuns({
               owner,
               repo,
               workflow_id: "upstream-canary.yaml",
               branch: "main",
               status: "completed",
-              per_page: 15,
+              per_page: 20,
             }).catch(() => ({ data: { workflow_runs: [] } }));
 
             let cursorFound = false;
-            const probeHistory = [];
             for (const run of canaryRuns.data.workflow_runs || []) {
               if (run.id === context.runId) continue;
               const arts = await github.rest.actions.listWorkflowRunArtifacts({
@@ -130,29 +117,28 @@ jobs:
                 run_id: run.id,
                 per_page: 20,
               }).catch(() => ({ data: { artifacts: [] } }));
-              const pubArt = (arts.data.artifacts || []).find(
-                a => !a.expired && a.name.startsWith("upstream-post-merge-public-")
+              const curArt = (arts.data.artifacts || []).find(
+                a => !a.expired && a.name.startsWith("upstream-post-merge-cursor-")
               );
-              if (!pubArt) continue;
+              if (!curArt) continue;
               core.setOutput("prior_canary_run_id", String(run.id));
-              core.setOutput("prior_public_artifact", pubArt.name);
+              core.setOutput("prior_cursor_artifact", curArt.name);
               cursorFound = true;
               break;
             }
             if (!cursorFound) {
               core.setOutput("prior_canary_run_id", "");
-              core.setOutput("prior_public_artifact", "");
+              core.setOutput("prior_cursor_artifact", "");
             }
-            fs.writeFileSync("state/probe-history.json", JSON.stringify(probeHistory));
 
       - name: Restore prior cursor artifact when available
         if: steps.prior.outputs.prior_canary_run_id != ''
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
-          name: ${{ steps.prior.outputs.prior_public_artifact }}
+          name: ${{ steps.prior.outputs.prior_cursor_artifact }}
           run-id: ${{ steps.prior.outputs.prior_canary_run_id }}
-          path: state/prior-public
+          path: state/prior-cursor
           github-token: ${{ github.token }}
 
       - name: Poll upstream refs and compute changed paths for sliding window
@@ -166,8 +152,8 @@ jobs:
         run: |
           mkdir -p state
           git ls-remote https://github.com/vllm-project/vllm.git refs/heads/main "refs/tags/v*" > state/ls-remote.txt
-          if [[ -f state/prior-public/cursor.json ]]; then
-            cp state/prior-public/cursor.json state/cursor.json
+          if [[ -f state/prior-cursor/cursor.json ]]; then
+            cp state/prior-cursor/cursor.json state/cursor.json
           fi
           if [[ -n "${LAST_GREEN_OVERRIDE}" ]]; then
             python3 - <<'PY'
@@ -239,6 +225,7 @@ jobs:
       pr_head_sha: ${{ github.sha }}
       vllm_ref: ${{ needs.route.outputs.target_sha }}
       native_reuse_run_id: ${{ needs.route.outputs.native_reuse_run_id }}
+      diagnostics_mode: public
 
   cpu-fast-check:
     name: SDK container CPU fast check & static bisect
@@ -307,9 +294,9 @@ jobs:
 
           git init -q /tmp/vllm-src
           git -C /tmp/vllm-src remote add origin https://github.com/vllm-project/vllm.git
-          git -C /tmp/vllm-src fetch --quiet --depth=150 origin "${TARGET_SHA}"
+          git -C /tmp/vllm-src fetch --quiet --depth=250 origin "${TARGET_SHA}"
           if [[ -n "${LAST_GREEN_SHA}" && "${LAST_GREEN_SHA}" != "${TARGET_SHA}" ]]; then
-            git -C /tmp/vllm-src fetch --quiet --depth=150 origin "${LAST_GREEN_SHA}" || true
+            git -C /tmp/vllm-src fetch --quiet --depth=1 origin "${LAST_GREEN_SHA}" || true
           fi
           git -C /tmp/vllm-src checkout --quiet --detach "${TARGET_SHA}"
 
@@ -466,7 +453,8 @@ jobs:
           if [[ "$rc" -ne 0 && -n "${LAST_GREEN_SHA}" && "${LAST_GREEN_SHA}" != "${TARGET_SHA}" ]]; then
             git init -q "${BISECT_DIR}/vllm-src"
             git -C "${BISECT_DIR}/vllm-src" remote add origin https://github.com/vllm-project/vllm.git
-            git -C "${BISECT_DIR}/vllm-src" fetch --quiet --depth=150 origin "${TARGET_SHA}" "${LAST_GREEN_SHA}" || true
+            git -C "${BISECT_DIR}/vllm-src" fetch --quiet --depth=250 origin "${TARGET_SHA}" || true
+            git -C "${BISECT_DIR}/vllm-src" fetch --quiet --depth=1 origin "${LAST_GREEN_SHA}" || true
 
             probe_cmd='
               set -euo pipefail
@@ -677,11 +665,35 @@ jobs:
           PY
           )"
           cp scripts/ci/ppu_ops_tests.json scripts/ci/ppu_ops_environment.json ops-selection/
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          from scripts.ci.ppu_upstream_post_merge import extract_image_digest
+
+          build_image = os.environ["BUILD_IMAGE"].strip()
+          lines = []
+          recorded_digest = ""
+          for raw in Path("ops-build-diagnostics/build-manifest.txt").read_text(encoding="utf-8").splitlines():
+              k, sep, v = raw.partition("=")
+              if not sep:
+                  continue
+              if k == "build_image_digest":
+                  recorded_digest = v.strip()
+                  continue
+              if k != "build_image":
+                  lines.append(raw)
+          if recorded_digest != extract_image_digest(build_image):
+              raise SystemExit(
+                  f"Observed sanitized build image digest mismatch: {recorded_digest} != {extract_image_digest(build_image)}"
+              )
+          lines.append(f"build_image={build_image}")
+          Path("/tmp/rc-ops-build-manifest.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+          PY
           python3 scripts/ci/ppu_ops_select.py select --repo . \
             --config ops-selection/ppu_ops_tests.json \
             --environment ops-selection/ppu_ops_environment.json \
             --changes ops-selection/changes.json \
-            --build-manifest ops-build-diagnostics/build-manifest.txt \
+            --build-manifest /tmp/rc-ops-build-manifest.txt \
             --wheel-manifest ops-wheels/wheel-manifest.json \
             --build-run-id "${GITHUB_RUN_ID}" \
             --build-image "${BUILD_IMAGE}" \
@@ -950,7 +962,7 @@ jobs:
             "${extra_args[@]}"
           printf 'final_status=%s\n' "${status}" >> "$GITHUB_OUTPUT"
 
-      - name: Upload allowlisted public summary and cursor artifact
+      - name: Upload allowlisted public summary artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -958,7 +970,19 @@ jobs:
           path: |
             /tmp/post-merge-public/public-summary.json
             /tmp/post-merge-public/issue-payload.json
-            /tmp/post-merge-public/cursor.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload persistent post-merge cursor artifact
+        if: >-
+          always() &&
+          steps.publish.outcome == 'success' &&
+          (needs.route.outputs.selected_gear == 'probe' || needs.route.outputs.selected_gear == 'rc_qualify') &&
+          steps.publish.outputs.final_status != 'noop'
+        uses: actions/upload-artifact@v4
+        with:
+          name: upstream-post-merge-cursor-${{ github.run_id }}-${{ github.run_attempt }}
+          path: /tmp/post-merge-public/cursor.json
           if-no-files-found: error
           retention-days: 30
 

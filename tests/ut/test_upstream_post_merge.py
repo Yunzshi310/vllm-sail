@@ -1077,5 +1077,636 @@ def test_gate6_upstream_canary_workflow_three_gears_contract():
         "group": "upstream-post-merge-ppu-slot",
         "cancel-in-progress": False,
     }
+    assert wf["concurrency"] == {
+        "group": "upstream-post-merge-state",
+        "cancel-in-progress": False,
+    }
+    assert jobs["build"]["with"]["diagnostics_mode"] == "public"
+    assert "ppu_preview_wheel_donor" in wf_raw
+    assert "ppu-build-and-test.yaml" not in wf_raw
     for rc_job in ("rc-pin-ut", "rc-fast-sanity", "rc-model-sanity", "rc-ops-tests"):
         assert "rc_qualify" in jobs[rc_job]["if"]
+
+
+# ---------------------------------------------------------------------------
+# PR #374 Review Regression Suite (All 12 Counterexamples + Controls)
+# ---------------------------------------------------------------------------
+
+
+def test_review_r1_container_build_candidate_export_works_under_posix_sh_and_bash():
+    candidate = "b" * 40
+    assert candidate != VERIFIED_PIN
+    shells = ["sh", "bash"]
+    if shutil.which("dash"):
+        shells.append("dash")
+
+    for wf_name in ("_ppu-build.yaml", "ppu-ops-tests.yaml"):
+        jobs = yaml.safe_load((REPO_ROOT / ".github/workflows" / wf_name).read_text())[
+            "jobs"
+        ]
+        job = next(
+            j
+            for j in jobs.values()
+            if any(
+                "export VLLM_SAIL_CANDIDATE_UPSTREAM_COMMIT" in s.get("run", "")
+                for s in j.get("steps", [])
+            )
+        )
+        step = next(
+            s
+            for s in job["steps"]
+            if "export VLLM_SAIL_CANDIDATE_UPSTREAM_COMMIT" in s.get("run", "")
+        )
+        assert step.get("shell") == "bash"
+        snippet = step["run"].replace(
+            "bash scripts/ci/build_ppu_wheels.sh",
+            'printf "%s" "${VLLM_SAIL_CANDIDATE_UPSTREAM_COMMIT:-unset}"',
+        )
+        for sh in shells:
+            proc = subprocess.run(
+                [sh, "-e", "-c", snippet],
+                cwd=REPO_ROOT,
+                env={**os.environ, "VLLM_REF": candidate},
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            assert proc.stdout == candidate
+            pin_proc = subprocess.run(
+                [sh, "-e", "-c", snippet],
+                cwd=REPO_ROOT,
+                env={**os.environ, "VLLM_REF": VERIFIED_PIN},
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            assert pin_proc.stdout == "unset"
+
+
+def test_review_r2_real_patch_baseline_opaque_fingerprints_pass_redaction_and_diff(
+    tmp_path,
+):
+    from types import SimpleNamespace
+
+    from tools import check_patch_drift
+
+    def _to_records(source_by_target: dict[str, str | None]):
+        return [
+            SimpleNamespace(target=k, original_source=v)
+            for k, v in source_by_target.items()
+        ]
+
+    real_baseline = json.loads(
+        (REPO_ROOT / "tools/patch_baseline.json").read_text(encoding="utf-8")
+    )
+    assert len(real_baseline) >= 300
+    # Raw baseline contains confidential/long symbols that trip public redaction.
+    with pytest.raises(post_merge.RedactionViolationError):
+        post_merge.assert_zero_sensitive_leaks(
+            json.dumps({"patch_fingerprints": real_baseline})
+        )
+
+    # Opaque mapping serializes cleanly through both redaction and cursor sanitization,
+    # while still detecting incremental drift on any of the 376 targets.
+    base_sources = {
+        k: (None if v == "additive" else f"body:{k}:{v}")
+        for k, v in real_baseline.items()
+    }
+    recorded = check_patch_drift._fingerprints(_to_records(base_sources))
+    drift_clean = check_patch_drift.evaluate_drift(_to_records(base_sources), recorded)
+    opaque_map = drift_clean["opaque_fingerprints"]
+    assert len(opaque_map) == len(real_baseline)
+    cpu_payload = json.dumps({"patch_fingerprints": opaque_map}, sort_keys=True)
+    post_merge.assert_zero_sensitive_leaks(cpu_payload)
+
+    cursor = post_merge.advance_cursor(
+        None,
+        verified_pin=VERIFIED_PIN,
+        selected_gear="probe",
+        target_sha=_sha(601),
+        status="pass",
+        cpu_status="pass",
+        ppu_status="pass",
+        patch_fingerprints=opaque_map,
+    )
+    cursor_file = tmp_path / "cursor.json"
+    cursor_text = json.dumps(cursor, indent=2, sort_keys=True)
+    post_merge.assert_zero_sensitive_leaks(cursor_text)
+    cursor_file.write_text(cursor_text, encoding="utf-8")
+
+    # Simulate a known soft drift recorded in cursor.json followed by an incremental drift on a step5 target!
+    step5_key = next(k for k in real_baseline if "step5" in k.lower())
+    prev_sources = {**base_sources, step5_key: "soft-drifted-body-v1"}
+    prev_opaque = check_patch_drift.evaluate_drift(_to_records(prev_sources), recorded)[
+        "opaque_fingerprints"
+    ]
+    cursor_soft = post_merge.advance_cursor(
+        cursor,
+        verified_pin=VERIFIED_PIN,
+        selected_gear="probe",
+        target_sha=_sha(602),
+        status="pass",
+        cpu_status="pass",
+        ppu_status="pass",
+        patch_fingerprints=prev_opaque,
+    )
+    prev_file = tmp_path / "prev-cursor.json"
+    prev_file.write_text(json.dumps(cursor_soft), encoding="utf-8")
+    loaded_prev = check_patch_drift._read_mapping_file(prev_file, "previous baseline")
+
+    same_soft = check_patch_drift.evaluate_drift(
+        _to_records(prev_sources), recorded, previous=loaded_prev
+    )
+    assert same_soft["known_soft_drifted"] == [step5_key]
+    assert same_soft["incremental_drifted"] == []
+
+    new_drift = check_patch_drift.evaluate_drift(
+        _to_records({**base_sources, step5_key: "incremental-drifted-body-v2"}),
+        recorded,
+        previous=loaded_prev,
+    )
+    assert new_drift["incremental_drifted"] == [step5_key]
+    safe_sig = post_merge._sanitize_patch_target_signature(step5_key)
+    assert safe_sig.startswith("opaque_target:t_")
+    post_merge.assert_zero_sensitive_leaks(safe_sig)
+
+
+def test_review_r3_r4_r9_r10_promotion_eligibility_deferred_merge_and_cursor_discipline(
+    tmp_path,
+):
+    sha_b = _sha(701)
+    sha_c = _sha(702)
+
+    def _cycle(state=None, gear="probe", target=sha_b, permute=None, **kw):
+        decision = post_merge.route_three_gears(
+            ls_remote_data={"main_sha": target, "tags": {}},
+            verified_pin=VERIFIED_PIN,
+            release_baseline_tag="v0.33.0",
+            requested_gear=gear,
+            cursor=state,
+            **kw,
+        )
+        args = {
+            "selected_gear": decision["selected_gear"],
+            "target_sha": decision["target_sha"],
+            "run_cpu": decision["run_cpu"],
+            "run_ppu": decision["run_ppu"],
+            "ppu_skip_reason": decision["ppu_skip_reason"],
+        }
+        jobs = {
+            "build_result": "success"
+            if args["run_cpu"] or args["run_ppu"]
+            else "skipped",
+            "cpu_result": "success" if args["run_cpu"] else "skipped",
+            "ppu_smoke_result": "success"
+            if args["run_ppu"] and args["selected_gear"] == "probe"
+            else "skipped",
+        }
+        outcome = post_merge.evaluate_workflow_outcome(
+            **args, **(jobs | (permute or {}))
+        )
+        next_state = post_merge.advance_cursor(
+            state,
+            verified_pin=VERIFIED_PIN,
+            selected_gear=args["selected_gear"],
+            target_sha=args["target_sha"],
+            rc_tag=decision["rc_tag"],
+            status=outcome["status"],
+            cpu_status=outcome["cpu_status"],
+            ppu_status=outcome["ppu_status"],
+            ppu_skip_reason=outcome["ppu_skip_reason"],
+        )
+        return decision, outcome, next_state
+
+    # R3: Prior passing probe on B followed by forced wheel-build failure invalidates B!
+    _, _, prior = _cycle()
+    assert (
+        post_merge.route_three_gears(
+            ls_remote_data={"main_sha": sha_b, "tags": {}},
+            verified_pin=VERIFIED_PIN,
+            release_baseline_tag="v0.33.0",
+            requested_gear="daily_pin_bump",
+            cursor=prior,
+        )["target_sha"]
+        == sha_b
+    )
+    _, rerun, failed_cursor = _cycle(
+        prior,
+        force=True,
+        permute={
+            "build_result": "failure",
+            "cpu_result": "skipped",
+            "ppu_smoke_result": "skipped",
+        },
+    )
+    assert rerun["status"] == "fail"
+    assert (
+        post_merge.route_three_gears(
+            ls_remote_data={"main_sha": sha_b, "tags": {}},
+            verified_pin=VERIFIED_PIN,
+            release_baseline_tag="v0.33.0",
+            requested_gear="daily_pin_bump",
+            cursor=failed_cursor,
+        )["target_sha"]
+        == ""
+    )
+    next_probe_after_build_fail = post_merge.route_three_gears(
+        ls_remote_data={"main_sha": sha_b, "tags": {}},
+        verified_pin=VERIFIED_PIN,
+        release_baseline_tag="v0.33.0",
+        requested_gear="probe",
+        cursor=failed_cursor,
+    )
+    assert next_probe_after_build_fail["run_cpu"] is True
+    assert next_probe_after_build_fail["ppu_skip_reason"] != "already_tested"
+
+    # R4: Manual daily_pin_bump override rejects unprobed SHAs and accepts verified SHAs.
+    assert (
+        post_merge.route_three_gears(
+            ls_remote_data={"main_sha": sha_b, "tags": {}},
+            verified_pin=VERIFIED_PIN,
+            release_baseline_tag="v0.33.0",
+            requested_gear="daily_pin_bump",
+            cursor=None,
+            upstream_ref_override=sha_c,
+        )["target_sha"]
+        == ""
+    )
+    assert (
+        post_merge.route_three_gears(
+            ls_remote_data={"main_sha": sha_b, "tags": {}},
+            verified_pin=VERIFIED_PIN,
+            release_baseline_tag="v0.33.0",
+            requested_gear="daily_pin_bump",
+            cursor=prior,
+            upstream_ref_override=sha_b,
+        )["target_sha"]
+        == sha_b
+    )
+
+    # R9: Split 2-run probe (CPU pass + PPU deferred, then PPU pass) promotes B!
+    _, out1, st1 = _cycle(active_pr_runs=1)
+    assert out1["status"] == "deferred"
+    d2, out2, st2 = _cycle(st1)
+    assert d2["run_cpu"] is False and d2["run_ppu"] is True
+    assert out2["status"] == "pass"
+    assert (
+        post_merge.route_three_gears(
+            ls_remote_data={"main_sha": sha_b, "tags": {}},
+            verified_pin=VERIFIED_PIN,
+            release_baseline_tag="v0.33.0",
+            requested_gear="daily_pin_bump",
+            cursor=st2,
+        )["target_sha"]
+        == sha_b
+    )
+
+    # R10: Read-only daily_pin_bump and noop runs never write cursor.json in `publish`.
+    pub_daily = tmp_path / "pub-daily"
+    assert (
+        post_merge.main(
+            [
+                "publish",
+                "--gear",
+                "daily_pin_bump",
+                "--status",
+                "pass",
+                "--sail-sha",
+                _sha(709),
+                "--upstream-sha",
+                sha_b,
+                "--public-dir",
+                str(pub_daily),
+            ]
+        )
+        == 0
+    )
+    assert not (pub_daily / "cursor.json").exists()
+
+
+def test_review_r5_rc_red_and_green_never_starve_or_pollute_main_probe():
+    sha_rc = _sha(720)
+    sha_main = _sha(721)
+    tags = {"v0.34.0rc1": sha_rc}
+
+    # 1. Failed RC runs once on auto schedule; next auto poll probes advancing main!
+    d_rc = post_merge.route_three_gears(
+        ls_remote_data={"main_sha": sha_main, "tags": tags},
+        verified_pin=VERIFIED_PIN,
+        release_baseline_tag="v0.33.0",
+        requested_gear="auto",
+    )
+    assert d_rc["selected_gear"] == "rc_qualify" and d_rc["target_sha"] == sha_rc
+    red_rc_cursor = post_merge.advance_cursor(
+        None,
+        verified_pin=VERIFIED_PIN,
+        selected_gear="rc_qualify",
+        target_sha=sha_rc,
+        rc_tag="v0.34.0rc1",
+        status="fail",
+        cpu_status="pass",
+        ppu_status="fail",
+    )
+    after_red_rc = post_merge.route_three_gears(
+        ls_remote_data={"main_sha": sha_main, "tags": tags},
+        verified_pin=VERIFIED_PIN,
+        release_baseline_tag="v0.33.0",
+        requested_gear="auto",
+        cursor=red_rc_cursor,
+    )
+    assert after_red_rc["selected_gear"] == "probe"
+    assert after_red_rc["target_sha"] == sha_main
+    assert after_red_rc["last_green_sha"] == VERIFIED_PIN
+
+    # 2. Passing RC records RC tag without overwriting main's last_ppu_green_sha!
+    green_rc_cursor = post_merge.advance_cursor(
+        None,
+        verified_pin=VERIFIED_PIN,
+        selected_gear="rc_qualify",
+        target_sha=sha_rc,
+        rc_tag="v0.34.0rc1",
+        status="pass",
+        cpu_status="pass",
+        ppu_status="pass",
+    )
+    assert green_rc_cursor["last_ppu_green_sha"] == VERIFIED_PIN
+    assert green_rc_cursor["last_cpu_green_sha"] == VERIFIED_PIN
+    after_green_rc = post_merge.route_three_gears(
+        ls_remote_data={"main_sha": sha_main, "tags": tags},
+        verified_pin=VERIFIED_PIN,
+        release_baseline_tag="v0.33.0",
+        requested_gear="auto",
+        cursor=green_rc_cursor,
+    )
+    assert after_green_rc["selected_gear"] == "probe"
+    assert after_green_rc["last_green_sha"] == VERIFIED_PIN
+
+
+def test_review_r6_r12_shallow_bisect_completeness_deepening_and_precise_publish_stage(
+    tmp_path,
+):
+    src = tmp_path / "upstream-full"
+    shallow_no_origin = tmp_path / "shallow-disconnected"
+    shallow_with_origin = tmp_path / "shallow-origin"
+    for d in (src, shallow_no_origin, shallow_with_origin):
+        d.mkdir()
+        subprocess.run(["git", "-C", str(d), "init", "-q"], check=True)
+
+    git_env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "Test",
+        "GIT_COMMITTER_NAME": "Test",
+        "GIT_AUTHOR_EMAIL": "test@example.org",
+        "GIT_COMMITTER_EMAIL": "test@example.org",
+    }
+    commits: list[str] = []
+    for i in range(6):
+        (src / "state").write_text(f"{i}\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(src), "add", "state"], check=True)
+        subprocess.run(
+            ["git", "-C", str(src), "commit", "-qm", str(i)],
+            check=True,
+            env=git_env,
+        )
+        commits.append(
+            subprocess.check_output(
+                ["git", "-C", str(src), "rev-parse", "HEAD"], text=True
+            ).strip()
+        )
+
+    url = src.as_uri()
+    # Disconnected shallow clone (no `origin` remote): must report unresolved_history with NO false culprit!
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(shallow_no_origin),
+            "fetch",
+            "-q",
+            "--depth=2",
+            url,
+            commits[-1],
+        ],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(shallow_no_origin),
+            "fetch",
+            "-q",
+            "--depth=1",
+            url,
+            commits[0],
+        ],
+        check=True,
+    )
+    out_disc = tmp_path / "disc.json"
+    assert (
+        post_merge.main(
+            [
+                "bisect",
+                "--vllm-repo",
+                str(shallow_no_origin),
+                "--last-green-sha",
+                commits[0],
+                "--red-sha",
+                commits[-1],
+                "--probe-cmd",
+                f'test "$CANDIDATE_SHA" = {commits[0]}',
+                "--output-json",
+                str(out_disc),
+            ]
+        )
+        == 0
+    )
+    disc_data = json.loads(out_disc.read_text(encoding="utf-8"))
+    assert disc_data["bisect_status"] == "unresolved_history"
+    assert disc_data["first_failing_sha"] == ""
+
+    # Shallow clone WITH `origin` remote: automatically deepens until connected and finds exact commit 1!
+    subprocess.run(
+        ["git", "-C", str(shallow_with_origin), "remote", "add", "origin", url],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(shallow_with_origin),
+            "fetch",
+            "-q",
+            "--depth=2",
+            "origin",
+            commits[-1],
+        ],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(shallow_with_origin),
+            "fetch",
+            "-q",
+            "--depth=1",
+            "origin",
+            commits[0],
+        ],
+        check=True,
+    )
+    out_deep = tmp_path / "deep.json"
+    assert (
+        post_merge.main(
+            [
+                "bisect",
+                "--vllm-repo",
+                str(shallow_with_origin),
+                "--last-green-sha",
+                commits[0],
+                "--red-sha",
+                commits[-1],
+                "--probe-cmd",
+                f'test "$CANDIDATE_SHA" = {commits[0]}',
+                "--output-json",
+                str(out_deep),
+            ]
+        )
+        == 0
+    )
+    deep_data = json.loads(out_deep.read_text(encoding="utf-8"))
+    assert deep_data["bisect_status"] == "converged"
+    assert deep_data["first_failing_sha"] == commits[1]
+
+    # R6 + R12 in `publish`: unbisected failures have first_failing_sha=None; measured cpu stage wins!
+    no_bisect_dir = tmp_path / "pub-no-bisect"
+    assert (
+        post_merge.main(
+            [
+                "publish",
+                "--gear",
+                "probe",
+                "--status",
+                "fail",
+                "--sail-sha",
+                _sha(730),
+                "--upstream-sha",
+                commits[-1],
+                "--failure-stage",
+                "wheel_build",
+                "--public-dir",
+                str(no_bisect_dir),
+            ]
+        )
+        == 0
+    )
+    no_bisect_sum = json.loads(
+        (no_bisect_dir / "public-summary.json").read_text(encoding="utf-8")
+    )
+    assert no_bisect_sum["bisect"]["first_failing_sha"] is None
+    assert no_bisect_sum["triage"]["stage"] == "wheel_build"
+
+    cpu_res_file = tmp_path / "cpu-res.json"
+    cpu_res_file.write_text(
+        json.dumps(
+            {
+                "stage": "patch_drift",
+                "status": "fail",
+                "target_signature": "vllm.config.Example",
+            }
+        ),
+        encoding="utf-8",
+    )
+    detail_dir = tmp_path / "pub-cpu-detail"
+    assert (
+        post_merge.main(
+            [
+                "publish",
+                "--gear",
+                "probe",
+                "--status",
+                "fail",
+                "--sail-sha",
+                _sha(730),
+                "--upstream-sha",
+                commits[-1],
+                "--failure-stage",
+                "plugin_registration",
+                "--cpu-result-json",
+                str(cpu_res_file),
+                "--public-dir",
+                str(detail_dir),
+            ]
+        )
+        == 0
+    )
+    detail_sum = json.loads(
+        (detail_dir / "public-summary.json").read_text(encoding="utf-8")
+    )
+    assert detail_sum["triage"]["stage"] == "patch_drift"
+    assert detail_sum["triage"]["classification"] == "sail_internal_patch_drift"
+
+
+def test_review_r7_r8_moe_sum_schema_parity_and_sanitized_build_diagnostics(tmp_path):
+    # R7: Every single compiled Tier-A op is extracted from vendored bindings, including `m.def("moe_sum...")`!
+    manifest_data = post_merge._load_toml(REPO_ROOT / "csrc/upstream/manifest.toml")
+    fake_vllm = tmp_path / "vllm-tier-a"
+    for entry in manifest_data["entry"]:
+        if entry.get("tier") == "a":
+            target = fake_vllm / entry["path"]
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("// stub\n", encoding="utf-8")
+    for up_rel, sail_rel in (
+        ("csrc/torch_bindings.cpp", "csrc/upstream/torch_bindings.cpp"),
+        ("csrc/moe/torch_bindings.cpp", "csrc/upstream/moe/torch_bindings.cpp"),
+    ):
+        dst = fake_vllm / up_rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(REPO_ROOT / sail_rel, dst)
+
+    assert post_merge.check_kernel_manifest_compatibility(fake_vllm, REPO_ROOT) == []
+    moe_tb = fake_vllm / "csrc/moe/torch_bindings.cpp"
+    orig_moe = moe_tb.read_text(encoding="utf-8")
+    assert "moe_sum(Tensor input," in orig_moe
+    moe_tb.write_text(
+        orig_moe.replace(
+            "moe_sum(Tensor input,", "moe_sum(int breaking_arg, Tensor input,"
+        ),
+        encoding="utf-8",
+    )
+    moe_problems = post_merge.check_kernel_manifest_compatibility(fake_vllm, REPO_ROOT)
+    assert "changed_op_schema:moe_sum" in moe_problems
+
+    # R8: `sanitize-build-manifest` strips internal registry/host paths and passes redaction gate.
+    raw_manifest = tmp_path / "build-manifest.txt"
+    raw_manifest.write_text(
+        "\n".join(
+            [
+                "status=running",
+                f"vllm_ref={VERIFIED_PIN}",
+                "pytorch_sail_arch=ppu_15;ppu_10",
+                "build_image=download.t-head.cn/docker_release/pytorch@sha256:"
+                + "9" * 64,
+                "reuse_mode=sail-native",
+                "reuse_source=/home/runner/work/vllm-sail/artifacts/native-reuse",
+                "hgcc=hgcc (T-Head PPU) /ppusw/sdk",
+                "status=succeeded",
+                f"vllm_commit={VERIFIED_PIN}",
+                f"vllm_sail_commit={_sha(740)}",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    assert (
+        post_merge.main(["sanitize-build-manifest", "--manifest", str(raw_manifest)])
+        == 0
+    )
+    cleaned = raw_manifest.read_text(encoding="utf-8")
+    post_merge.assert_zero_sensitive_leaks(cleaned)
+    assert "t-head.cn" not in cleaned
+    assert "/home/runner" not in cleaned
+    assert "/ppusw" not in cleaned
+    assert f"build_image_digest=sha256:{'9' * 64}" in cleaned
+    assert "status=succeeded" in cleaned

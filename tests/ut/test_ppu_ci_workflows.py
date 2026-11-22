@@ -720,6 +720,7 @@ def test_build_leaf_preserves_retry_identity_and_image_output():
         "vllm_ref",
         "pytorch_sail_arch",
         "native_reuse_run_id",
+        "diagnostics_mode",
     }
     for value in call["inputs"].values():
         assert value["type"] == "string"

@@ -23,6 +23,10 @@ on:
         description: Prior trusted run whose vLLM wheel and native SAIL extensions may be reused
         type: string
         default: ""
+      diagnostics_mode:
+        description: Diagnostics mode (blank retains full logs; public redacts console and artifacts)
+        type: string
+        default: ""
     outputs:
       image:
         description: Build image recorded for downstream tests
@@ -105,11 +109,13 @@ jobs:
           run-id: ${{ inputs.native_reuse_run_id }}
 
       - name: Build or repackage wheels
+        shell: bash
         env:
           VLLM_SAIL_NATIVE_REUSE_DIR: ${{ inputs.native_reuse_run_id != '' && format('{0}/artifacts/native-reuse', github.workspace) || '' }}
+          VLLM_SAIL_SANITIZE_PUBLIC_BUILD: ${{ inputs.diagnostics_mode == 'public' && '1' || '0' }}
         run: |
           verified="$(tr -d '[:space:]' < .github/vllm-main-verified.commit)"
-          if [[ -n "${VLLM_REF:-}" && "${VLLM_REF}" != "${verified}" ]]; then
+          if [ -n "${VLLM_REF:-}" ] && [ "${VLLM_REF}" != "${verified}" ]; then
             export VLLM_SAIL_CANDIDATE_UPSTREAM_COMMIT="${VLLM_REF}"
           fi
           bash scripts/ci/build_ppu_wheels.sh
@@ -129,14 +135,21 @@ jobs:
         if: success()
         run: printf 'ready_epoch=%s\n' "$(date +%s)" >> "$GITHUB_OUTPUT"
 
+      - name: Sanitize public build diagnostics
+        if: always() && inputs.diagnostics_mode == 'public'
+        shell: bash
+        run: |
+          rm -rf artifacts/logs
+          python_bin="$(command -v python3 || command -v python)"
+          "${python_bin}" scripts/ci/ppu_upstream_post_merge.py sanitize-build-manifest \
+            --manifest artifacts/build-manifest.txt
+
       - name: Upload build diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ppu-build-diagnostics-${{ github.run_id }}
           overwrite: true
-          path: |
-            artifacts/logs/**
-            artifacts/build-manifest.txt
+          path: ${{ inputs.diagnostics_mode == 'public' && 'artifacts/build-manifest.txt' || format('{0}\n{1}', 'artifacts/logs/**', 'artifacts/build-manifest.txt') }}
           if-no-files-found: warn
           retention-days: 14
