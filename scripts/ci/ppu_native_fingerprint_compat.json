@@ -1,0 +1,14 @@
+{
+  ".github/workflows/_ppu-build.yaml": {
+    "current": "6d9b48e51f7a93d4059975408b39f09495688f005535bc52137f7b06a74ddc57",
+    "previous": "cce4c5efc3299d688dca53eb43c2ddbd244704130d47ac1959f081329da1292e"
+  },
+  "scripts/ci/build_ppu_wheels.sh": {
+    "current": "56b528117bfb24559f08b9ce532f8c9745fc678dd7c145f2f88c37493ba6ec13",
+    "previous": "39a9a9aa6688ca65d1f9499b8324301f3a6de45b98195edadfc977f4ae86aead"
+  },
+  "scripts/ci/ppu_wheel_manifest.py": {
+    "current": "bb20a00be80caea1819456a71e7630a7d1ccb5e1f8cf56461dffac57b7cf2b4a",
+    "previous": "b4fb93e09a6178db328c44cde4333a1cc8abeb8d3662b869dae262ca7cde6069"
+  }
+}

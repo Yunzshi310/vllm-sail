@@ -242,10 +242,13 @@ def test_gate2_candidate_sha_passthrough_and_sail_native_so_reuse_without_mutati
         encoding="utf-8"
     )
     start_idx = build_script.index("fingerprint_args=(")
-    end_idx = build_script.index('if [[ -n "${NATIVE_REUSE_DIR}"')
+    end_idx = build_script.index('if [[ "${VLLM_REF}" =~ ^[0-9a-f]{40}$ ]]')
     extracted_fn = build_script[start_idx:end_idx]
 
-    prebuilt_dir = tmp_path / "prebuilt-ext"
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    manifest_file = tmp_path / "build-manifest.txt"
+    manifest_file.touch()
     vllm_wheel_out = tmp_path / "out-vllm-wheels"
     vllm_wheel_out.mkdir()
     harness = tmp_path / "run_reuse.sh"
@@ -253,17 +256,19 @@ def test_gate2_candidate_sha_passthrough_and_sail_native_so_reuse_without_mutati
         "#!/usr/bin/env bash\n"
         "set -Eeuo pipefail\n"
         f'ROOT_DIR="{REPO_ROOT}"\n'
-        f'NATIVE_REUSE_DIR="{donor_dir}"\n'
-        f'PREBUILT_EXT_DIR="{prebuilt_dir}"\n'
+        f'WORK_DIR="{work_dir}"\n'
+        f'MANIFEST="{manifest_file}"\n'
         f'VLLM_WHEEL_DIR="{vllm_wheel_out}"\n'
         f'VLLM_SAIL_BUILD_IMAGE="{build_img}"\n'
         'PYTORCH_SAIL_ARCH="ppu_15;ppu_10"\n'
         f'VLLM_REF="{candidate_sha}"\n'
+        f'CANDIDATE_VLLM_COMMIT="{candidate_sha}"\n'
         "NATIVE_REUSE=0\n"
         "SAIL_NATIVE_REUSE=0\n"
+        'PREBUILT_EXT_DIR=""\n'
         f"{extracted_fn}\n"
-        "prepare_native_reuse\n"
-        'printf "NATIVE_REUSE=%s\\nSAIL_NATIVE_REUSE=%s\\n" "$NATIVE_REUSE" "$SAIL_NATIVE_REUSE"\n',
+        f'prepare_native_reuse "{donor_dir}"\n'
+        'printf "NATIVE_REUSE=%s\\nSAIL_NATIVE_REUSE=%s\\nPREBUILT_EXT_DIR=%s\\n" "$NATIVE_REUSE" "$SAIL_NATIVE_REUSE" "$PREBUILT_EXT_DIR"\n',
         encoding="utf-8",
     )
     reuse_env = dict(os.environ)
@@ -277,6 +282,12 @@ def test_gate2_candidate_sha_passthrough_and_sail_native_so_reuse_without_mutati
     )
     assert "NATIVE_REUSE=0" in proc.stdout
     assert "SAIL_NATIVE_REUSE=1" in proc.stdout
+    ext_line = next(
+        line.split("=", 1)[1]
+        for line in proc.stdout.splitlines()
+        if line.startswith("PREBUILT_EXT_DIR=")
+    )
+    prebuilt_dir = Path(ext_line)
     for mod_name in ("_C", "_moe_C", "_upstream_C", "_upstream_moe_C"):
         assert (prebuilt_dir / f"{mod_name}.abi3.so").is_file()
     assert hashlib.sha256(manifest_toml.read_bytes()).hexdigest() == manifest_sha_before
@@ -1082,7 +1093,7 @@ def test_gate6_upstream_canary_workflow_three_gears_contract():
         "cancel-in-progress": False,
     }
     assert jobs["build"]["with"]["diagnostics_mode"] == "public"
-    assert "ppu_preview_wheel_donor" in wf_raw
+    assert jobs["build"]["with"]["resolve_native_donors"] is True
     assert "ppu-build-and-test.yaml" not in wf_raw
     for rc_job in ("rc-pin-ut", "rc-fast-sanity", "rc-model-sanity", "rc-ops-tests"):
         assert "rc_qualify" in jobs[rc_job]["if"]

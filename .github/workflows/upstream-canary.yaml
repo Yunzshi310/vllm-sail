@@ -61,19 +61,12 @@ jobs:
       run_cpu: ${{ steps.route.outputs.run_cpu }}
       run_ppu: ${{ steps.route.outputs.run_ppu }}
       ppu_skip_reason: ${{ steps.route.outputs.ppu_skip_reason }}
-      native_reuse_run_id: ${{ steps.donor.outputs.run_id }}
     steps:
       - name: Check out vLLM SAIL
         uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-
-      - name: Find verified Nightly wheel donor on default branch
-        id: donor
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: python3 -m scripts.ci.ppu_preview_wheel_donor
 
       - name: Discover prior cursor and active PR CI runs
         id: prior
@@ -224,7 +217,7 @@ jobs:
     with:
       pr_head_sha: ${{ github.sha }}
       vllm_ref: ${{ needs.route.outputs.target_sha }}
-      native_reuse_run_id: ${{ needs.route.outputs.native_reuse_run_id }}
+      resolve_native_donors: true
       diagnostics_mode: public
 
   cpu-fast-check:
