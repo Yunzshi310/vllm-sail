@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
+import json
 import os
+import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -382,8 +385,6 @@ def test_accuracy_self_check_redacts_raw_version_on_compat_failure(tmp_path):
         encoding="utf-8",
     )
 
-    import sys
-
     proc = subprocess.run(
         [
             sys.executable,
@@ -427,3 +428,154 @@ def test_runtime_container_prebuilt_mode_guards_and_relaxed_wheels():
     assert '--env PPU_CI_SKIP_WHEEL_INSTALL="${skip_wheel_install}"' in text
     assert '--env PPU_CI_RUNTIME_IMAGE_DIGEST="${runtime_image_digest}"' in text
     assert '--env PPU_CI_RUNTIME_IMAGE_ID="${image_id}"' in text
+
+
+def test_accuracy_script_redacts_raw_image_stack_in_stdout_and_artifacts(tmp_path):
+    ci_dir = tmp_path / "trusted-ci"
+    ci_dir.mkdir()
+    shutil.copyfile(
+        ROOT / "scripts/ci/ppu_e2e_accuracy.sh", ci_dir / "ppu_e2e_accuracy.sh"
+    )
+    # Stub ppu_image_stack.py to reproduce a raw dotted local version in capture
+    # output and in the captured JSON, plus verify failure behavior.
+    (ci_dir / "ppu_image_stack.py").write_text(
+        "import argparse, json, os, sys\n"
+        "from pathlib import Path\n"
+        "p = argparse.ArgumentParser()\n"
+        "p.add_argument('cmd')\n"
+        "p.add_argument('--sdk')\n"
+        "p.add_argument('--output', type=Path)\n"
+        "p.add_argument('--constraints', type=Path)\n"
+        "a = p.parse_args()\n"
+        "if os.environ.get('FAIL_STACK') == a.cmd:\n"
+        "    print('torch_version=2.13.0+example.invalid', file=sys.stderr)\n"
+        "    sys.exit(2)\n"
+        "if a.cmd == 'capture':\n"
+        "    doc = {\n"
+        "        'stack_source': 'image',\n"
+        "        'fingerprint_kind': 'installed-tree-sha256',\n"
+        "        'sdk_path': '/usr/local/PPU_SDK',\n"
+        "        'sdk_sha256': 'a' * 64,\n"
+        "        'torch_path': '/opt/torch',\n"
+        "        'torch_sha256': 'b' * 64,\n"
+        "        'torch_version': '2.13.0+example.invalid',\n"
+        "        'packages': {'torch': '2.13.0+example.invalid', 'triton': '3.1.0+ok_1'},\n"
+        "    }\n"
+        "    a.output.write_text(json.dumps(doc), encoding='utf-8')\n"
+        "    a.constraints.write_text('torch===2.13.0+example.invalid\\n', encoding='utf-8')\n"
+        "    print('torch_version=2.13.0+example.invalid')\n"
+        "elif a.cmd == 'verify':\n"
+        "    print('stack_unchanged=true')\n",
+        encoding="utf-8",
+    )
+
+    source_dir = tmp_path / "source"
+    (source_dir / "scripts/eval").mkdir(parents=True)
+    (source_dir / "scripts/eval/ppu_gsm8k_eval.py").write_text(
+        "print('gsm8k eval ok')\n", encoding="utf-8"
+    )
+
+    stubs = tmp_path / "stubs"
+    (stubs / "vllm").mkdir(parents=True)
+    (stubs / "vllm_sail").mkdir(parents=True)
+    (stubs / "evalscope").mkdir(parents=True)
+    (stubs / "huggingface_hub").mkdir(parents=True)
+    (stubs / "torch.py").write_text(
+        '__version__ = "2.13.0+example.invalid"\n'
+        "class cuda:\n"
+        "    @staticmethod\n"
+        "    def is_available(): return True\n",
+        encoding="utf-8",
+    )
+    (stubs / "vllm/__init__.py").write_text(
+        '__version__ = "0.10.2+example.invalid"\n', encoding="utf-8"
+    )
+    (stubs / "vllm/platforms.py").write_text(
+        "class _P:\n"
+        "    def is_ppu(self): return True\n"
+        '    def get_device_name(self, idx): return "ZW-M890P"\n'
+        "    def get_device_capability(self): return (9, 0)\n"
+        "current_platform = _P()\n",
+        encoding="utf-8",
+    )
+    (stubs / "vllm_sail/__init__.py").write_text(
+        '__version__ = "0.34.0.dev1+example.invalid"\n', encoding="utf-8"
+    )
+    (stubs / "vllm_sail/compat.py").write_text(
+        "def check_vllm_compatibility(force=True): return None\n", encoding="utf-8"
+    )
+    (stubs / "evalscope/__init__.py").write_text(
+        "TaskConfig = object\ndef run_task(*a, **k): pass\n", encoding="utf-8"
+    )
+    (stubs / "huggingface_hub/__init__.py").write_text(
+        f'def snapshot_download(**k): return "{tmp_path / "snapshot"}"\n',
+        encoding="utf-8",
+    )
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    # Wrapper python that keeps stubs on sys.path even after script unsets PYTHONPATH.
+    (bin_dir / "python").write_text(
+        f"#!/usr/bin/env bash\n"
+        f'export PYTHONPATH="{stubs}${{PYTHONPATH:+:$PYTHONPATH}}"\n'
+        f'exec "{sys.executable}" "$@"\n',
+        encoding="utf-8",
+    )
+    (bin_dir / "python").chmod(0o755)
+    (bin_dir / "ppu-smi").write_text("#!/usr/bin/env bash\necho ppu-smi-ok\n")
+    (bin_dir / "ppu-smi").chmod(0o755)
+
+    results_dir = tmp_path / "results"
+    base_env = {
+        **os.environ,
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+        "PPU_CI_SOURCE_ROOT": str(source_dir),
+        "RESULTS_DIR": str(results_dir),
+        "HF_HOME": str(tmp_path / "hf"),
+        "GSM8K_DATASET_PATH": str(tmp_path / "gsm8k"),
+        "MODEL_KEY": "qwen3_8_27b",
+        "MODEL_ID": "Qwen/Qwen3.8-27B",
+        "PPU_CI_SKIP_WHEEL_INSTALL": "true",
+        "PPU_CI_RUNTIME_IMAGE_DIGEST": "@sha256:" + "a" * 64,
+        "PPU_CI_RUNTIME_IMAGE_ID": "sha256:" + "b" * 64,
+        "GOLDEN_SEED_DIR": str(tmp_path / "no-golden"),
+    }
+    proc = subprocess.run(
+        ["bash", str(ci_dir / "ppu_e2e_accuracy.sh")],
+        env=base_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "example.invalid" not in proc.stdout
+    assert "example.invalid" not in proc.stderr
+    assert not (results_dir / "image-constraints.txt").exists()
+    for artifact in results_dir.rglob("*"):
+        if artifact.is_file():
+            assert "example.invalid" not in artifact.read_text(encoding="utf-8"), (
+                artifact
+            )
+    stack_doc = json.loads((results_dir / "image-stack.json").read_text())
+    assert stack_doc["torch_version"] == "2.13.0"
+    assert stack_doc["packages"] == {"torch": "2.13.0", "triton": "3.1.0+ok_1"}
+    assert "sdk_path" not in stack_doc and "torch_path" not in stack_doc
+    fp = json.loads((results_dir / "runtime-fingerprint.json").read_text())
+    assert fp["versions"] == {
+        "torch": "2.13.0",
+        "vllm": "0.10.2",
+        "vllm_sail": "0.34.0.dev1",
+    }
+
+    # Capture failure path must also avoid leaking raw versions.
+    fail_results = tmp_path / "results-fail"
+    fail_proc = subprocess.run(
+        ["bash", str(ci_dir / "ppu_e2e_accuracy.sh")],
+        env={**base_env, "RESULTS_DIR": str(fail_results), "FAIL_STACK": "capture"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert fail_proc.returncode != 0
+    assert "example.invalid" not in (fail_proc.stdout + fail_proc.stderr)
+    assert "example.invalid" not in (fail_results / "accuracy.log").read_text()

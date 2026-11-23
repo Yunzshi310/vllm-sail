@@ -322,6 +322,21 @@ def test_trusted_entrypoint_runs_prebuilt_mode_against_older_source_tree(
     evidence = json.loads((results / "provenance.json").read_text())
     assert evidence["install_mode"] == "prebuilt_image"
     assert evidence["runtime_image_digest"] == image_digest
+    recorded = {entry["path"]: entry["sha256"] for entry in evidence["runner_sources"]}
+    trusted_sha = hashlib.sha256(
+        (trusted_ci / "ppu_e2e_recipe_sanity.sh").read_bytes()
+    ).hexdigest()
+    stub_sha = hashlib.sha256(
+        (source / "scripts/ci/ppu_e2e_recipe_sanity.sh").read_bytes()
+    ).hexdigest()
+    assert trusted_sha != stub_sha
+    assert recorded["scripts/ci/ppu_e2e_recipe_sanity.sh"] == trusted_sha
+    for rel in (
+        "scripts/ci/ppu_recipe.py",
+        "scripts/ci/ppu_recipe_runner.py",
+        "scripts/eval/ppu_gsm8k_eval.py",
+    ):
+        assert recorded[rel] == hashlib.sha256((source / rel).read_bytes()).hexdigest()
 
 
 @pytest.mark.parametrize(

@@ -127,10 +127,64 @@ if [[ "${SKIP_WHEEL_INSTALL}" == "false" ]]; then
     python "${CI_SCRIPT_DIR}/ppu_wheel_manifest.py" "${verify_args[@]}"
 fi
 
-export PIP_CONSTRAINT="${RESULTS_DIR}/image-constraints.txt"
-python "${CI_SCRIPT_DIR}/ppu_image_stack.py" capture \
-    --sdk /usr/local/PPU_SDK --output "${RESULTS_DIR}/image-stack.json" \
-    --constraints "${PIP_CONSTRAINT}"
+RAW_IMAGE_STACK="/tmp/ppu-accuracy-image-stack.json"
+export PIP_CONSTRAINT="/tmp/ppu-accuracy-image-constraints.txt"
+if ! python "${CI_SCRIPT_DIR}/ppu_image_stack.py" capture \
+    --sdk /usr/local/PPU_SDK --output "${RAW_IMAGE_STACK}" \
+    --constraints "${PIP_CONSTRAINT}" >/tmp/ppu-accuracy-image-stack-capture.log 2>&1; then
+    echo "ERROR: SAIL PyTorch image stack capture failed" >&2
+    exit 1
+fi
+python - "${RAW_IMAGE_STACK}" "${RESULTS_DIR}/image-stack.json" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+raw_path, public_path = Path(sys.argv[1]), Path(sys.argv[2])
+raw = json.loads(raw_path.read_text(encoding="utf-8"))
+SAFE_VERSION_RE = re.compile(
+    r"\d+(?:\.\d+){1,3}(?:(?:a|b|rc|\.post|\.dev)\d+){0,2}(?:\+[A-Za-z0-9_-]{1,24})?"
+)
+BASE_VERSION_RE = re.compile(
+    r"\d+(?:\.\d+){1,3}(?:(?:a|b|rc|\.post|\.dev)\d+){0,2}"
+)
+
+
+def sanitize_version(value):
+    if not isinstance(value, str):
+        return None
+    if SAFE_VERSION_RE.fullmatch(value):
+        return value
+    if "+" in value:
+        base = value.split("+", 1)[0]
+        if BASE_VERSION_RE.fullmatch(base):
+            return base
+    return None
+
+
+packages = {}
+raw_packages = raw.get("packages")
+if isinstance(raw_packages, dict):
+    for name, version in raw_packages.items():
+        if isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9._-]+", name):
+            cleaned = sanitize_version(version)
+            if cleaned is not None:
+                packages[name] = cleaned
+
+sanitized = {
+    "stack_source": raw.get("stack_source") if raw.get("stack_source") in {"image", "image+torch"} else "image",
+    "fingerprint_kind": raw.get("fingerprint_kind") if raw.get("fingerprint_kind") == "installed-tree-sha256" else "installed-tree-sha256",
+    "sdk_sha256": raw.get("sdk_sha256") if isinstance(raw.get("sdk_sha256"), str) and re.fullmatch(r"[0-9a-f]{64}", raw["sdk_sha256"]) else None,
+    "torch_sha256": raw.get("torch_sha256") if isinstance(raw.get("torch_sha256"), str) and re.fullmatch(r"[0-9a-f]{64}", raw["torch_sha256"]) else None,
+    "torch_version": sanitize_version(raw.get("torch_version")),
+    "packages": packages,
+}
+public_path.write_text(json.dumps(sanitized, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+for key in ("stack_source", "fingerprint_kind", "sdk_sha256", "torch_sha256", "torch_version"):
+    if sanitized[key] is not None:
+        print(f"{key}={sanitized[key]}")
+PY
 
 # ------------------------------------------------------------------
 if [[ "${SKIP_WHEEL_INSTALL}" == "false" ]]; then
@@ -151,21 +205,31 @@ if [[ "${SKIP_WHEEL_INSTALL}" == "false" ]]; then
         python -m pip install -r "${ROOT_DIR}/requirements/dev.txt"
 
     # Install accuracy evaluation dependencies (not in dev.txt, needs a real device)
-    PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ \
-        python -m pip install "evalscope==1.14.1"
+    if ! PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ \
+        python -m pip install "evalscope==1.14.1" >/tmp/ppu-accuracy-evalscope-pip.log 2>&1; then
+        echo "ERROR: failed to install evalscope==1.14.1" >&2
+        exit 1
+    fi
 else
     log "prebuilt image mode (skip wheel install)"
     if ! python -c "from evalscope import TaskConfig, run_task" >/dev/null 2>&1; then
-        PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ \
-            python -m pip install "evalscope==1.14.1"
+        if ! PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ \
+            python -m pip install "evalscope==1.14.1" >/tmp/ppu-accuracy-evalscope-pip.log 2>&1; then
+            echo "ERROR: failed to install evalscope==1.14.1" >&2
+            exit 1
+        fi
     fi
 fi
 
 # Verify evalscope is importable
 python -c "from evalscope import TaskConfig, run_task; print('evalscope OK')"
 
-python "${CI_SCRIPT_DIR}/ppu_image_stack.py" verify \
-    --sdk /usr/local/PPU_SDK --output "${RESULTS_DIR}/image-stack.json"
+if ! python "${CI_SCRIPT_DIR}/ppu_image_stack.py" verify \
+    --sdk /usr/local/PPU_SDK --output "${RAW_IMAGE_STACK}" >/tmp/ppu-accuracy-image-stack-verify.log 2>&1; then
+    echo "ERROR: SAIL PyTorch image stack verification failed" >&2
+    exit 1
+fi
+echo "stack_unchanged=true"
 
 # ------------------------------------------------------------------
 log "platform self-check"

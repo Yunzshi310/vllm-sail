@@ -145,6 +145,7 @@ try:
             tree_digest.update(path.relative_to(recipes).as_posix().encode("utf-8") + b"\0")
             tree_digest.update(hashlib.sha256(path.read_bytes()).digest())
 
+    entrypoint_path = (ci_script_path / "ppu_e2e_recipe_sanity.sh").resolve(strict=True)
     provenance = {
         "schema": 1,
         "install_mode": "prebuilt_image" if skip_wheel_install == "true" else "wheel_overlay",
@@ -155,12 +156,18 @@ try:
         "recipes_tree_sha256": tree_digest.hexdigest(),
         "policy": source_record(policy),
         "runner_sources": [
-            source_record(path) for path in (
-                "scripts/ci/ppu_e2e_recipe_sanity.sh",
-                "scripts/ci/ppu_recipe.py",
-                "scripts/ci/ppu_recipe_runner.py",
-                "scripts/eval/ppu_gsm8k_eval.py",
-            )
+            {
+                "path": "scripts/ci/ppu_e2e_recipe_sanity.sh",
+                "sha256": hashlib.sha256(entrypoint_path.read_bytes()).hexdigest(),
+            },
+            *(
+                source_record(path)
+                for path in (
+                    "scripts/ci/ppu_recipe.py",
+                    "scripts/ci/ppu_recipe_runner.py",
+                    "scripts/eval/ppu_gsm8k_eval.py",
+                )
+            ),
         ],
     }
     if manifest is not None:

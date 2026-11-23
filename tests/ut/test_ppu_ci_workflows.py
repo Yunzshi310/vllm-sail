@@ -1602,6 +1602,7 @@ def test_recipe_public_flag_controls_callers_and_gate(build_jobs, enabled):
         "needs.runtime-image.outputs.recipe_sanity": "true",
         "needs.build.result": "success",
         "needs.select.result": "success",
+        "needs.resolve-image.result": "skipped",
         "needs.select.outputs.recipe_models": "glm-5.3",
         "needs.select.outputs.run_recipe": "true",
     }
@@ -1788,6 +1789,7 @@ def test_accuracy_nightly_routes_selected_models(
         "inputs.skip_wheel_build": False,
         "needs.build.result": "success",
         "needs.select.result": "success",
+        "needs.resolve-image.result": "skipped",
         "needs.select.outputs.recipe_models": values.get("recipe_models", ""),
         "needs.select.outputs.run_recipe": values.get("run_recipe", "false"),
         "needs.select.outputs.matrix": legacy_matrix,
@@ -1951,6 +1953,7 @@ def test_accuracy_nightly_devops_dispatch_dual_mode_and_cron_switch(tmp_path):
         "inputs.skip_wheel_build": True,
         "needs.select.result": "success",
         "needs.build.result": "skipped",
+        "needs.resolve-image.result": "success",
         "needs.select.outputs.matrix": values["matrix"],
         "needs.select.outputs.recipe_models": values["recipe_models"],
         "needs.select.outputs.run_recipe": values["run_recipe"],
@@ -2008,6 +2011,152 @@ def test_accuracy_nightly_devops_dispatch_dual_mode_and_cron_switch(tmp_path):
         assert (
             expression(rec_run["env"]["PPU_CI_WHEEL_SOURCE_SHA"], expr_ctx) == exp_sha
         )
+
+
+def test_accuracy_nightly_hardening_target_trust_digest_pin_and_cron_concurrency(
+    tmp_path,
+):
+    wf = workflow("ppu-accuracy-nightly.yaml")
+    jobs = wf["jobs"]
+
+    # P1 #1a: target_ref must be validated against trusted branch/tag history
+    # before checkout, and checkout must pin steps.verify_target.outputs.target_sha.
+    select_steps = jobs["select"]["steps"]
+    verify_idx = next(
+        i for i, step in enumerate(select_steps) if step.get("id") == "verify_target"
+    )
+    checkout_idx = next(
+        i
+        for i, step in enumerate(select_steps)
+        if step.get("uses", "").startswith("actions/checkout@")
+    )
+    assert verify_idx < checkout_idx
+    verify_script = select_steps[verify_idx]["with"]["script"]
+    for marker in (
+        "default_branch",
+        "releases/",
+        "listTags",
+        "compareCommitsWithBasehead",
+        "identical",
+        "ahead",
+    ):
+        assert marker in verify_script
+    assert (
+        select_steps[checkout_idx]["with"]["ref"]
+        == "${{ steps.verify_target.outputs.target_sha }}"
+    )
+    select_step = next(s for s in select_steps if s.get("id") == "select")
+    assert (
+        select_step["env"]["VERIFIED_TARGET_SHA"]
+        == "${{ steps.verify_target.outputs.target_sha }}"
+    )
+
+    # P1 #1b: ppu-build-and-test.yaml runtime-image runs ppu_runtime_image.sh from
+    # a trusted sparse checkout of github.sha rather than inputs.pr_head_sha.
+    runtime_steps = workflow("ppu-build-and-test.yaml")["jobs"]["runtime-image"][
+        "steps"
+    ]
+    trusted_checkout = next(
+        s
+        for s in runtime_steps
+        if s.get("name") == "Check out trusted CI scripts"
+        and s.get("uses", "").startswith("actions/checkout@")
+    )
+    assert trusted_checkout["with"]["ref"] == "${{ github.sha }}"
+    assert trusted_checkout["with"]["sparse-checkout"] == "scripts/ci"
+    assert trusted_checkout["with"]["persist-credentials"] is False
+    resolve_step = next(
+        s
+        for s in runtime_steps
+        if s.get("name") == "Resolve the runner-configured CUDA-compatible runtime"
+    )
+    assert resolve_step["env"] == {
+        "TRUSTED_DIR": "${{ steps.workspace.outputs.trusted }}"
+    }
+    assert (
+        'bash "${TRUSTED_DIR}/scripts/ci/ppu_runtime_image.sh"' in resolve_step["run"]
+    )
+    assert "SOURCE_DIR" not in resolve_step["run"]
+
+    # P1 #3: tag-only dispatch resolves an immutable sha256 digest once per run
+    # and passes that single digest to every legacy and Recipe model job.
+    resolve_job = jobs["resolve-image"]
+    assert resolve_job["needs"] == "select"
+    assert resolve_job["runs-on"] == "8-ppu-m890p"
+    resolve_checkout = checkouts(resolve_job)[0]
+    assert resolve_checkout["with"]["ref"] == "${{ github.sha }}"
+    assert resolve_checkout["with"]["sparse-checkout"] == "scripts/ci"
+    for tag, digest, expected in (
+        ("nightly-1", "", True),
+        ("nightly-1", "sha256:" + "a" * 64, False),
+        ("", "sha256:" + "a" * 64, False),
+        ("", "", False),
+    ):
+        ctx = {
+            "needs.select.result": "success",
+            "inputs.image_tag": tag,
+            "inputs.image_digest": digest,
+        }
+        assert bool(expression(resolve_job["if"], ctx)) is expected
+
+    pin_step = next(s for s in resolve_job["steps"] if s.get("id") == "resolve")
+    fake_trusted = tmp_path / "trusted"
+    (fake_trusted / "scripts/ci").mkdir(parents=True)
+    expected_digest = "sha256:" + "f" * 64
+    (fake_trusted / "scripts/ci/ppu_runtime_image.sh").write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        f'printf "@{expected_digest}\\n" >"${{PPU_CI_RUNTIME_DIGEST_OUT:?}}"\n'
+        f'printf "sha256:{"1" * 64}\\n"\n',
+        encoding="utf-8",
+    )
+    gh_out = tmp_path / "resolve-output"
+    runner_tmp = tmp_path / "runner-tmp"
+    runner_tmp.mkdir()
+    proc = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", pin_step["run"]],
+        env={
+            **os.environ,
+            "TRUSTED_DIR": str(fake_trusted),
+            "PPU_CI_RUNTIME_IMAGE_TAG": "nightly-1",
+            "RUNNER_TEMP": str(runner_tmp),
+            "GITHUB_OUTPUT": str(gh_out),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert gh_out.read_text().strip() == f"image_digest={expected_digest}"
+
+    for consumer in ("accuracy", "recipe-model-sanity"):
+        assert "resolve-image" in jobs[consumer]["needs"]
+        assert (
+            jobs[consumer]["with"]["image_digest"]
+            == "${{ needs.resolve-image.outputs.image_digest || inputs.image_digest }}"
+        )
+        fail_ctx = {
+            "github.event_name": "workflow_dispatch",
+            "vars.PPU_RECIPE_PUBLIC_ENABLED": "true",
+            "inputs.skip_wheel_build": True,
+            "needs.select.result": "success",
+            "needs.build.result": "skipped",
+            "needs.resolve-image.result": "failure",
+            "needs.select.outputs.matrix": '{"include":[{"model":"m"}]}',
+            "needs.select.outputs.recipe_models": "glm-5.3",
+            "needs.select.outputs.run_recipe": "true",
+        }
+        assert bool(expression(jobs[consumer]["if"], fail_ctx)) is False
+
+    # P2 #5: disabled scheduled triggers must not enter the active DevOps
+    # concurrency group and evict pending dispatches.
+    concurrency = wf["concurrency"]
+    assert concurrency["cancel-in-progress"] is False
+    group_expr = concurrency["group"]
+    assert "PPU_NIGHTLY_SCHEDULE_DISABLED == 'true'" in group_expr
+    assert "accuracy-nightly-disabled-schedule-" in group_expr
+    assert "github.run_id" in group_expr
+    assert "accuracy-nightly-{0}" in group_expr
 
 
 def test_nightly_public_summary_exports_safe_image_digest_and_versions(tmp_path):
