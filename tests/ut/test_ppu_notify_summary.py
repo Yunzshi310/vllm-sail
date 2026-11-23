@@ -289,6 +289,21 @@ def test_nightly_joins_reusable_jobs_and_public_recipe_summaries(tmp_path, monke
         report = nightly.collect(tmp_path)
     assert [row["phase"] for row in report["results"]] == ["build", "build"]
 
+    monkeypatch.setenv("NOTIFY_BUILD_RESULT", "skipped")
+    monkeypatch.setenv("NOTIFY_SKIP_BUILD", "true")
+    monkeypatch.setenv("NOTIFY_IMAGE_RESULT", "success")
+    with patch.object(nightly, "run_jobs", return_value=(jobs, 60)):
+        report = nightly.collect(tmp_path)
+    assert [row["status"] for row in report["results"]] == ["pass", "fail"]
+
+    monkeypatch.setenv("NOTIFY_IMAGE_RESULT", "failure")
+    with patch.object(nightly, "run_jobs", return_value=({}, 60)):
+        report = nightly.collect(tmp_path)
+    assert [row["phase"] for row in report["results"]] == [
+        "runtime_setup",
+        "runtime_setup",
+    ]
+
 
 def test_nightly_legacy_matrix_uses_only_public_artifact(tmp_path, monkeypatch):
     import ppu_notify_nightly as nightly

@@ -89,11 +89,17 @@ def collect(root):
         for key in recipe
     }
     jobs, elapsed = run_jobs(set(legacy_jobs) | set(recipe_jobs))
+    build = os.environ["NOTIFY_BUILD_RESULT"]
+    skip_build = os.environ.get("NOTIFY_SKIP_BUILD") == "true"
     if os.environ["NOTIFY_SELECT_RESULT"] != "success":
         results = [failure("select", "selection")]
-    elif os.environ["NOTIFY_BUILD_RESULT"] != "success":
+    elif build != "success" and not (skip_build and build == "skipped"):
         results = [failure(key, "build") for key in legacy + recipe] or [
             failure("build", "build")
+        ]
+    elif os.environ.get("NOTIFY_IMAGE_RESULT", "skipped") not in ("success", "skipped"):
+        results = [failure(key, "runtime_setup") for key in legacy + recipe] or [
+            failure("resolve-image", "runtime_setup")
         ]
     else:
         results = []
