@@ -35,7 +35,7 @@ ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 RESULTS_DIR="${RESULTS_DIR:?RESULTS_DIR is required}"
 ci_result_file="${RESULTS_DIR}/legacy-accuracy-result.json"
-if [[ "${REQUIRE_PR_ARTIFACT:-false}" == true ]]; then
+if [[ "${REQUIRE_PR_ARTIFACT:-false}" == true || "${RECORD_LEGACY_ACCURACY:-false}" == true ]]; then
     umask 077
     mkdir -p "${RESULTS_DIR}"
     record_setup_failure() {
@@ -214,7 +214,7 @@ fi
 if [[ "${UPDATE_GOLDEN}" == "1" ]]; then
     eval_args+=(--update-golden)
 fi
-if [[ "${REQUIRE_PR_ARTIFACT:-false}" == true ]]; then
+if [[ "${REQUIRE_PR_ARTIFACT:-false}" == true || "${RECORD_LEGACY_ACCURACY:-false}" == true ]]; then
     eval_args+=(--ci-result-file "${ci_result_file}")
     trap - EXIT
 fi
