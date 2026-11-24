@@ -1336,6 +1336,44 @@ def _validate_port_value(raw: str, *, context: str) -> None:
         raise ValidationError(f"{context}: port must be in [1, 65535], got {port}")
 
 
+def _parse_mooncake_host_port(address: str, *, context: str) -> tuple[str, int]:
+    """Parse ``host:port`` or ``[ipv6]:port`` matching pinned vLLM ``split_host_port``."""
+    if not address or any(ch.isspace() for ch in address) or "/" in address:
+        raise ValidationError(
+            f"{context}: bootstrap_server_address must be 'host:port' or '[ipv6]:port' "
+            f"(no scheme, path, or whitespace), got {address!r}"
+        )
+    if address.startswith("["):
+        if "]" not in address:
+            raise ValidationError(
+                f"{context}: bootstrap_server_address has unclosed IPv6 bracket: {address!r}"
+            )
+        host_part, rest = address.rsplit("]", 1)
+        host = host_part[1:]
+        if not host or "[" in host or "]" in host or not rest.startswith(":"):
+            raise ValidationError(
+                f"{context}: bootstrap_server_address must be '[ipv6]:port', got {address!r}"
+            )
+        port_raw = rest[1:]
+        if ":" in port_raw:
+            raise ValidationError(
+                f"{context}: bootstrap_server_address must be '[ipv6]:port', got {address!r}"
+            )
+    else:
+        parts = address.split(":")
+        if len(parts) != 2:
+            raise ValidationError(
+                f"{context}: bootstrap_server_address must be 'host:port', got {address!r}"
+            )
+        host, port_raw = parts
+    if not host:
+        raise ValidationError(
+            f"{context}: bootstrap_server_address requires non-empty host, got {address!r}"
+        )
+    _validate_port_value(port_raw, context=context)
+    return host, int(port_raw)
+
+
 def _validate_resolved_topology_and_placeholders(
     resolved: Mapping[str, Any], *, context: str
 ) -> tuple[list[str], dict[str, str]]:
@@ -1509,14 +1547,8 @@ def _validate_resolved_topology_and_placeholders(
                             f"be a 'host:port' string wiring {{kv_port}}"
                         )
                     sub_addr = _substitute_placeholders_in_str(bootstrap_addr)
-                    host_part, sep, port_part = sub_addr.rpartition(":")
-                    if not sep or not host_part:
-                        raise ValidationError(
-                            f"{context}: MooncakeConnector bootstrap_server_address must "
-                            f"be 'host:port', got {bootstrap_addr!r}"
-                        )
-                    _validate_port_value(
-                        port_part,
+                    _parse_mooncake_host_port(
+                        sub_addr,
                         context=f"{context}.bootstrap_server_address",
                     )
                 else:

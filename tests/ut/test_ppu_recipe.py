@@ -3428,6 +3428,57 @@ def test_mooncake_pd_endpoint_wiring_nondefault_and_counterexamples(
         ext_sub_kv["kv_connector_extra_config"]["bootstrap_server_address"]
         == "198.51.100.30:19001"
     )
+    assert ppu_recipe._parse_mooncake_host_port(
+        ext_sub_kv["kv_connector_extra_config"]["bootstrap_server_address"],
+        context="ext_ipv4",
+    ) == ("198.51.100.30", 19001)
+
+    # Bracketed IPv6 host:port control passes
+    ext_v6 = copy.deepcopy(ext_doc)
+    v6_args = ext_v6["presets"]["pd_prefill"]["args"]
+    v6_kv = json.loads(v6_args[v6_args.index("--kv-transfer-config") + 1])
+    v6_kv["kv_connector_extra_config"]["bootstrap_server_address"] = (
+        "[{kv_ip}]:{kv_port}"
+    )
+    v6_args[v6_args.index("--kv-transfer-config") + 1] = json.dumps(
+        v6_kv, separators=(",", ":")
+    )
+    ppu_recipe.validate_serving_recipe_structure(ext_v6, context="ext_ipv6_control")
+    assert ppu_recipe._parse_mooncake_host_port("[::1]:19001", context="v6") == (
+        "::1",
+        19001,
+    )
+
+    # Counterexamples: scheme/path/extra-colon/empty-host bootstrap_server_address rejected
+    for bad_addr in (
+        "http://{kv_ip}:{kv_port}",
+        "{kv_ip}:0:{kv_port}",
+        ":{kv_port}",
+        "{kv_ip}:{kv_port}/query",
+        "[{kv_ip}]:0:{kv_port}",
+        "[{kv_ip}]{kv_port}",
+    ):
+        bad_ext = copy.deepcopy(ext_doc)
+        b_args = bad_ext["presets"]["pd_prefill"]["args"]
+        b_kv = json.loads(b_args[b_args.index("--kv-transfer-config") + 1])
+        b_kv["kv_connector_extra_config"]["bootstrap_server_address"] = bad_addr
+        b_args[b_args.index("--kv-transfer-config") + 1] = json.dumps(
+            b_kv, separators=(",", ":")
+        )
+        with pytest.raises(
+            ppu_recipe.ValidationError, match="bootstrap_server_address"
+        ):
+            ppu_recipe.validate_serving_recipe_structure(bad_ext, context="bad_ext")
+        bad_ext_path = tmp_path / f"bad_ext_{abs(hash(bad_addr))}.yaml"
+        bad_ext_path.write_text(yaml.safe_dump(bad_ext), encoding="utf-8")
+        with pytest.raises(
+            ppu_recipe.ValidationError, match="bootstrap_server_address"
+        ):
+            ppu_recipe.validate_paths(
+                [bad_ext_path],
+                vllm_parser_mode="required",
+                parser=_sample_vllm_parser(),
+            )
 
     # 3. Counterexamples: dead Mooncake fields and missing/ambiguous runtime wiring fail closed
     dead_port = copy.deepcopy(glm_doc)
