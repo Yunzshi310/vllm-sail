@@ -427,9 +427,9 @@ class NonPpuReproEvidence:
             "verified": bool(self.verified),
         }
         if self.observed_signature:
-            out["observed_signature"] = _sanitize_symbol(
-                self.observed_signature, "VLLM_TARGET_DEVICE=empty"
-            )
+            safe_obs = _sanitize_symbol(self.observed_signature, "")
+            if safe_obs:
+                out["observed_signature"] = safe_obs
         return out
 
 
@@ -501,10 +501,27 @@ def opaque_target_id(target: str) -> str:
     return f"t_{digest}"
 
 
+CANONICAL_WHEEL_BUILD_SIGNATURES = frozenset(
+    {
+        "VLLM_TARGET_DEVICE=empty",
+        "rust_frontend_build",
+        "vllm_empty_device_build",
+    }
+)
+
+
+def _normalize_wheel_build_signature(raw_sig: str) -> str:
+    if raw_sig == "vllm_empty_device_build":
+        return "VLLM_TARGET_DEVICE=empty"
+    return raw_sig
+
+
 def _sanitize_symbol(value: str, fallback: str = "unspecified") -> str:
     cleaned = value.strip()
     if not cleaned:
         return fallback
+    if cleaned in CANONICAL_WHEEL_BUILD_SIGNATURES:
+        return cleaned
     # Strip any accidental leading slash paths before checking symbol syntax.
     if cleaned.startswith("/") or ".." in cleaned:
         return fallback
@@ -2250,11 +2267,12 @@ def parse_non_ppu_repro_evidence(data: Any) -> NonPpuReproEvidence | None:
         or type(raw_verified) is not bool
     ):
         return None
-    safe_obs_sig = (
-        _sanitize_symbol(raw_obs_sig, "VLLM_TARGET_DEVICE=empty")
-        if raw_obs_sig.strip()
-        else ""
-    )
+    if raw_obs_sig.strip():
+        safe_obs_sig = _sanitize_symbol(raw_obs_sig, "")
+        if not safe_obs_sig:
+            return None
+    else:
+        safe_obs_sig = ""
     candidate = NonPpuReproEvidence(
         mode=mode,
         repro_kind=repro_kind,
@@ -2804,7 +2822,7 @@ def verify_non_ppu_reproducer(
 
     any_infra = good_infra or bad_infra
     eff_obs_sig = (
-        _sanitize_symbol(bad_sig, "VLLM_TARGET_DEVICE=empty")
+        _sanitize_symbol(bad_sig, "")
         if (not any_infra and bad_rc > 0 and bad_sig.strip())
         else ""
     )
@@ -2933,11 +2951,23 @@ def classify_failure(
         and stage == "wheel_build"
         and effective_repro is not None
         and effective_repro.observed_signature
-        in ("VLLM_TARGET_DEVICE=empty", "rust_frontend_build")
-        and sig in ("VLLM_TARGET_DEVICE=empty", "rust_frontend_build")
-        and effective_repro.observed_signature != sig
     ):
-        repro_verified = False
+        norm_obs = _normalize_wheel_build_signature(effective_repro.observed_signature)
+        norm_sig = _normalize_wheel_build_signature(sig)
+        if sig == "unspecified":
+            repro_verified = False
+        elif (
+            norm_obs in CANONICAL_WHEEL_BUILD_SIGNATURES
+            and norm_sig in CANONICAL_WHEEL_BUILD_SIGNATURES
+            and norm_obs != norm_sig
+        ):
+            repro_verified = False
+        elif (
+            norm_sig not in CANONICAL_WHEEL_BUILD_SIGNATURES
+            and norm_obs not in CANONICAL_WHEEL_BUILD_SIGNATURES
+            and norm_obs != norm_sig
+        ):
+            repro_verified = False
 
     if is_public_candidate and repro_verified and effective_repro is not None:
         return {
@@ -4475,13 +4505,14 @@ def run_source_only_build_triage(
                 and ev.first_failing_phase != red_outcome.detail_code
             ):
                 return False
-            expected_sig = _sanitize_symbol(
-                red_outcome.target_signature, "VLLM_TARGET_DEVICE=empty"
+            expected_sig = _normalize_wheel_build_signature(
+                _sanitize_symbol(red_outcome.target_signature, "")
             )
+            obs_sig = _normalize_wheel_build_signature(ev.observed_signature)
             if red_outcome.stage == "wheel_build":
-                if not ev.observed_signature or ev.observed_signature != expected_sig:
+                if not expected_sig or not obs_sig or obs_sig != expected_sig:
                     return False
-            elif ev.observed_signature and ev.observed_signature != expected_sig:
+            elif expected_sig and obs_sig and obs_sig != expected_sig:
                 return False
             return True
 

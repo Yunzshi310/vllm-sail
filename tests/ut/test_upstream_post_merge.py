@@ -4595,3 +4595,71 @@ def test_review_pr374_rereview_mandatory_rust_and_target_matched_bisect(
     )
     assert mismatch_triage["classification"] == "sail_internal_patch_drift"
     assert mismatch_triage["non_ppu_repro_verified"] is False
+
+    # Reverse canonical direction (`target=VLLM_TARGET_DEVICE=empty`, `observed=rust_frontend_build`)
+    # through JSON serialization, `parse_non_ppu_repro_evidence`, and full `publish` CLI must ALSO reject!
+    rev_ev = post_merge.NonPpuReproEvidence(
+        mode="cpu_empty_build",
+        repro_kind="cpu_empty_build",
+        last_good_sha=nm_shas[3],
+        first_failing_sha=nm_shas[4],
+        last_good_exit_code=0,
+        first_failing_exit_code=101,
+        verified=True,
+        last_good_phase="build_import",
+        first_failing_phase="build_install",
+        last_good_check_executed=True,
+        first_failing_check_executed=False,
+        infra_error=False,
+        failure_source="upstream_build_source",
+        observed_signature="rust_frontend_build",
+    )
+    rev_json = tmp_path / "rev-repro.json"
+    rev_json.write_text(
+        json.dumps(rev_ev.to_public_dict(), indent=2) + "\n", encoding="utf-8"
+    )
+    rev_pub = tmp_path / "rev-pub"
+    rev_pin = tmp_path / "rev.pin"
+    rev_pin.write_text(nm_shas[0] + "\n", encoding="utf-8")
+    assert (
+        post_merge.main(
+            [
+                "publish",
+                "--gear",
+                "probe",
+                "--status",
+                "fail",
+                "--sail-sha",
+                _sha(973),
+                "--upstream-sha",
+                nm_shas[4],
+                "--verified-pin-file",
+                str(rev_pin),
+                "--first-failing-sha",
+                nm_shas[4],
+                "--last-good-sha",
+                nm_shas[3],
+                "--failure-stage",
+                "wheel_build",
+                "--target-signature",
+                "VLLM_TARGET_DEVICE=empty",
+                "--public-plugin-break",
+                "--non-ppu-repro-json",
+                str(rev_json),
+                "--public-dir",
+                str(rev_pub),
+            ]
+        )
+        == 0
+    )
+    rev_sum = json.loads((rev_pub / "public-summary.json").read_text(encoding="utf-8"))
+    rev_iss = json.loads((rev_pub / "issue-payload.json").read_text(encoding="utf-8"))
+    assert rev_sum["triage"]["target_signature"] == "VLLM_TARGET_DEVICE=empty"
+    assert rev_sum["triage"]["classification"] == "sail_internal_patch_drift"
+    assert rev_sum["triage"]["non_ppu_repro_verified"] is False
+    assert rev_iss["upstream_reproducer_markdown"] == ""
+
+    # Malformed/sensitive `observed_signature` must fail closed (`None`), never impersonating `VLLM_TARGET_DEVICE=empty`!
+    forged_sig_dict = rev_ev.to_public_dict()
+    forged_sig_dict["observed_signature"] = "/Users/leak/secret"
+    assert post_merge.parse_non_ppu_repro_evidence(forged_sig_dict) is None
