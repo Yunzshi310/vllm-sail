@@ -133,11 +133,13 @@ TOPOLOGY_PLACEHOLDERS: dict[str, tuple[str, Any]] = {
     "master_port": ("29500", 29500),
     "node_rank": ("0", 0),
     "kv_ip": ("127.0.0.1", "127.0.0.1"),
-    "kv_port": ("14579", 14579),
+    "kv_port": ("8998", 8998),
     "ib_devices": ("rdma0", "rdma0"),
 }
 MULTI_NODE_REQUIRED_PLACEHOLDERS = frozenset({"master_addr", "node_rank"})
-PD_DISAGG_REQUIRED_PLACEHOLDERS = frozenset({"kv_ip", "kv_port", "ib_devices"})
+PD_DISAGG_PREFILL_REQUIRED_PLACEHOLDERS = frozenset({"kv_ip", "kv_port", "ib_devices"})
+PD_DISAGG_DECODE_REQUIRED_PLACEHOLDERS = frozenset({"kv_ip", "ib_devices"})
+PD_DISAGG_REQUIRED_PLACEHOLDERS = PD_DISAGG_PREFILL_REQUIRED_PLACEHOLDERS
 _PLACEHOLDER_RE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 ALLOWED_CACHE_MODES = frozenset({"sanity_throughput_guard", "prefix_reuse_bench"})
 DEFAULT_MAX_AUTO_LAYER_OVERRIDE = 8
@@ -1245,32 +1247,51 @@ def _extract_placeholders_from_flags_and_env(
     return found
 
 
-def _substitute_placeholders_in_str(text: str) -> str:
+def _build_placeholder_table(
+    values: Mapping[str, Any] | None = None,
+) -> dict[str, tuple[str, Any]]:
+    table = dict(TOPOLOGY_PLACEHOLDERS)
+    if values is not None:
+        unknown = sorted(set(values) - set(TOPOLOGY_PLACEHOLDERS))
+        if unknown:
+            raise ValidationError(
+                f"unknown topology placeholder override(s): {', '.join(unknown)}"
+            )
+        for name, raw in values.items():
+            table[name] = (str(raw), raw)
+    return table
+
+
+def _substitute_placeholders_in_str(
+    text: str, table: Mapping[str, tuple[str, Any]] = TOPOLOGY_PLACEHOLDERS
+) -> str:
     def _repl(match: re.Match[str]) -> str:
         name = match.group(1)
-        if name not in TOPOLOGY_PLACEHOLDERS:
+        if name not in table:
             raise ValidationError(f"unknown topology placeholder '{{{name}}}'")
-        return TOPOLOGY_PLACEHOLDERS[name][0]
+        return table[name][0]
 
     return _PLACEHOLDER_RE.sub(_repl, text)
 
 
-def _substitute_placeholders_in_json_obj(obj: Any) -> Any:
+def _substitute_placeholders_in_json_obj(
+    obj: Any, table: Mapping[str, tuple[str, Any]] = TOPOLOGY_PLACEHOLDERS
+) -> Any:
     if isinstance(obj, str):
         exact = _PLACEHOLDER_RE.fullmatch(obj)
         if exact:
             name = exact.group(1)
-            if name not in TOPOLOGY_PLACEHOLDERS:
+            if name not in table:
                 raise ValidationError(f"unknown topology placeholder '{{{name}}}'")
-            return TOPOLOGY_PLACEHOLDERS[name][1]
-        return _substitute_placeholders_in_str(obj)
+            return table[name][1]
+        return _substitute_placeholders_in_str(obj, table)
     if isinstance(obj, list):
-        return [_substitute_placeholders_in_json_obj(elem) for elem in obj]
+        return [_substitute_placeholders_in_json_obj(elem, table) for elem in obj]
     if isinstance(obj, dict):
         return {
             _substitute_placeholders_in_str(
-                str(k)
-            ): _substitute_placeholders_in_json_obj(v)
+                str(k), table
+            ): _substitute_placeholders_in_json_obj(v, table)
             for k, v in obj.items()
         }
     return obj
@@ -1279,24 +1300,40 @@ def _substitute_placeholders_in_json_obj(obj: Any) -> Any:
 def substitute_validation_placeholders(
     flags: Sequence[str],
     server_env: Mapping[str, str] | None = None,
+    *,
+    values: Mapping[str, Any] | None = None,
 ) -> tuple[list[str], dict[str, str]]:
-    """Substitute topology placeholders with valid dummy values for validation."""
+    """Substitute topology placeholders with valid dummy or caller-supplied values."""
+    table = _build_placeholder_table(values)
     sub_entries: list[tuple[str, str | None, bool]] = []
     for flag, val, has_eq in _parse_flag_entries(list(flags)):
         if val is None:
             sub_entries.append((flag, None, has_eq))
         elif flag in JSON_FLAGS:
             parsed = json.loads(val)
-            substituted = _substitute_placeholders_in_json_obj(parsed)
+            substituted = _substitute_placeholders_in_json_obj(parsed, table)
             encoded = json.dumps(substituted, separators=(",", ":"), sort_keys=True)
             sub_entries.append((flag, encoded, has_eq))
         else:
-            sub_entries.append((flag, _substitute_placeholders_in_str(val), has_eq))
+            sub_entries.append(
+                (flag, _substitute_placeholders_in_str(val, table), has_eq)
+            )
     sub_env = {
-        str(k): _substitute_placeholders_in_str(str(v))
+        str(k): _substitute_placeholders_in_str(str(v), table)
         for k, v in (server_env or {}).items()
     }
     return _render_entries(sub_entries), sub_env
+
+
+def _validate_port_value(raw: str, *, context: str) -> None:
+    try:
+        port = int(raw)
+    except ValueError as exc:
+        raise ValidationError(
+            f"{context}: port must be an integer in [1, 65535], got {raw!r}"
+        ) from exc
+    if not 1 <= port <= 65535:
+        raise ValidationError(f"{context}: port must be in [1, 65535], got {port}")
 
 
 def _validate_resolved_topology_and_placeholders(
@@ -1319,6 +1356,11 @@ def _validate_resolved_topology_and_placeholders(
         raise ValidationError(
             f"{context}: resolved parallelism requires {ppu_count} devices, "
             f"exceeding declared topology capacity ({topo_nodes}x{topo['devices_per_node']}={topo_capacity})"
+        )
+    if topo_nodes > 1 and ppu_count % topo_nodes != 0:
+        raise ValidationError(
+            f"{context}: topology.nodes ({topo_nodes}) must evenly divide effective "
+            f"vLLM world size ({ppu_count})"
         )
 
     placeholders = _extract_placeholders_from_flags_and_env(flags, server_env)
@@ -1382,22 +1424,14 @@ def _validate_resolved_topology_and_placeholders(
                 f"declared topology capacity ({topo_nodes}x{topo['devices_per_node']}={topo_capacity})"
             )
     elif topo_kind == "pd_disagg":
-        missing = sorted(PD_DISAGG_REQUIRED_PLACEHOLDERS - placeholders)
-        if missing:
-            raise ValidationError(
-                f"{context}: pd_disagg topology missing required placeholder(s): "
-                f"{', '.join(missing)}"
-            )
         kv_raw = _flag_value(entries, "--kv-transfer-config")
         if kv_raw is None:
             raise ValidationError(
                 f"{context}: pd_disagg preset requires --kv-transfer-config"
             )
         kv_obj = json.loads(kv_raw)
-        if (
-            not isinstance(kv_obj.get("kv_connector"), str)
-            or not kv_obj["kv_connector"].strip()
-        ):
+        connector = kv_obj.get("kv_connector")
+        if not isinstance(connector, str) or not connector.strip():
             raise ValidationError(
                 f"{context}: --kv-transfer-config requires non-empty kv_connector"
             )
@@ -1407,6 +1441,17 @@ def _validate_resolved_topology_and_placeholders(
                 role = "prefill"
             elif preset_name == "pd_decode":
                 role = "decode"
+        required_pd_ph = (
+            PD_DISAGG_DECODE_REQUIRED_PLACEHOLDERS
+            if role == "decode"
+            else PD_DISAGG_PREFILL_REQUIRED_PLACEHOLDERS
+        )
+        missing = sorted(required_pd_ph - placeholders)
+        if missing:
+            raise ValidationError(
+                f"{context}: pd_disagg topology missing required placeholder(s): "
+                f"{', '.join(missing)}"
+            )
         expected_kv_role = (
             "kv_producer"
             if role == "prefill"
@@ -1417,6 +1462,84 @@ def _validate_resolved_topology_and_placeholders(
                 f"{context}: pd_disagg role {role!r} requires "
                 f"kv_role={expected_kv_role!r}, got {kv_obj.get('kv_role')!r}"
             )
+        if connector == "MooncakeConnector":
+            extra = kv_obj.get("kv_connector_extra_config")
+            if extra is not None and not isinstance(extra, dict):
+                raise ValidationError(
+                    f"{context}: MooncakeConnector kv_connector_extra_config must be a JSON object"
+                )
+            extra = extra or {}
+            if "kv_port" in kv_obj:
+                raise ValidationError(
+                    f"{context}: MooncakeConnector does not read KVTransferConfig.kv_port; "
+                    f"wire {{kv_port}} via VLLM_MOONCAKE_BOOTSTRAP_PORT or "
+                    f"kv_connector_extra_config.bootstrap_server_address"
+                )
+            if "kv_ip" in extra:
+                raise ValidationError(
+                    f"{context}: MooncakeConnector does not read kv_connector_extra_config.kv_ip; "
+                    f"wire {{kv_ip}} via VLLM_HOST_IP (and optional bootstrap_server_address)"
+                )
+            dev_name = extra.get("device_name")
+            if not isinstance(dev_name, str) or "{ib_devices}" not in dev_name:
+                raise ValidationError(
+                    f"{context}: MooncakeConnector requires kv_connector_extra_config.device_name "
+                    f"to wire {{ib_devices}}"
+                )
+            host_ip_env = server_env.get("VLLM_HOST_IP")
+            if not isinstance(host_ip_env, str) or "{kv_ip}" not in host_ip_env:
+                raise ValidationError(
+                    f"{context}: MooncakeConnector requires env VLLM_HOST_IP to wire {{kv_ip}}"
+                )
+            bootstrap_addr = extra.get("bootstrap_server_address")
+            bootstrap_port_env = server_env.get("VLLM_MOONCAKE_BOOTSTRAP_PORT")
+            if role == "prefill":
+                if bootstrap_addr is not None and bootstrap_port_env is not None:
+                    raise ValidationError(
+                        f"{context}: MooncakeConnector prefill must not set both "
+                        f"bootstrap_server_address and VLLM_MOONCAKE_BOOTSTRAP_PORT"
+                    )
+                if bootstrap_addr is not None:
+                    if (
+                        not isinstance(bootstrap_addr, str)
+                        or "{kv_port}" not in bootstrap_addr
+                    ):
+                        raise ValidationError(
+                            f"{context}: MooncakeConnector bootstrap_server_address must "
+                            f"be a 'host:port' string wiring {{kv_port}}"
+                        )
+                    sub_addr = _substitute_placeholders_in_str(bootstrap_addr)
+                    host_part, sep, port_part = sub_addr.rpartition(":")
+                    if not sep or not host_part:
+                        raise ValidationError(
+                            f"{context}: MooncakeConnector bootstrap_server_address must "
+                            f"be 'host:port', got {bootstrap_addr!r}"
+                        )
+                    _validate_port_value(
+                        port_part,
+                        context=f"{context}.bootstrap_server_address",
+                    )
+                else:
+                    if (
+                        not isinstance(bootstrap_port_env, str)
+                        or "{kv_port}" not in bootstrap_port_env
+                    ):
+                        raise ValidationError(
+                            f"{context}: MooncakeConnector prefill requires env "
+                            f"VLLM_MOONCAKE_BOOTSTRAP_PORT (or kv_connector_extra_config."
+                            f"bootstrap_server_address) to wire {{kv_port}}"
+                        )
+                    _validate_port_value(
+                        _substitute_placeholders_in_str(bootstrap_port_env),
+                        context=f"{context}.VLLM_MOONCAKE_BOOTSTRAP_PORT",
+                    )
+            elif role == "decode":
+                if bootstrap_addr is not None or bootstrap_port_env is not None:
+                    raise ValidationError(
+                        f"{context}: MooncakeConnector decode (kv_consumer) does not read "
+                        f"bootstrap_server_address or VLLM_MOONCAKE_BOOTSTRAP_PORT; "
+                        f"decoders receive remote_bootstrap_addr via kv_transfer_params"
+                    )
         if topo_nodes == 1:
             bad_mn = sorted(flag_names & MULTI_NODE_LAUNCH_FLAGS)
             if bad_mn:
@@ -1701,19 +1824,32 @@ def _resolve_recipe_from_doc(
             )
         return val
 
-    dp_val = _parse_pos_int_flag(
-        "--data-parallel-size", _flag_value(ordered, "--data-parallel-size")
+    dp_val = (
+        _parse_pos_int_flag(
+            "--data-parallel-size", _flag_value(ordered, "--data-parallel-size")
+        )
+        or 1
     )
-    tp_val = _parse_pos_int_flag(
-        "--tensor-parallel-size", _flag_value(ordered, "--tensor-parallel-size")
+    tp_val = (
+        _parse_pos_int_flag(
+            "--tensor-parallel-size", _flag_value(ordered, "--tensor-parallel-size")
+        )
+        or 1
     )
-    pp_val = _parse_pos_int_flag(
-        "--pipeline-parallel-size", _flag_value(ordered, "--pipeline-parallel-size")
+    pp_val = (
+        _parse_pos_int_flag(
+            "--pipeline-parallel-size", _flag_value(ordered, "--pipeline-parallel-size")
+        )
+        or 1
     )
-    if dp_val is not None or tp_val is not None or pp_val is not None:
-        ppu_count = (dp_val or 1) * (tp_val or 1) * (pp_val or 1)
-    else:
-        ppu_count = int(eff_topology["nodes"]) * int(eff_topology["devices_per_node"])
+    pcp_val = (
+        _parse_pos_int_flag(
+            "--prefill-context-parallel-size",
+            _flag_value(ordered, "--prefill-context-parallel-size"),
+        )
+        or 1
+    )
+    ppu_count = dp_val * tp_val * pp_val * pcp_val
 
     runtime_env: dict[str, str] = {}
     if needs_dev_mode:
@@ -2102,9 +2238,17 @@ def validate_serving_recipe_structure(
             )
 
     allow_legacy_bf16 = _is_legacy_bf16_smoke_recipe(recipe)
-    variants_blk = recipe.get("variants", {})
-    if not isinstance(variants_blk, dict):
-        raise ValidationError(f"{context}.variants must be mapping")
+    if ppu["framework"] == "vllm":
+        raw_variants = recipe.get("variants")
+        if not isinstance(raw_variants, dict) or not raw_variants:
+            raise ValidationError(
+                f"{context}.variants must be a non-empty mapping for vllm serving recipes"
+            )
+        variants_blk = raw_variants
+    else:
+        variants_blk = recipe.get("variants", {})
+        if not isinstance(variants_blk, dict):
+            raise ValidationError(f"{context}.variants must be mapping")
     variant_hw_map: dict[str, str] = {}
     for vname, vcfg in variants_blk.items():
         _check_keys(

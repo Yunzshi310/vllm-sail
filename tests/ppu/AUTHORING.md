@@ -74,7 +74,7 @@ models and frameworks:
 | `prefill` | `single_node` (`nodes: 1`) | Prefill-optimized single-node layout (e.g., smaller TP width, `spec_decoding: false`) | None (placeholders forbidden on `single_node`) |
 | `decode` | `single_node` (`nodes: 1`) | Decode-optimized single-node layout (e.g., TP8 with MTP / speculative decoding enabled) | None |
 | `decode_ep` | `multi_node_ep` (`nodes >= 2`) | Multi-node DP+EP decode layout (e.g., 4-node DP32+EP+MTP) | Must include `{master_addr}` and `{node_rank}` (`--nnodes` must match `topology.nodes`; launchers append `--headless` on non-zero node ranks) |
-| `pd_prefill` + `pd_decode` | `pd_disagg` (paired roles `prefill` + `decode`) | Disaggregated prefill/decode pair using `--kv-transfer-config` | Must be declared as a pair; must include `{kv_ip}`, `{kv_port}`, `{ib_devices}` and matching `kv_role` (`kv_producer` / `kv_consumer`) |
+| `pd_prefill` + `pd_decode` | `pd_disagg` (paired roles `prefill` + `decode`) | Disaggregated prefill/decode pair using `--kv-transfer-config` | Must be declared as a pair with matching `kv_role` (`kv_producer` / `kv_consumer`); for `MooncakeConnector`, wire `{kv_ip}` via `VLLM_HOST_IP`, `{ib_devices}` via `kv_connector_extra_config.device_name`, and `{kv_port}` on `pd_prefill` via `VLLM_MOONCAKE_BOOTSTRAP_PORT` (embedded bootstrap) or `kv_connector_extra_config.bootstrap_server_address` (external bootstrap); `pd_decode` receives `remote_bootstrap_addr` per request from the PD proxy |
 
 Specialized single-node slots already in use by existing recipes (`dp_ep_low_latency`,
 `prefill_long`, `eval_longctx`, `decode_nographs`, `tp8`) remain accepted for
@@ -86,8 +86,9 @@ Supported topology placeholders are `{master_addr}`, `{master_port}`, `{node_ran
 `{kv_ip}`, `{kv_port}`, and `{ib_devices}`. During `validate --all` (both CPU checks
 and PPU pin-UT real `vllm serve` argparse verification), `ppu_recipe.py` expands
 100% of compatible `variant x preset` combinations, substitutes safe typed dummy
-values (`127.0.0.1`, `29500`, `0`, `14579`, `rdma0`), and validates CLI syntax,
-JSON objects, environment allowlists, and redaction rules.
+values (`127.0.0.1`, `29500`, `0`, `8998`, `rdma0`), and validates CLI syntax,
+JSON objects, environment allowlists, effective world size (`DP x TP x PP x PCP`),
+and redaction rules.
 
 ## 5. Three-Tier CI Gate Admission Rules
 
@@ -108,9 +109,10 @@ CI runners. Promotion follows three tiers:
      (for example, TP4 without MTP `prefill` vs TP8 with MTP `decode`, or single-node
      DP+EP).
    The single-node CI selector (`scripts/ci/ppu_e2e_select.py`) automatically skips
-   `nodes > 1`, `pd_disagg`, and unattached `zhenwu_810e` entries. Keep `zhenwu_810e`
-   variants catalog-only until 810E storage and runners are ready, and keep
-   `multi_node_ep` / `pd_disagg` static-only until multi-node K8s CI is onboarded.
+   `nodes > 1`, `pd_disagg`, oversized policies exceeding the single-node 8-card
+   Zhenwu M890 runner limit, and unattached / non-M890 (`zhenwu_810e`) entries. Keep
+   `zhenwu_810e` variants catalog-only until 810E storage and runners are ready, and
+   keep `multi_node_ep` / `pd_disagg` static-only until multi-node K8s CI is onboarded.
 3. **Tier 3 — Nightly `model_sanity` (One GSM8K gate per ready quantized mainline)**
    Maintain one full-dataset GSM8K + micro-E2E `model_sanity` policy per ready
    quantized mainline checkpoint (with a reviewed golden under

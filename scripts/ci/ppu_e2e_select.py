@@ -34,6 +34,9 @@ from pathlib import Path
 CI_DIR = Path(__file__).resolve().parent
 REPO_ROOT = CI_DIR.parents[1]
 CATALOG = CI_DIR / "ppu_e2e_models.json"
+SINGLE_NODE_MAX_DEVICES_BY_HARDWARE: dict[str, int] = {
+    "zhenwu_m890": 8,
+}
 
 
 def _category(entry: dict) -> str:
@@ -114,7 +117,11 @@ def build_accuracy_matrix(catalog: list[dict], models: str) -> dict:
 
 
 def _recipe_entries(
-    models: str, tier: str, *, hardware: str | None = "zhenwu_m890"
+    models: str,
+    tier: str,
+    *,
+    hardware: str | None = "zhenwu_m890",
+    max_devices: int | None = None,
 ) -> Iterator[tuple[dict, list[str], dict]]:
     if str(CI_DIR) not in sys.path:
         sys.path.insert(0, str(CI_DIR))
@@ -132,6 +139,15 @@ def _recipe_entries(
         raise ValueError(
             f"unknown recipe policy key(s): {', '.join(unknown)}; available: {available}"
         )
+    eff_max_devices = (
+        max_devices
+        if max_devices is not None
+        else (
+            SINGLE_NODE_MAX_DEVICES_BY_HARDWARE.get(hardware)
+            if hardware is not None
+            else None
+        )
+    )
     selected_keys = requested if requested else list(by_slug)
     for slug in selected_keys:
         pol_path = by_slug[slug]
@@ -161,6 +177,13 @@ def _recipe_entries(
                     f"which is not runnable on single-node {hardware!r} CI"
                 )
             continue
+        if eff_max_devices is not None and int(resolved["ppu_count"]) > eff_max_devices:
+            if requested:
+                raise ValueError(
+                    f"recipe policy {slug!r} requires {resolved['ppu_count']} devices, "
+                    f"exceeding single-node {hardware or resolved['hardware']!r} CI runner limit ({eff_max_devices})"
+                )
+            continue
         yield (
             {
                 "key": slug,
@@ -183,12 +206,19 @@ def _recipe_entries(
 
 
 def build_recipe_matrix(
-    models: str, tier: str = "fast_sanity", *, hardware: str | None = "zhenwu_m890"
+    models: str,
+    tier: str = "fast_sanity",
+    *,
+    hardware: str | None = "zhenwu_m890",
+    max_devices: int | None = None,
 ) -> dict:
     """Select all policies defining the tier, or require it for each explicit key."""
     return {
         "include": [
-            entry for entry, _, _ in _recipe_entries(models, tier, hardware=hardware)
+            entry
+            for entry, _, _ in _recipe_entries(
+                models, tier, hardware=hardware, max_devices=max_devices
+            )
         ]
     }
 

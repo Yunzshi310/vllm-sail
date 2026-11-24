@@ -81,6 +81,8 @@ def _sample_vllm_parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", type=int)
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--tensor-parallel-size", type=int)
+    parser.add_argument("--pipeline-parallel-size", type=int)
+    parser.add_argument("--prefill-context-parallel-size", type=int)
     parser.add_argument("--data-parallel-size", type=int)
     parser.add_argument("--enable-expert-parallel", action="store_true")
     parser.add_argument("--all2all-backend")
@@ -259,7 +261,7 @@ def test_resolve_glm53_matches_catalog_and_supports_presets() -> None:
     assert "{node_rank}" in resolved_ep["flags"]
     assert resolved_ep["server_env"]["HGGC_EMBEDDED_COPY_THRESHOLD"] == "0x10000"
 
-    # Paired Mooncake PD disagg presets
+    # Paired Mooncake PD disagg presets (wired to actual pinned MooncakeConnector runtime settings)
     for slot, expected_role, expected_kv_role in (
         ("pd_prefill", "prefill", "kv_producer"),
         ("pd_decode", "decode", "kv_consumer"),
@@ -272,9 +274,14 @@ def test_resolve_glm53_matches_catalog_and_supports_presets() -> None:
         kv_cfg = json.loads(res_pd["flags"][kv_idx + 1])
         assert kv_cfg["kv_connector"] == "MooncakeConnector"
         assert kv_cfg["kv_role"] == expected_kv_role
-        assert kv_cfg["kv_port"] == "{kv_port}"
+        assert "kv_port" not in kv_cfg
+        assert "kv_ip" not in kv_cfg["kv_connector_extra_config"]
         assert kv_cfg["kv_connector_extra_config"]["device_name"] == "{ib_devices}"
-        assert kv_cfg["kv_connector_extra_config"]["kv_ip"] == "{kv_ip}"
+        assert res_pd["server_env"]["VLLM_HOST_IP"] == "{kv_ip}"
+        if expected_role == "prefill":
+            assert res_pd["server_env"]["VLLM_MOONCAKE_BOOTSTRAP_PORT"] == "{kv_port}"
+        else:
+            assert "VLLM_MOONCAKE_BOOTSTRAP_PORT" not in res_pd["server_env"]
 
     # Multi-variant asset and hardware overrides (fp8_channel on 890P, w8a8_int8 on 810E)
     resolved_fp8 = ppu_recipe.resolve_recipe(
@@ -2979,7 +2986,7 @@ def test_recipe_boundary_and_sanitization_guardrails(mutator, match: str) -> Non
 def test_topology_placeholder_validation_and_substitution(tmp_path: Path) -> None:
     glm_doc = yaml.safe_load((RECIPES_DIR / "zai-org" / "GLM-5.3.yaml").read_text())
 
-    # 1. Placeholder substitution produces typed int kv_port and parses cleanly
+    # 1. Placeholder substitution wires real Mooncake env/extra_config and parses cleanly
     res_pd = ppu_recipe.resolve_recipe(
         RECIPES_DIR / "zai-org" / "GLM-5.3.yaml", preset="pd_prefill"
     )
@@ -2988,10 +2995,11 @@ def test_topology_placeholder_validation_and_substitution(tmp_path: Path) -> Non
     )
     kv_idx = sub_flags.index("--kv-transfer-config")
     kv_obj = json.loads(sub_flags[kv_idx + 1])
-    assert kv_obj["kv_port"] == 14579
-    assert type(kv_obj["kv_port"]) is int
-    assert kv_obj["kv_connector_extra_config"]["kv_ip"] == "127.0.0.1"
+    assert "kv_port" not in kv_obj
+    assert "kv_ip" not in kv_obj["kv_connector_extra_config"]
     assert kv_obj["kv_connector_extra_config"]["device_name"] == "rdma0"
+    assert sub_env["VLLM_HOST_IP"] == "127.0.0.1"
+    assert sub_env["VLLM_MOONCAKE_BOOTSTRAP_PORT"] == "8998"
     assert sub_env["MOONCAKE_PROTOCOL"] == "rdma"
     ppu_recipe.validate_flags_with_parser(
         _sample_vllm_parser(), sub_flags, context="pd_prefill_sub"
@@ -3348,3 +3356,279 @@ def test_topology_flag_invariant_blocks_multinode_and_disagg_bypass(
     )
     assert decode_entry["ppu_count"] == 8
     assert decode_entry["preset"] == "decode"
+
+
+def test_mooncake_pd_endpoint_wiring_nondefault_and_counterexamples(
+    tmp_path: Path,
+) -> None:
+    recipe_path = RECIPES_DIR / "zai-org" / "GLM-5.3.yaml"
+    glm_doc = yaml.safe_load(recipe_path.read_text(encoding="utf-8"))
+
+    # 1. Non-default address, port, and IB device list resolve to Mooncake's real runtime inputs
+    prefill = ppu_recipe.resolve_recipe(recipe_path, preset="pd_prefill")
+    p_flags, p_env = ppu_recipe.substitute_validation_placeholders(
+        prefill["flags"],
+        prefill["server_env"],
+        values={
+            "kv_ip": "198.51.100.10",
+            "kv_port": 18998,
+            "ib_devices": "rdma2,rdma3",
+        },
+    )
+    p_kv = json.loads(p_flags[p_flags.index("--kv-transfer-config") + 1])
+    assert p_env["VLLM_HOST_IP"] == "198.51.100.10"
+    assert int(p_env["VLLM_MOONCAKE_BOOTSTRAP_PORT"]) == 18998
+    assert p_kv["kv_role"] == "kv_producer"
+    assert p_kv["kv_connector_extra_config"]["device_name"] == "rdma2,rdma3"
+    assert "kv_port" not in p_kv
+    assert "kv_ip" not in p_kv["kv_connector_extra_config"]
+    ppu_recipe.validate_flags_with_parser(
+        _sample_vllm_parser(), p_flags, context="pd_prefill_nondefault"
+    )
+
+    decode = ppu_recipe.resolve_recipe(recipe_path, preset="pd_decode")
+    d_flags, d_env = ppu_recipe.substitute_validation_placeholders(
+        decode["flags"],
+        decode["server_env"],
+        values={"kv_ip": "198.51.100.20", "ib_devices": "rdma4,rdma5"},
+    )
+    d_kv = json.loads(d_flags[d_flags.index("--kv-transfer-config") + 1])
+    assert d_env["VLLM_HOST_IP"] == "198.51.100.20"
+    assert "VLLM_MOONCAKE_BOOTSTRAP_PORT" not in d_env
+    assert d_kv["kv_role"] == "kv_consumer"
+    assert d_kv["kv_connector_extra_config"]["device_name"] == "rdma4,rdma5"
+    assert "kv_port" not in d_kv
+    assert "kv_ip" not in d_kv["kv_connector_extra_config"]
+    ppu_recipe.validate_flags_with_parser(
+        _sample_vllm_parser(), d_flags, context="pd_decode_nondefault"
+    )
+
+    # 2. External bootstrap_server_address mode on prefill also works with non-default host:port
+    ext_doc = copy.deepcopy(glm_doc)
+    ext_doc["presets"]["pd_prefill"]["env"].pop("VLLM_MOONCAKE_BOOTSTRAP_PORT")
+    ext_args = ext_doc["presets"]["pd_prefill"]["args"]
+    ext_kv = json.loads(ext_args[ext_args.index("--kv-transfer-config") + 1])
+    ext_kv["kv_connector_extra_config"]["bootstrap_server_address"] = (
+        "{kv_ip}:{kv_port}"
+    )
+    ext_args[ext_args.index("--kv-transfer-config") + 1] = json.dumps(
+        ext_kv, separators=(",", ":")
+    )
+    ext_path = tmp_path / "ext_bootstrap.yaml"
+    ext_path.write_text(yaml.safe_dump(ext_doc), encoding="utf-8")
+    ext_res = ppu_recipe.resolve_recipe(ext_path, preset="pd_prefill")
+    ext_flags, ext_env = ppu_recipe.substitute_validation_placeholders(
+        ext_res["flags"],
+        ext_res["server_env"],
+        values={"kv_ip": "198.51.100.30", "kv_port": 19001, "ib_devices": "rdma1"},
+    )
+    ext_sub_kv = json.loads(ext_flags[ext_flags.index("--kv-transfer-config") + 1])
+    assert ext_env["VLLM_HOST_IP"] == "198.51.100.30"
+    assert (
+        ext_sub_kv["kv_connector_extra_config"]["bootstrap_server_address"]
+        == "198.51.100.30:19001"
+    )
+
+    # 3. Counterexamples: dead Mooncake fields and missing/ambiguous runtime wiring fail closed
+    dead_port = copy.deepcopy(glm_doc)
+    dp_args = dead_port["presets"]["pd_prefill"]["args"]
+    dp_kv = json.loads(dp_args[dp_args.index("--kv-transfer-config") + 1])
+    dp_kv["kv_port"] = "{kv_port}"
+    dp_args[dp_args.index("--kv-transfer-config") + 1] = json.dumps(dp_kv)
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"does not read KVTransferConfig\.kv_port",
+    ):
+        ppu_recipe.validate_serving_recipe_structure(dead_port, context="dead_port")
+
+    dead_ip = copy.deepcopy(glm_doc)
+    di_args = dead_ip["presets"]["pd_prefill"]["args"]
+    di_kv = json.loads(di_args[di_args.index("--kv-transfer-config") + 1])
+    di_kv["kv_connector_extra_config"]["kv_ip"] = "{kv_ip}"
+    di_args[di_args.index("--kv-transfer-config") + 1] = json.dumps(di_kv)
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"does not read kv_connector_extra_config\.kv_ip",
+    ):
+        ppu_recipe.validate_serving_recipe_structure(dead_ip, context="dead_ip")
+
+    no_host_ip = copy.deepcopy(glm_doc)
+    no_host_ip["presets"]["pd_decode"]["env"].pop("VLLM_HOST_IP")
+    with pytest.raises(
+        ppu_recipe.ValidationError, match="missing required placeholder.*kv_ip"
+    ):
+        ppu_recipe.validate_serving_recipe_structure(no_host_ip, context="no_host_ip")
+
+    both_bootstrap = copy.deepcopy(ext_doc)
+    both_bootstrap["presets"]["pd_prefill"]["env"]["VLLM_MOONCAKE_BOOTSTRAP_PORT"] = (
+        "{kv_port}"
+    )
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match="must not set both bootstrap_server_address and VLLM_MOONCAKE_BOOTSTRAP_PORT",
+    ):
+        ppu_recipe.validate_serving_recipe_structure(
+            both_bootstrap, context="both_bootstrap"
+        )
+
+    decode_bootstrap = copy.deepcopy(glm_doc)
+    decode_bootstrap["presets"]["pd_decode"]["env"]["VLLM_MOONCAKE_BOOTSTRAP_PORT"] = (
+        "{kv_port}"
+    )
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match="decode .* does not read bootstrap_server_address or VLLM_MOONCAKE_BOOTSTRAP_PORT",
+    ):
+        ppu_recipe.validate_serving_recipe_structure(
+            decode_bootstrap, context="decode_bootstrap"
+        )
+
+
+def test_effective_vllm_world_size_pcp_defaults_and_runner_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    glm_doc = yaml.safe_load((RECIPES_DIR / "zai-org" / "GLM-5.3.yaml").read_text())
+
+    # 1. TP8 + PCP2 demands 16 devices (not 8): fails against 1x8 topology, resolves to 16 on 1x16
+    pcp_oversub = copy.deepcopy(glm_doc)
+    pcp_oversub["presets"]["decode"]["args"] = [
+        "--prefill-context-parallel-size",
+        "2",
+    ]
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match="requires 16 devices, exceeding declared topology capacity",
+    ):
+        ppu_recipe.validate_serving_recipe_structure(pcp_oversub, context="pcp_1x8")
+
+    pcp_16 = copy.deepcopy(pcp_oversub)
+    pcp_16["presets"]["decode"]["topology"]["devices_per_node"] = 16
+    pcp_path = tmp_path / "glm_pcp16.yaml"
+    pcp_path.write_text(yaml.safe_dump(pcp_16), encoding="utf-8")
+    resolved_pcp = ppu_recipe.resolve_recipe(pcp_path, preset="decode")
+    assert resolved_pcp["ppu_count"] == 16
+    report = ppu_recipe.validate_paths(
+        [pcp_path], vllm_parser_mode="required", parser=_sample_vllm_parser()
+    )
+    assert report["parser_checked"] is True
+
+    # 2. Removing --data-parallel-size 32 from 4-node decode_ep yields vLLM default world size 1,
+    #    which must fail (not silently copy topology capacity 32)
+    no_dp_ep = copy.deepcopy(glm_doc)
+    ep_args = no_dp_ep["presets"]["decode_ep"]["args"]
+    idx_dp = ep_args.index("--data-parallel-size")
+    del ep_args[idx_dp : idx_dp + 2]
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"topology\.nodes \(4\) must evenly divide effective vLLM world size \(1\)",
+    ):
+        ppu_recipe.validate_serving_recipe_structure(no_dp_ep, context="no_dp_ep")
+
+    # 3. Single-node recipe omitting all parallel flags resolves to vLLM default world_size=1
+    one_card = copy.deepcopy(glm_doc)
+    one_card["ppu"]["topology"]["devices_per_node"] = 1
+    one_card["model"]["base_args"] = [
+        tok
+        for i, tok in enumerate(one_card["model"]["base_args"])
+        if tok != "--tensor-parallel-size"
+        and (
+            i == 0 or one_card["model"]["base_args"][i - 1] != "--tensor-parallel-size"
+        )
+    ]
+    one_card["variants"] = {"default": copy.deepcopy(glm_doc["variants"]["default"])}
+    one_card["presets"] = {}
+    one_path = tmp_path / "one_card.yaml"
+    one_path.write_text(yaml.safe_dump(one_card), encoding="utf-8")
+    assert ppu_recipe.resolve_recipe(one_path)["ppu_count"] == 1
+
+    # 4. Single-node M890 selector enforces the 8-card runner cap for both TP16 and TP8xPCP2
+    shutil.copytree(ROOT / "tests/ppu", tmp_path / "tests/ppu")
+    monkeypatch.setattr(ppu_e2e_select, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(ppu_recipe, "REPO_ROOT", tmp_path)
+    glm_tp16_doc = copy.deepcopy(glm_doc)
+    glm_tp16_doc["presets"]["decode"]["topology"]["devices_per_node"] = 16
+    glm_tp16_doc["presets"]["decode"]["tp"] = 16
+    (tmp_path / "tests/ppu/recipes/zai-org/GLM-5.3.yaml").write_text(
+        yaml.safe_dump(glm_tp16_doc), encoding="utf-8"
+    )
+    # Static validation still passes (preset stays available in static catalog)
+    assert (
+        ppu_recipe.validate_paths(
+            [tmp_path / "tests/ppu/recipes/zai-org/GLM-5.3.yaml"],
+            vllm_parser_mode="required",
+            parser=_sample_vllm_parser(),
+        )["checked_combinations"]
+        == 14
+    )
+    default_keys = {
+        item["key"]
+        for item in ppu_e2e_select.build_recipe_matrix("", "fast_sanity")["include"]
+    }
+    assert "glm-5.3" in default_keys
+    assert "glm-5.3-decode" not in default_keys
+    with pytest.raises(
+        ValueError,
+        match="requires 16 devices, exceeding single-node 'zhenwu_m890' CI runner limit \\(8\\)",
+    ):
+        ppu_e2e_select.build_recipe_matrix("glm-5.3-decode", "fast_sanity")
+    # Positive control: higher runner cap admits the 16-card entry cleanly
+    admitted = ppu_e2e_select.build_recipe_matrix(
+        "glm-5.3-decode", "fast_sanity", max_devices=16
+    )["include"]
+    assert len(admitted) == 1 and admitted[0]["ppu_count"] == 16
+
+    # Same 8-card cap catches TP8 + PCP2 (16 devices) in selector
+    (tmp_path / "tests/ppu/recipes/zai-org/GLM-5.3.yaml").write_text(
+        yaml.safe_dump(pcp_16), encoding="utf-8"
+    )
+    default_keys_pcp = {
+        item["key"]
+        for item in ppu_e2e_select.build_recipe_matrix("", "fast_sanity")["include"]
+    }
+    assert "glm-5.3-decode" not in default_keys_pcp
+    with pytest.raises(
+        ValueError,
+        match="requires 16 devices, exceeding single-node 'zhenwu_m890' CI runner limit \\(8\\)",
+    ):
+        ppu_e2e_select.build_recipe_matrix("glm-5.3-decode", "fast_sanity")
+
+
+def test_vllm_recipe_rejects_missing_or_empty_variants(tmp_path: Path) -> None:
+    glm_doc = yaml.safe_load((RECIPES_DIR / "zai-org" / "GLM-5.3.yaml").read_text())
+
+    for name, mutator in (
+        ("empty_variants", lambda d: d.update({"variants": {}, "presets": {}})),
+        (
+            "missing_variants",
+            lambda d: (d.pop("variants", None), d.update({"presets": {}})),
+        ),
+    ):
+        bad = copy.deepcopy(glm_doc)
+        mutator(bad)
+        with pytest.raises(
+            ppu_recipe.ValidationError,
+            match=r"variants must be a non-empty mapping for vllm serving recipes",
+        ):
+            ppu_recipe.validate_serving_recipe_structure(bad, context=name)
+
+        bad_path = tmp_path / f"{name}.yaml"
+        bad_path.write_text(yaml.safe_dump(bad), encoding="utf-8")
+        with pytest.raises(
+            ppu_recipe.ValidationError,
+            match=r"variants must be a non-empty mapping for vllm serving recipes",
+        ):
+            ppu_recipe.validate_paths(
+                [bad_path], vllm_parser_mode="required", parser=_sample_vllm_parser()
+            )
+
+    # Positive control: non-empty single variant expands and passes parser check
+    good = copy.deepcopy(glm_doc)
+    good["variants"] = {"default": copy.deepcopy(glm_doc["variants"]["default"])}
+    good["presets"] = {}
+    good_path = tmp_path / "nonempty_variants.yaml"
+    good_path.write_text(yaml.safe_dump(good), encoding="utf-8")
+    report = ppu_recipe.validate_paths(
+        [good_path], vllm_parser_mode="required", parser=_sample_vllm_parser()
+    )
+    assert report["checked_combinations"] == 1
+    assert report["parser_checked"] is True

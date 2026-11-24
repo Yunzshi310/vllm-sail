@@ -166,11 +166,13 @@ presets:
       - --gpu-memory-utilization
       - "0.85"
       - --kv-transfer-config
-      - '{"kv_connector":"MooncakeConnector","kv_role":"kv_producer","kv_port":"{kv_port}","kv_connector_extra_config":{"mooncake_protocol":"rdma","device_name":"{ib_devices}","kv_ip":"{kv_ip}"}}'
+      - '{"kv_connector":"MooncakeConnector","kv_role":"kv_producer","kv_connector_extra_config":{"mooncake_protocol":"rdma","device_name":"{ib_devices}"}}'
     env:
       HGGC_EMBEDDED_COPY_THRESHOLD: "0x10000"
       MC_NUM_QP_PER_EP: "4"
       MOONCAKE_PROTOCOL: rdma
+      VLLM_HOST_IP: "{kv_ip}"
+      VLLM_MOONCAKE_BOOTSTRAP_PORT: "{kv_port}"
   pd_decode:
     hardware: zhenwu_m890
     topology:
@@ -192,11 +194,12 @@ presets:
       - --gpu-memory-utilization
       - "0.85"
       - --kv-transfer-config
-      - '{"kv_connector":"MooncakeConnector","kv_role":"kv_consumer","kv_port":"{kv_port}","kv_connector_extra_config":{"mooncake_protocol":"rdma","device_name":"{ib_devices}","kv_ip":"{kv_ip}"}}'
+      - '{"kv_connector":"MooncakeConnector","kv_role":"kv_consumer","kv_connector_extra_config":{"mooncake_protocol":"rdma","device_name":"{ib_devices}"}}'
     env:
       HGGC_EMBEDDED_COPY_THRESHOLD: "0x10000"
       MC_NUM_QP_PER_EP: "4"
       MOONCAKE_PROTOCOL: rdma
+      VLLM_HOST_IP: "{kv_ip}"
 notes: >-
   Reference #0 full-scenario serving recipe for zai-org/GLM-5.3 across Zhenwu
   M890 (default mxfp4 and fp8_channel) and Zhenwu 810E (w8a8_int8) variants,
