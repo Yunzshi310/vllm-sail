@@ -2226,6 +2226,15 @@ def test_accuracy_nightly_hardening_target_trust_digest_pin_and_cron_concurrency
     )
 
 
+def test_recipe_model_sanity_runs_two_way_parallel_while_legacy_stays_serial():
+    recipe_sanity = workflow("_ppu-recipe-model-sanity.yaml")["jobs"]["sanity"]
+    legacy_leaf = workflow("_ppu-accuracy-tests.yaml")["jobs"]["accuracy"]
+    nightly_legacy = workflow("ppu-accuracy-nightly.yaml")["jobs"]["accuracy"]
+    assert recipe_sanity["strategy"]["max-parallel"] == 2
+    assert legacy_leaf["strategy"]["max-parallel"] == 1
+    assert nightly_legacy["strategy"]["max-parallel"] == 1
+
+
 def test_nightly_public_summary_exports_safe_image_digest_and_versions(tmp_path):
     steps = workflow("_ppu-recipe-model-sanity.yaml")["jobs"]["sanity"]["steps"]
     publish = next(step for step in steps if step.get("id") == "publish")
