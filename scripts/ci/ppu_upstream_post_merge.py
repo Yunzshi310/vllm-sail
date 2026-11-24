@@ -126,6 +126,13 @@ VALID_REPRO_PHASES = (
     "stub_check",
     "infra_error",
 )
+VALID_REPRO_FAILURE_SOURCES = (
+    "none",
+    "upstream_build_source",
+    "stub_plugin_check",
+    "upstream_import_check",
+    "infra_or_unknown",
+)
 _INFRA_EXIT_CODES = frozenset({124, 126, 127, 137})
 _INSTALL_INFRA_ERROR_RE = re.compile(
     r"(?i)(?:"
@@ -135,6 +142,8 @@ _INSTALL_INFRA_ERROR_RE = re.compile(
     r"|cannot allocate memory|\bmemoryerror\b"
     r"|read-only file system|too many open files|broken pipe"
     r"|permissionerror|permission denied|bus error|segmentation fault"
+    r"|can't start new thread|resource temporarily unavailable"
+    r"|\[0 lines of output\]"
     r"|temporary failure in name resolution|name or service not known|nodename nor servname"
     r"|connectionerror|connectionreseterror|connectionrefusederror"
     r"|readtimeouterror|connecttimeouterror|newconnectionerror|maxretryerror"
@@ -144,14 +153,42 @@ _INSTALL_INFRA_ERROR_RE = re.compile(
     r"|\bkilled\b|\bsigkill\b"
     r")"
 )
-_BUILD_SOURCE_FAILURE_RE = re.compile(
+_PIP_INTERNAL_TRACEBACK_RE = re.compile(
     r"(?i)(?:"
-    r"building wheel for vllm|getting requirements to build|preparing metadata \(pyproject\.toml\)"
-    r"|metadata-generation-failed|subprocess-exited-with-error"
-    r"|setup\.py|pyproject\.toml|rust-toolchain\.toml|cargo\.toml|cmakelists\.txt"
-    r"|syntaxerror|indentationerror|importerror|modulenotfounderror|runtimeerror"
+    r"site-packages[/\\]pip[/\\](?!_vendor[/\\]pyproject_hooks[/\\]_in_process[/\\])"
+    r"|pip[/\\]_internal[/\\]"
+    r"|pip[/\\]_vendor[/\\](?!pyproject_hooks[/\\]_in_process[/\\])"
+    r")"
+)
+_PIP_WRAPPER_LINE_RE = re.compile(
+    r"(?i)^\s*(?:"
+    r"[×x✗•│╰├┌─>\s]*(?:"
+    r"preparing metadata|getting requirements to build|building wheel for"
+    r"|installing build dependencies|running setup\.py|encountered error while"
+    r"|exit code:|\[?\d+\s+lines? of output\]?|\[end of output\]"
+    r"|see above for output\.?|vllm\s*$"
+    r")"
+    r"|(?:(?:processing|obtaining|using cached|running command)\s+"
+    r"|(?:looking in indexes|created temporary directory|installing collected packages):"
+    r"|\[notice\]\s+)"
+    r"|note:\s+this (?:error originates from a subprocess|is an issue with the package mentioned above)"
+    r"|error:\s+(?:metadata-generation-failed|subprocess-exited-with-error|failed building wheel|legacy-install-failure)"
+    r"|hint:\s+"
+    r")"
+)
+_UPSTREAM_BUILD_ANCHOR_RE = re.compile(
+    r"(?i)(?:"
+    r"\bsetup\.py\b|\bpyproject\.toml\b|\brust-toolchain\.toml\b|\bcargo\.toml\b|\bcmakelists\.txt\b"
+    r"|\brequirements[/\\][A-Za-z0-9_.-]+\b|\b(?:vllm|cmake|csrc)[/\\](?!\.?venv[/\\])[A-Za-z0-9_./-]+\b"
+    r"|\bvllm_rs\b|\bvllm_target_device\b|\bcmake error\b|\bcargo build\b|\brustc\b"
+    r")"
+)
+_UPSTREAM_BUILD_DIAGNOSTIC_RE = re.compile(
+    r"(?i)(?:"
+    r"\b(?:syntaxerror|indentationerror|importerror|modulenotfounderror|runtimeerror"
     r"|valueerror|typeerror|attributeerror|keyerror|assertionerror|nameerror"
-    r"|calledprocesserror|distutilserror|setuptoolserror|cmake error|rustc|cargo build"
+    r"|filenotfounderror|tomldecodeerror|calledprocesserror|distutilserror|setuptoolserror)\b"
+    r"|\bcmake error\b|error\[e\d+\]|error:\s+(?:failed|could not) (?:to )?compile|fatal error:"
     r")"
 )
 VALID_PPU_SKIP_REASONS = (
@@ -297,6 +334,7 @@ class NonPpuReproEvidence:
     last_good_check_executed: bool = False
     first_failing_check_executed: bool = False
     infra_error: bool = False
+    failure_source: str = "none"
 
     def to_public_dict(self) -> dict[str, Any]:
         return {
@@ -311,6 +349,7 @@ class NonPpuReproEvidence:
             "last_good_check_executed": bool(self.last_good_check_executed),
             "first_failing_check_executed": bool(self.first_failing_check_executed),
             "infra_error": bool(self.infra_error),
+            "failure_source": self.failure_source,
             "verified": bool(self.verified),
         }
 
@@ -1693,25 +1732,40 @@ def materialize_stub_plugin(repro_kind: str, workdir: Path) -> tuple[Path, Path]
 def _is_infra_process_failure(
     returncode: int, stderr: str = "", stdout: str = ""
 ) -> bool:
-    """Return True when a subprocess exit indicates runner/host/network infra failure."""
+    """Return True when a subprocess exit indicates runner/host/network/pip-internal infra failure."""
     if returncode < 0 or returncode in _INFRA_EXIT_CODES:
         return True
     combined = f"{stderr}\n{stdout}"
-    return _INSTALL_INFRA_ERROR_RE.search(combined) is not None
+    if _INSTALL_INFRA_ERROR_RE.search(combined) is not None:
+        return True
+    return _PIP_INTERNAL_TRACEBACK_RE.search(combined) is not None
+
+
+def _strip_pip_wrapper_lines(text: str) -> str:
+    kept = [
+        line
+        for line in text.splitlines()
+        if line.strip() and _PIP_WRAPPER_LINE_RE.match(line) is None
+    ]
+    return "\n".join(kept)
 
 
 def _classify_install_failure(
     returncode: int, stderr: str, stdout: str, *, mode: str
-) -> tuple[str, bool]:
-    """Classify a non-zero install/build exit into ``(phase, is_infra_error)`` fail-closed."""
+) -> tuple[str, str, bool]:
+    """Classify a non-zero install/build exit into ``(phase, failure_source, is_infra_error)``."""
     if _is_infra_process_failure(returncode, stderr, stdout):
-        return "infra_error", True
+        return "infra_error", "infra_or_unknown", True
     if mode != "cpu_empty_build":
-        return "install", False
-    combined = f"{stderr}\n{stdout}"
-    if _BUILD_SOURCE_FAILURE_RE.search(combined) is not None:
-        return "build_install", False
-    return "infra_error", True
+        return "install", "infra_or_unknown", False
+    payload = _strip_pip_wrapper_lines(f"{stderr}\n{stdout}")
+    if (
+        payload
+        and _UPSTREAM_BUILD_ANCHOR_RE.search(payload) is not None
+        and _UPSTREAM_BUILD_DIAGNOSTIC_RE.search(payload) is not None
+    ):
+        return "build_install", "upstream_build_source", False
+    return "infra_error", "infra_or_unknown", True
 
 
 def is_valid_non_ppu_repro(
@@ -1737,6 +1791,8 @@ def is_valid_non_ppu_repro(
         return False
     if evidence.first_failing_phase not in VALID_REPRO_PHASES:
         return False
+    if evidence.failure_source not in VALID_REPRO_FAILURE_SOURCES:
+        return False
     if type(evidence.last_good_check_executed) is not bool:
         return False
     if type(evidence.first_failing_check_executed) is not bool:
@@ -1751,10 +1807,16 @@ def is_valid_non_ppu_repro(
         ):
             return False
         if evidence.first_failing_phase == "build_import":
-            if evidence.first_failing_check_executed is not True:
+            if (
+                evidence.first_failing_check_executed is not True
+                or evidence.failure_source != "upstream_import_check"
+            ):
                 return False
         elif evidence.first_failing_phase == "build_install":
-            if evidence.first_failing_check_executed is not False:
+            if (
+                evidence.first_failing_check_executed is not False
+                or evidence.failure_source != "upstream_build_source"
+            ):
                 return False
         else:
             return False
@@ -1769,6 +1831,7 @@ def is_valid_non_ppu_repro(
         if (
             evidence.first_failing_phase != "stub_check"
             or evidence.first_failing_check_executed is not True
+            or evidence.failure_source != "stub_plugin_check"
         ):
             return False
     else:
@@ -1836,6 +1899,7 @@ def parse_non_ppu_repro_evidence(data: Any) -> NonPpuReproEvidence | None:
     good_exec = data.get("last_good_check_executed")
     bad_exec = data.get("first_failing_check_executed")
     infra_err = data.get("infra_error")
+    failure_source = data.get("failure_source")
     raw_verified = data.get("verified")
     if (
         not isinstance(mode, str)
@@ -1844,8 +1908,10 @@ def parse_non_ppu_repro_evidence(data: Any) -> NonPpuReproEvidence | None:
         or not isinstance(first_bad, str)
         or not isinstance(good_phase, str)
         or not isinstance(bad_phase, str)
+        or not isinstance(failure_source, str)
         or good_phase not in VALID_REPRO_PHASES
         or bad_phase not in VALID_REPRO_PHASES
+        or failure_source not in VALID_REPRO_FAILURE_SOURCES
         or type(good_rc) is not int
         or type(bad_rc) is not int
         or type(good_exec) is not bool
@@ -1867,6 +1933,7 @@ def parse_non_ppu_repro_evidence(data: Any) -> NonPpuReproEvidence | None:
         last_good_check_executed=good_exec,
         first_failing_check_executed=bad_exec,
         infra_error=infra_err,
+        failure_source=failure_source,
     )
     return NonPpuReproEvidence(
         mode=candidate.mode,
@@ -1881,6 +1948,7 @@ def parse_non_ppu_repro_evidence(data: Any) -> NonPpuReproEvidence | None:
         last_good_check_executed=candidate.last_good_check_executed,
         first_failing_check_executed=candidate.first_failing_check_executed,
         infra_error=candidate.infra_error,
+        failure_source=candidate.failure_source,
     )
 
 
@@ -1918,12 +1986,13 @@ def verify_non_ppu_reproducer(
             last_good_check_executed=False,
             first_failing_check_executed=False,
             infra_error=False,
+            failure_source="none",
         )
 
     def _run_one(
         sha: str, workdir: Path, stub_site: Path, check_script: Path
-    ) -> tuple[int, str, bool, bool]:
-        """Return ``(exit_code, phase, check_executed, is_infra_error)``."""
+    ) -> tuple[int, str, str, bool, bool]:
+        """Return ``(exit_code, phase, failure_source, check_executed, is_infra_error)``."""
         base_env = {
             k: v
             for k, v in os.environ.items()
@@ -1962,24 +2031,39 @@ def verify_non_ppu_reproducer(
                     timeout=timeout_sec,
                 )
             except subprocess.TimeoutExpired:
-                return 124, "infra_error", marker_path.is_file(), True
+                return (
+                    124,
+                    "infra_error",
+                    "infra_or_unknown",
+                    marker_path.is_file(),
+                    True,
+                )
             executed = marker_path.is_file()
             if proc.returncode != 0 and _is_infra_process_failure(
                 proc.returncode, proc.stderr, proc.stdout
             ):
-                return proc.returncode, "infra_error", executed, True
+                return (
+                    proc.returncode,
+                    "infra_error",
+                    "infra_or_unknown",
+                    executed,
+                    True,
+                )
             if mode == "stub_plugin_cpu":
                 if executed:
-                    return proc.returncode, "stub_check", True, False
-                return proc.returncode, "install", False, False
+                    src = "none" if proc.returncode == 0 else "stub_plugin_check"
+                    return proc.returncode, "stub_check", src, True, False
+                src = "none" if proc.returncode == 0 else "infra_or_unknown"
+                return proc.returncode, "install", src, False, False
             if executed:
-                return proc.returncode, "build_import", True, False
+                src = "none" if proc.returncode == 0 else "upstream_import_check"
+                return proc.returncode, "build_import", src, True, False
             if proc.returncode != 0:
-                phase, is_infra = _classify_install_failure(
+                phase, src, is_infra = _classify_install_failure(
                     proc.returncode, proc.stderr, proc.stdout, mode=mode
                 )
-                return proc.returncode, phase, False, is_infra
-            return 0, "install", False, False
+                return proc.returncode, phase, src, False, is_infra
+            return 0, "install", "none", False, False
 
         base_env["STUB_CHECK_SCRIPT"] = str(check_script)
         wt_dir = workdir / f"vllm-{sha[:12]}"
@@ -2004,7 +2088,7 @@ def verify_non_ppu_reproducer(
                 timeout=120,
             )
             if add_proc.returncode != 0:
-                return add_proc.returncode, "setup", False, True
+                return add_proc.returncode, "setup", "infra_or_unknown", False, True
             wt_added = True
 
             use_torch = wt_dir / "tools" / "use_existing_torch.py"
@@ -2024,6 +2108,7 @@ def verify_non_ppu_reproducer(
                     return (
                         torch_proc.returncode,
                         "infra_error" if is_infra else "install",
+                        "infra_or_unknown",
                         False,
                         is_infra,
                     )
@@ -2049,13 +2134,13 @@ def verify_non_ppu_reproducer(
                 timeout=timeout_sec,
             )
             if install_proc.returncode != 0:
-                phase, is_infra = _classify_install_failure(
+                phase, src, is_infra = _classify_install_failure(
                     install_proc.returncode,
                     install_proc.stderr,
                     install_proc.stdout,
                     mode=mode,
                 )
-                return install_proc.returncode, phase, False, is_infra
+                return install_proc.returncode, phase, src, False, is_infra
 
             check_env = dict(base_env)
             py_entries = [str(site_dir)]
@@ -2073,11 +2158,26 @@ def verify_non_ppu_reproducer(
             if check_proc.returncode != 0 and _is_infra_process_failure(
                 check_proc.returncode, check_proc.stderr, check_proc.stdout
             ):
-                return check_proc.returncode, "infra_error", True, True
+                return (
+                    check_proc.returncode,
+                    "infra_error",
+                    "infra_or_unknown",
+                    True,
+                    True,
+                )
             phase = "stub_check" if mode == "stub_plugin_cpu" else "build_import"
-            return check_proc.returncode, phase, True, False
+            src = (
+                "none"
+                if check_proc.returncode == 0
+                else (
+                    "stub_plugin_check"
+                    if mode == "stub_plugin_cpu"
+                    else "upstream_import_check"
+                )
+            )
+            return check_proc.returncode, phase, src, True, False
         except subprocess.TimeoutExpired:
-            return 124, "infra_error", False, True
+            return 124, "infra_error", "infra_or_unknown", False, True
         finally:
             if wt_added:
                 subprocess.run(
@@ -2098,7 +2198,7 @@ def verify_non_ppu_reproducer(
     with tempfile.TemporaryDirectory(prefix="non-ppu-repro-") as td:
         workdir = Path(td)
         stub_site, check_script = materialize_stub_plugin(kind, workdir)
-        good_rc, good_phase, good_exec, good_infra = _run_one(
+        good_rc, good_phase, good_src, good_exec, good_infra = _run_one(
             good, workdir, stub_site, check_script
         )
         if good_infra or good_rc != 0 or not good_exec:
@@ -2115,8 +2215,9 @@ def verify_non_ppu_reproducer(
                 last_good_check_executed=good_exec,
                 first_failing_check_executed=False,
                 infra_error=good_infra,
+                failure_source=good_src if good_rc != 0 else "infra_or_unknown",
             )
-        bad_rc, bad_phase, bad_exec, bad_infra = _run_one(
+        bad_rc, bad_phase, bad_src, bad_exec, bad_infra = _run_one(
             bad, workdir, stub_site, check_script
         )
 
@@ -2134,6 +2235,7 @@ def verify_non_ppu_reproducer(
         last_good_check_executed=good_exec,
         first_failing_check_executed=bad_exec,
         infra_error=any_infra,
+        failure_source="infra_or_unknown" if any_infra else bad_src,
     )
     return NonPpuReproEvidence(
         mode=raw_evidence.mode,
@@ -2154,6 +2256,7 @@ def verify_non_ppu_reproducer(
         last_good_check_executed=raw_evidence.last_good_check_executed,
         first_failing_check_executed=raw_evidence.first_failing_check_executed,
         infra_error=raw_evidence.infra_error,
+        failure_source=raw_evidence.failure_source,
     )
 
 

@@ -522,6 +522,7 @@ def test_gate4_bisection_control_first_and_dual_track_triage(tmp_path):
         last_good_check_executed=True,
         first_failing_check_executed=True,
         infra_error=False,
+        failure_source="stub_plugin_check",
     )
     pub_plugin_dir = tmp_path / "pub-plugin"
     plugin_pub = post_merge.publish_sanitized_channels(
@@ -2265,7 +2266,13 @@ def test_non_ppu_repro_hard_gate_real_stub_plugins_all_five_kinds(
     expected_phase = (
         "build_import" if expected_mode == "cpu_empty_build" else "stub_check"
     )
+    expected_source = (
+        "upstream_import_check"
+        if expected_mode == "cpu_empty_build"
+        else "stub_plugin_check"
+    )
     assert repro_data == {
+        "failure_source": expected_source,
         "first_failing_check_executed": True,
         "first_failing_exit_code": 1,
         "first_failing_phase": expected_phase,
@@ -2448,6 +2455,7 @@ def test_non_ppu_repro_hard_gate_negative_controls_ppu_only_and_tampered_evidenc
         last_good_check_executed=True,
         first_failing_check_executed=True,
         infra_error=False,
+        failure_source="stub_plugin_check",
     )
     for internal_stage in sorted(post_merge.SAIL_INTERNAL_ONLY_STAGES):
         triage = post_merge.classify_failure(
@@ -2480,6 +2488,7 @@ def test_non_ppu_repro_hard_gate_negative_controls_ppu_only_and_tampered_evidenc
             True,
             True,
             False,
+            "stub_plugin_check",
         ),
         post_merge.NonPpuReproEvidence(
             "stub_plugin_cpu",
@@ -2494,6 +2503,7 @@ def test_non_ppu_repro_hard_gate_negative_controls_ppu_only_and_tampered_evidenc
             True,
             True,
             False,
+            "stub_plugin_check",
         ),
         post_merge.NonPpuReproEvidence(
             "stub_plugin_cpu",
@@ -2508,6 +2518,7 @@ def test_non_ppu_repro_hard_gate_negative_controls_ppu_only_and_tampered_evidenc
             True,
             True,
             False,
+            "stub_plugin_check",
         ),
         post_merge.NonPpuReproEvidence(
             "stub_plugin_cpu",
@@ -2522,6 +2533,7 @@ def test_non_ppu_repro_hard_gate_negative_controls_ppu_only_and_tampered_evidenc
             True,
             True,
             False,
+            "stub_plugin_check",
         ),
         post_merge.NonPpuReproEvidence(
             "stub_plugin_cpu",
@@ -2536,6 +2548,7 @@ def test_non_ppu_repro_hard_gate_negative_controls_ppu_only_and_tampered_evidenc
             True,
             True,
             False,
+            "stub_plugin_check",
         ),  # mismatched first_failing_sha
         post_merge.NonPpuReproEvidence(
             "cpu_empty_build",
@@ -2550,6 +2563,7 @@ def test_non_ppu_repro_hard_gate_negative_controls_ppu_only_and_tampered_evidenc
             True,
             False,
             False,
+            "upstream_build_source",
         ),  # wrong mode for plugin_registration
         post_merge.NonPpuReproEvidence(
             "stub_plugin_cpu",
@@ -2564,6 +2578,7 @@ def test_non_ppu_repro_hard_gate_negative_controls_ppu_only_and_tampered_evidenc
             True,
             True,
             False,
+            "stub_plugin_check",
         ),
     ]
     for idx, ev in enumerate(bad_evidences):
@@ -2600,6 +2615,7 @@ def test_non_ppu_repro_hard_gate_negative_controls_ppu_only_and_tampered_evidenc
                 "last_good_check_executed": True,
                 "first_failing_check_executed": True,
                 "infra_error": False,
+                "failure_source": "stub_plugin_check",
                 "verified": True,
             }
         ),
@@ -2788,6 +2804,7 @@ def test_upstream_reproducer_author_resolution_fenced_template_and_zero_bare_pin
         last_good_check_executed=True,
         first_failing_check_executed=True,
         infra_error=False,
+        failure_source="stub_plugin_check",
     )
     with_author = post_merge.render_upstream_reproducer(
         first_failing_sha=bad_sha,
@@ -3083,7 +3100,8 @@ def test_review_r1_p1_install_infra_and_unexecuted_stub_cannot_verify_or_classif
     assert ev_no_stub.first_failing_check_executed is False
 
     # Counterexample 3: cpu_empty_build where bad pip fails with ENOSPC / network / SIGKILL /
-    # Errno 122 (EDQUOT) / Errno 5 (EIO) / Errno 116 (ESTALE) / opaque error -> infra_error, verified=False!
+    # Errno 122 (EDQUOT) / Errno 5 (EIO) / Errno 116 (ESTALE) / pip host RuntimeError /
+    # 0-line metadata wrapper / opaque error -> infra_error, verified=False!
     for err_rc, err_msg in (
         (1, "OSError: [Errno 28] No space left on device"),
         (1, "OSError: [Errno 122] Disk quota exceeded"),
@@ -3098,6 +3116,22 @@ def test_review_r1_p1_install_infra_and_unexecuted_stub_cannot_verify_or_classif
             1,
             "ERROR: Could not install packages due to an OSError: [Errno 2] host temp missing",
         ),
+        (
+            1,
+            "Traceback (most recent call last):\n"
+            '  File "/usr/lib/python3/site-packages/pip/_vendor/rich/live.py", line 113, in start\n'
+            '  File "/usr/lib/python3.12/threading.py", line 992, in start\n'
+            "RuntimeError: can't start new thread",
+        ),
+        (
+            1,
+            "× Preparing metadata (pyproject.toml) did not run successfully.\n"
+            "│ exit code: 1\n"
+            "╰─> [0 lines of output]\n"
+            "note: This error originates from a subprocess, and is likely not a problem with pip.\n"
+            "error: metadata-generation-failed",
+        ),
+        (1, "RuntimeError: runner worker pool exhausted"),
         (1, "ConnectionError: Temporary failure in name resolution"),
         (
             1,
@@ -3117,6 +3151,7 @@ def test_review_r1_p1_install_infra_and_unexecuted_stub_cannot_verify_or_classif
         assert ev_build_infra.verified is False, f"leaked infra stderr={err_msg!r}"
         assert ev_build_infra.infra_error is True, f"not infra stderr={err_msg!r}"
         assert ev_build_infra.first_failing_phase == "infra_error"
+        assert ev_build_infra.failure_source == "infra_or_unknown"
         assert (
             post_merge.classify_failure(
                 post_merge.ProbeOutcome(
@@ -3133,12 +3168,26 @@ def test_review_r1_p1_install_infra_and_unexecuted_stub_cannot_verify_or_classif
             == "sail_internal_patch_drift"
         )
 
-    # Normal controls 1 & 2: cpu_empty_build where bad pip fails with genuine upstream build/packaging
-    # error (including FileNotFoundError [Errno 2] inside setup.py / pyproject.toml metadata prep) -> verified=True!
+    # Normal controls 1, 2 & 3: cpu_empty_build where bad pip fails with genuine upstream
+    # build/packaging error (including real PEP 517 pyproject_hooks/_in_process traceback
+    # and FileNotFoundError [Errno 2] inside setup.py / pyproject.toml metadata prep) -> verified=True!
     for build_err_msg in (
         "RuntimeError: VLLM_TARGET_DEVICE=empty unsupported in setup.py",
         "Preparing metadata (pyproject.toml) ... error\n"
         "FileNotFoundError: [Errno 2] No such file or directory: 'requirements/common.txt'",
+        "  error: subprocess-exited-with-error\n"
+        "  × Preparing metadata (pyproject.toml) did not run successfully.\n"
+        "  │ exit code: 1\n"
+        "  ╰─> [10 lines of output]\n"
+        "      Traceback (most recent call last):\n"
+        '        File "/opt/py/lib/python3.13/site-packages/pip/_vendor/pyproject_hooks/_in_process/_in_process.py", line 389, in <module>\n'
+        "          main()\n"
+        '        File "/tmp/vllm-bbbbbbbbbbbb/setup.py", line 12, in <module>\n'
+        '          raise RuntimeError("VLLM_TARGET_DEVICE=empty broken")\n'
+        "      RuntimeError: VLLM_TARGET_DEVICE=empty broken\n"
+        "      [end of output]\n"
+        "  note: This error originates from a subprocess, and is likely not a problem with pip.\n"
+        "error: metadata-generation-failed",
     ):
         fake_real_build_fail, _ = _make_fake_run(
             bad_pip_rc=1,
@@ -3159,6 +3208,7 @@ def test_review_r1_p1_install_infra_and_unexecuted_stub_cannot_verify_or_classif
         assert ev_real_build.last_good_phase == "build_import"
         assert ev_real_build.last_good_check_executed is True
         assert ev_real_build.first_failing_phase == "build_install"
+        assert ev_real_build.failure_source == "upstream_build_source"
         assert (
             post_merge.classify_failure(
                 post_merge.ProbeOutcome(
@@ -3175,8 +3225,8 @@ def test_review_r1_p1_install_infra_and_unexecuted_stub_cannot_verify_or_classif
             == "plugin_interface_break"
         )
 
-    # Counterexample 4: forged serialized JSON claiming verified=True on stub_plugin_cpu
-    # while first_failing_check_executed=False / first_failing_phase="install" -> fails closed!
+    # Counterexample 4: forged serialized JSON claiming verified=True with invalid phase,
+    # invalid/mismatched failure_source, or missing required fields -> fails closed!
     forged_payloads = [
         {
             "mode": "stub_plugin_cpu",
@@ -3190,6 +3240,7 @@ def test_review_r1_p1_install_infra_and_unexecuted_stub_cannot_verify_or_classif
             "last_good_check_executed": True,
             "first_failing_check_executed": False,
             "infra_error": False,
+            "failure_source": "stub_plugin_check",
             "verified": True,
         },
         {
@@ -3204,6 +3255,38 @@ def test_review_r1_p1_install_infra_and_unexecuted_stub_cannot_verify_or_classif
             "last_good_check_executed": True,
             "first_failing_check_executed": False,
             "infra_error": True,
+            "failure_source": "infra_or_unknown",
+            "verified": True,
+        },
+        # Forged build_install with failure_source="infra_or_unknown" must fail closed!
+        {
+            "mode": "cpu_empty_build",
+            "repro_kind": "cpu_empty_build",
+            "last_good_sha": good_sha,
+            "first_failing_sha": bad_sha,
+            "last_good_exit_code": 0,
+            "first_failing_exit_code": 1,
+            "last_good_phase": "build_import",
+            "first_failing_phase": "build_install",
+            "last_good_check_executed": True,
+            "first_failing_check_executed": False,
+            "infra_error": False,
+            "failure_source": "infra_or_unknown",
+            "verified": True,
+        },
+        # Legacy JSON missing failure_source must also fail closed!
+        {
+            "mode": "cpu_empty_build",
+            "repro_kind": "cpu_empty_build",
+            "last_good_sha": good_sha,
+            "first_failing_sha": bad_sha,
+            "last_good_exit_code": 0,
+            "first_failing_exit_code": 1,
+            "last_good_phase": "build_import",
+            "first_failing_phase": "build_install",
+            "last_good_check_executed": True,
+            "first_failing_check_executed": False,
+            "infra_error": False,
             "verified": True,
         },
         # Legacy JSON missing execution phase / check_executed fields must also fail closed!
@@ -3258,3 +3341,137 @@ def test_review_r1_p1_install_infra_and_unexecuted_stub_cannot_verify_or_classif
     assert ev_probe_no_exec.verified is False
     assert ev_probe_no_exec.last_good_check_executed is False
     assert ev_probe_no_exec.first_failing_check_executed is False
+
+    # Counterexample 6: real subprocess `probe_cmd` in cpu_empty_build mode where
+    # last_good executes check_script cleanly, while first_failing fails inside pip/host
+    # (rich/live.py thread RuntimeError, zero-line metadata wrapper, or BackendUnavailable)
+    # -> producer -> JSON -> gate -> publisher must all fail closed (zero upstream draft)!
+    good_vllm_dir = tmp_path / "fake_good_vllm"
+    (good_vllm_dir / "vllm").mkdir(parents=True, exist_ok=True)
+    (good_vllm_dir / "vllm" / "__init__.py").write_text(
+        "__version__ = '0.0.1'\n", encoding="utf-8"
+    )
+    probe_infra_snippets = [
+        (
+            "Traceback (most recent call last):\n"
+            '  File "/usr/lib/python3.11/site-packages/pip/_vendor/rich/live.py", line 108, in start\n'
+            '  File "/usr/lib/python3.11/threading.py", line 975, in start\n'
+            "RuntimeError: can't start new thread"
+        ),
+        (
+            "  × Preparing metadata (pyproject.toml) did not run successfully.\n"
+            "  │ exit code: 1\n"
+            "  ╰─> [0 lines of output]\n"
+            "error: metadata-generation-failed"
+        ),
+        (
+            "ERROR: Exception:\n"
+            '  File "/opt/py/lib/python3.13/site-packages/pip/_internal/operations/build/metadata.py", line 34\n'
+            '  File "/opt/py/lib/python3.13/site-packages/pip/_vendor/pyproject_hooks/_impl.py", line 402\n'
+            "pip._vendor.pyproject_hooks._impl.BackendUnavailable: Cannot import 'setuptools.build_meta'"
+        ),
+    ]
+    sail_sha = "c" * 40
+    for idx, err_blob in enumerate(probe_infra_snippets):
+        err_file = tmp_path / f"probe_err_{idx}.txt"
+        err_file.write_text(err_blob + "\n", encoding="utf-8")
+        ev_probe_infra = post_merge.verify_non_ppu_reproducer(
+            vllm_repo=tmp_path,
+            last_good_sha=good_sha,
+            first_failing_sha=bad_sha,
+            stage="wheel_build",
+            target_signature="VLLM_TARGET_DEVICE=empty",
+            probe_cmd=(
+                f'if [ "$CANDIDATE_SHA" = "{good_sha}" ]; then '
+                f'PYTHONPATH="{good_vllm_dir}" python3 "$STUB_CHECK_SCRIPT"; '
+                f'else cat "{err_file}" >&2; exit 1; fi'
+            ),
+        )
+        assert ev_probe_infra.verified is False, f"probe infra case {idx} verified"
+        assert ev_probe_infra.infra_error is True, f"probe infra case {idx} infra"
+        assert ev_probe_infra.first_failing_phase == "infra_error"
+        assert ev_probe_infra.failure_source == "infra_or_unknown"
+        # Round-trip through JSON -> gate -> publisher
+        roundtrip = post_merge.parse_non_ppu_repro_evidence(
+            ev_probe_infra.to_public_dict()
+        )
+        assert roundtrip is not None and roundtrip.verified is False
+        pub = post_merge.publish_sanitized_channels(
+            gear="probe",
+            status="fail",
+            sail_sha=sail_sha,
+            upstream_sha=bad_sha,
+            verified_pin=good_sha,
+            first_failing_sha=bad_sha,
+            last_good_sha=good_sha,
+            outcome=post_merge.ProbeOutcome(
+                status="fail",
+                stage="wheel_build",
+                target_signature="VLLM_TARGET_DEVICE=empty",
+                is_public_plugin_interface=True,
+                non_ppu_repro=roundtrip,
+            ),
+            public_dir=tmp_path / f"pub_infra_{idx}",
+        )
+        assert (
+            pub["public_summary"]["triage"]["classification"]
+            == "sail_internal_patch_drift"
+        )
+        assert pub["issue_payload"]["upstream_reproducer_markdown"] == ""
+
+    # Positive probe_cmd control: genuine PEP 517 _in_process.py + setup.py error -> verified!
+    pep517_err_file = tmp_path / "probe_pep517_real.txt"
+    pep517_err_file.write_text(
+        "  × Preparing metadata (pyproject.toml) did not run successfully.\n"
+        "  │ exit code: 1\n"
+        "  ╰─> [8 lines of output]\n"
+        "      Traceback (most recent call last):\n"
+        '        File "/opt/py/lib/python3.13/site-packages/pip/_vendor/pyproject_hooks/_in_process/_in_process.py", line 389, in <module>\n'
+        '        File "/tmp/vllm-bbbbbbbbbbbb/setup.py", line 10, in <module>\n'
+        "      RuntimeError: VLLM_TARGET_DEVICE=empty unsupported\n"
+        "      [end of output]\n"
+        "error: metadata-generation-failed\n",
+        encoding="utf-8",
+    )
+    ev_probe_real = post_merge.verify_non_ppu_reproducer(
+        vllm_repo=tmp_path,
+        last_good_sha=good_sha,
+        first_failing_sha=bad_sha,
+        stage="wheel_build",
+        target_signature="VLLM_TARGET_DEVICE=empty",
+        probe_cmd=(
+            f'if [ "$CANDIDATE_SHA" = "{good_sha}" ]; then '
+            f'PYTHONPATH="{good_vllm_dir}" python3 "$STUB_CHECK_SCRIPT"; '
+            f'else cat "{pep517_err_file}" >&2; exit 1; fi'
+        ),
+    )
+    assert ev_probe_real.verified is True
+    assert ev_probe_real.infra_error is False
+    assert ev_probe_real.first_failing_phase == "build_install"
+    assert ev_probe_real.failure_source == "upstream_build_source"
+    roundtrip_real = post_merge.parse_non_ppu_repro_evidence(
+        ev_probe_real.to_public_dict()
+    )
+    assert roundtrip_real is not None and roundtrip_real.verified is True
+    pub_real = post_merge.publish_sanitized_channels(
+        gear="probe",
+        status="fail",
+        sail_sha=sail_sha,
+        upstream_sha=bad_sha,
+        verified_pin=good_sha,
+        first_failing_sha=bad_sha,
+        last_good_sha=good_sha,
+        outcome=post_merge.ProbeOutcome(
+            status="fail",
+            stage="wheel_build",
+            target_signature="VLLM_TARGET_DEVICE=empty",
+            is_public_plugin_interface=True,
+            non_ppu_repro=roundtrip_real,
+        ),
+        public_dir=tmp_path / "pub_real_pep517",
+    )
+    assert (
+        pub_real["public_summary"]["triage"]["classification"]
+        == "plugin_interface_break"
+    )
+    assert pub_real["issue_payload"]["upstream_reproducer_markdown"] != ""
