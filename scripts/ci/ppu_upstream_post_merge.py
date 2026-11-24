@@ -408,9 +408,10 @@ class NonPpuReproEvidence:
     first_failing_check_executed: bool = False
     infra_error: bool = False
     failure_source: str = "none"
+    observed_signature: str = ""
 
     def to_public_dict(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "mode": self.mode,
             "repro_kind": self.repro_kind,
             "last_good_sha": self.last_good_sha,
@@ -425,6 +426,11 @@ class NonPpuReproEvidence:
             "failure_source": self.failure_source,
             "verified": bool(self.verified),
         }
+        if self.observed_signature:
+            out["observed_signature"] = _sanitize_symbol(
+                self.observed_signature, "VLLM_TARGET_DEVICE=empty"
+            )
+        return out
 
 
 @dataclass(frozen=True)
@@ -2221,6 +2227,9 @@ def parse_non_ppu_repro_evidence(data: Any) -> NonPpuReproEvidence | None:
     infra_err = data.get("infra_error")
     failure_source = data.get("failure_source")
     raw_verified = data.get("verified")
+    raw_obs_sig = data.get("observed_signature", "")
+    if raw_obs_sig is None:
+        raw_obs_sig = ""
     if (
         not isinstance(mode, str)
         or not isinstance(repro_kind, str)
@@ -2229,6 +2238,7 @@ def parse_non_ppu_repro_evidence(data: Any) -> NonPpuReproEvidence | None:
         or not isinstance(good_phase, str)
         or not isinstance(bad_phase, str)
         or not isinstance(failure_source, str)
+        or not isinstance(raw_obs_sig, str)
         or good_phase not in VALID_REPRO_PHASES
         or bad_phase not in VALID_REPRO_PHASES
         or failure_source not in VALID_REPRO_FAILURE_SOURCES
@@ -2240,6 +2250,11 @@ def parse_non_ppu_repro_evidence(data: Any) -> NonPpuReproEvidence | None:
         or type(raw_verified) is not bool
     ):
         return None
+    safe_obs_sig = (
+        _sanitize_symbol(raw_obs_sig, "VLLM_TARGET_DEVICE=empty")
+        if raw_obs_sig.strip()
+        else ""
+    )
     candidate = NonPpuReproEvidence(
         mode=mode,
         repro_kind=repro_kind,
@@ -2254,6 +2269,7 @@ def parse_non_ppu_repro_evidence(data: Any) -> NonPpuReproEvidence | None:
         first_failing_check_executed=bad_exec,
         infra_error=infra_err,
         failure_source=failure_source,
+        observed_signature=safe_obs_sig,
     )
     return NonPpuReproEvidence(
         mode=candidate.mode,
@@ -2269,6 +2285,7 @@ def parse_non_ppu_repro_evidence(data: Any) -> NonPpuReproEvidence | None:
         first_failing_check_executed=candidate.first_failing_check_executed,
         infra_error=candidate.infra_error,
         failure_source=candidate.failure_source,
+        observed_signature=candidate.observed_signature,
     )
 
 
@@ -2617,8 +2634,8 @@ def verify_non_ppu_reproducer(
 
     def _run_one(
         sha: str, workdir: Path, stub_site: Path, check_script: Path
-    ) -> tuple[int, str, str, bool, bool]:
-        """Return ``(exit_code, phase, failure_source, check_executed, is_infra_error)``."""
+    ) -> tuple[int, str, str, bool, bool, str]:
+        """Return ``(exit_code, phase, failure_source, check_executed, is_infra_error, observed_sig)``."""
         base_env = {
             k: v for k, v in os.environ.items() if k not in _CLEAN_BUILD_ENV_DROP_KEYS
         }
@@ -2636,6 +2653,8 @@ def verify_non_ppu_reproducer(
         if probe_cmd.strip():
             marker_path = workdir / f"check-exec-{sha[:12]}.marker"
             marker_path.unlink(missing_ok=True)
+            probe_json = workdir / f"repro-probe-{sha[:12]}.json"
+            probe_json.unlink(missing_ok=True)
             runner_script = workdir / f"run-check-{sha[:12]}.py"
             runner_script.write_text(
                 "import pathlib, runpy\n"
@@ -2644,6 +2663,7 @@ def verify_non_ppu_reproducer(
                 encoding="utf-8",
             )
             base_env["STUB_CHECK_SCRIPT"] = str(runner_script)
+            base_env["PROBE_RESULT_JSON"] = str(probe_json)
             try:
                 proc = subprocess.run(
                     ["bash", "-c", probe_cmd],
@@ -2659,8 +2679,33 @@ def verify_non_ppu_reproducer(
                     "infra_or_unknown",
                     marker_path.is_file(),
                     True,
+                    "",
                 )
             executed = marker_path.is_file()
+            explicit_sig = ""
+            if probe_json.is_file():
+                try:
+                    pdata = json.loads(probe_json.read_text(encoding="utf-8"))
+                    if isinstance(pdata, dict) and isinstance(
+                        pdata.get("target_signature"), str
+                    ):
+                        explicit_sig = pdata["target_signature"].strip()
+                except (OSError, ValueError):
+                    explicit_sig = ""
+                probe_json.unlink(missing_ok=True)
+            combined_out = f"{proc.stdout}\n{proc.stderr}"
+            inferred_build_sig = explicit_sig or (
+                "rust_frontend_build"
+                if (
+                    _RUSTC_REPO_SPAN_RE.search(combined_out) is not None
+                    or (
+                        executed
+                        and proc.returncode != 0
+                        and "required local Rust" in combined_out
+                    )
+                )
+                else "VLLM_TARGET_DEVICE=empty"
+            )
             if proc.returncode != 0 and _is_infra_process_failure(
                 proc.returncode, proc.stderr, proc.stdout
             ):
@@ -2670,24 +2715,46 @@ def verify_non_ppu_reproducer(
                     "infra_or_unknown",
                     executed,
                     True,
+                    "",
                 )
             if mode == "stub_plugin_cpu":
                 if executed:
                     src = "none" if proc.returncode == 0 else "stub_plugin_check"
-                    return proc.returncode, "stub_check", src, True, False
+                    return (
+                        proc.returncode,
+                        "stub_check",
+                        src,
+                        True,
+                        False,
+                        explicit_sig if proc.returncode != 0 else "",
+                    )
                 src = "none" if proc.returncode == 0 else "infra_or_unknown"
-                return proc.returncode, "install", src, False, False
+                return proc.returncode, "install", src, False, False, ""
             if executed:
                 src = "none" if proc.returncode == 0 else "upstream_import_check"
-                return proc.returncode, "build_import", src, True, False
+                return (
+                    proc.returncode,
+                    "build_import",
+                    src,
+                    True,
+                    False,
+                    inferred_build_sig if proc.returncode != 0 else "",
+                )
             if proc.returncode != 0:
                 phase, src, is_infra = _classify_install_failure(
                     proc.returncode, proc.stderr, proc.stdout, mode=mode
                 )
-                return proc.returncode, phase, src, False, is_infra
-            return 0, "install", "none", False, False
+                return (
+                    proc.returncode,
+                    phase,
+                    src,
+                    False,
+                    is_infra,
+                    "" if is_infra else inferred_build_sig,
+                )
+            return 0, "install", "none", False, False, ""
 
-        rc, phase, src, executed, is_infra, _sig = _execute_vllm_worktree_build(
+        rc, phase, src, executed, is_infra, obs_sig = _execute_vllm_worktree_build(
             vllm_repo=vllm_repo,
             sha=sha,
             workdir=workdir,
@@ -2699,12 +2766,19 @@ def verify_non_ppu_reproducer(
             python_exe=python_exe,
             timeout_sec=timeout_sec,
         )
-        return rc, phase, src, executed, is_infra
+        return (
+            rc,
+            phase,
+            src,
+            executed,
+            is_infra,
+            "" if (rc == 0 or is_infra) else obs_sig,
+        )
 
     with tempfile.TemporaryDirectory(prefix="non-ppu-repro-") as td:
         workdir = Path(td)
         stub_site, check_script = materialize_stub_plugin(kind, workdir)
-        good_rc, good_phase, good_src, good_exec, good_infra = _run_one(
+        good_rc, good_phase, good_src, good_exec, good_infra, _good_sig = _run_one(
             good, workdir, stub_site, check_script
         )
         if good_infra or good_rc != 0 or not good_exec:
@@ -2722,12 +2796,18 @@ def verify_non_ppu_reproducer(
                 first_failing_check_executed=False,
                 infra_error=good_infra,
                 failure_source=good_src if good_rc != 0 else "infra_or_unknown",
+                observed_signature="",
             )
-        bad_rc, bad_phase, bad_src, bad_exec, bad_infra = _run_one(
+        bad_rc, bad_phase, bad_src, bad_exec, bad_infra, bad_sig = _run_one(
             bad, workdir, stub_site, check_script
         )
 
     any_infra = good_infra or bad_infra
+    eff_obs_sig = (
+        _sanitize_symbol(bad_sig, "VLLM_TARGET_DEVICE=empty")
+        if (not any_infra and bad_rc > 0 and bad_sig.strip())
+        else ""
+    )
     raw_evidence = NonPpuReproEvidence(
         mode=mode,
         repro_kind=kind,
@@ -2742,6 +2822,7 @@ def verify_non_ppu_reproducer(
         first_failing_check_executed=bad_exec,
         infra_error=any_infra,
         failure_source="infra_or_unknown" if any_infra else bad_src,
+        observed_signature=eff_obs_sig,
     )
     return NonPpuReproEvidence(
         mode=raw_evidence.mode,
@@ -2763,6 +2844,7 @@ def verify_non_ppu_reproducer(
         first_failing_check_executed=raw_evidence.first_failing_check_executed,
         infra_error=raw_evidence.infra_error,
         failure_source=raw_evidence.failure_source,
+        observed_signature=raw_evidence.observed_signature,
     )
 
 
@@ -2846,6 +2928,16 @@ def classify_failure(
         first_failing_sha=first_failing_sha,
         require_shas=require_shas,
     )
+    if (
+        repro_verified
+        and stage == "wheel_build"
+        and effective_repro is not None
+        and effective_repro.observed_signature
+        in ("VLLM_TARGET_DEVICE=empty", "rust_frontend_build")
+        and sig in ("VLLM_TARGET_DEVICE=empty", "rust_frontend_build")
+        and effective_repro.observed_signature != sig
+    ):
+        repro_verified = False
 
     if is_public_candidate and repro_verified and effective_repro is not None:
         return {
@@ -3973,11 +4065,20 @@ def run_source_only_build_triage(
                     out = ProbeOutcome(status="pass", detail_code="pass")
                     wheel_cache[candidate_sha] = out
                     return out
+                combined_probe_out = f"{proc.stdout}\n{proc.stderr}"
+                inferred_probe_sig = (
+                    "rust_frontend_build"
+                    if (
+                        _RUSTC_REPO_SPAN_RE.search(combined_probe_out) is not None
+                        or (executed and "required local Rust" in combined_probe_out)
+                    )
+                    else "VLLM_TARGET_DEVICE=empty"
+                )
                 if _is_infra_process_failure(proc.returncode, proc.stderr, proc.stdout):
                     out = ProbeOutcome(
                         status="infra_error",
                         stage="wheel_build",
-                        target_signature="VLLM_TARGET_DEVICE=empty",
+                        target_signature=inferred_probe_sig,
                         detail_code="infra_error",
                     )
                     wheel_cache[candidate_sha] = out
@@ -3986,7 +4087,7 @@ def run_source_only_build_triage(
                     out = ProbeOutcome(
                         status="fail",
                         stage="wheel_build",
-                        target_signature="VLLM_TARGET_DEVICE=empty",
+                        target_signature=inferred_probe_sig,
                         is_public_plugin_interface=True,
                         detail_code="build_import",
                     )
@@ -4002,14 +4103,14 @@ def run_source_only_build_triage(
                     out = ProbeOutcome(
                         status="infra_error",
                         stage="wheel_build",
-                        target_signature="VLLM_TARGET_DEVICE=empty",
+                        target_signature=inferred_probe_sig,
                         detail_code="infra_error",
                     )
                 else:
                     out = ProbeOutcome(
                         status="fail",
                         stage="wheel_build",
-                        target_signature="VLLM_TARGET_DEVICE=empty",
+                        target_signature=inferred_probe_sig,
                         is_public_plugin_interface=True,
                         detail_code=phase,
                     )
@@ -4374,6 +4475,14 @@ def run_source_only_build_triage(
                 and ev.first_failing_phase != red_outcome.detail_code
             ):
                 return False
+            expected_sig = _sanitize_symbol(
+                red_outcome.target_signature, "VLLM_TARGET_DEVICE=empty"
+            )
+            if red_outcome.stage == "wheel_build":
+                if not ev.observed_signature or ev.observed_signature != expected_sig:
+                    return False
+            elif ev.observed_signature and ev.observed_signature != expected_sig:
+                return False
             return True
 
         final_cpu_status = "fail"
@@ -4442,6 +4551,7 @@ def run_source_only_build_triage(
                     first_failing_check_executed=repro_ev.first_failing_check_executed,
                     infra_error=repro_ev.infra_error,
                     failure_source=repro_ev.failure_source,
+                    observed_signature=repro_ev.observed_signature,
                 )
             repro_dict = repro_ev.to_public_dict()
             _write_sanitized(repro_json_path, repro_dict)

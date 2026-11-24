@@ -2280,7 +2280,7 @@ def test_non_ppu_repro_hard_gate_real_stub_plugins_all_five_kinds(
         if expected_mode == "cpu_empty_build"
         else "stub_plugin_check"
     )
-    assert repro_data == {
+    expected_repro = {
         "failure_source": expected_source,
         "first_failing_check_executed": True,
         "first_failing_exit_code": 1,
@@ -2295,6 +2295,9 @@ def test_non_ppu_repro_hard_gate_real_stub_plugins_all_five_kinds(
         "repro_kind": expected_kind,
         "verified": True,
     }
+    if expected_mode == "cpu_empty_build":
+        expected_repro["observed_signature"] = "VLLM_TARGET_DEVICE=empty"
+    assert repro_data == expected_repro
 
     # Feed verified receipt + commit author metadata into `publish` CLI end-to-end.
     commit_json = tmp_path / f"commit-{expected_kind}.json"
@@ -4502,3 +4505,93 @@ def test_review_pr374_rereview_mandatory_rust_and_target_matched_bisect(
     assert b1_sum["triage"]["non_ppu_repro_verified"] is False
     assert b1_iss["should_file_sail_issue"] is False
     assert b1_iss["upstream_reproducer_markdown"] == ""
+
+    # --- 2d. [R2 B1-sig] Same phase (`build_install`) with different signature on re-verification
+    #         (both primary boundary and `boundary_recheck`, plus `classify_failure` consumer):
+    #         must reject as `unverified_target_boundary` (`verified=False`)! ---
+    sig_counter = tmp_path / "sig_counter.txt"
+    sig_counter.write_text("0\n", encoding="utf-8")
+    # 5-commit non-monotonic history: [c1(fail), c2(fail), c3(pass), c4(fail=target)]
+    # Binary search on [c1, c2, c3, c4] picks mid=1 (c2 fail) -> mid=0 (c1 fail) -> chosen_bad=c1 != target(c4),
+    # exercising BOTH primary verification on (c0, c1) AND `boundary_recheck` on (c3, c4)!
+    nm_repo = tmp_path / "nm-sig-repo"
+    commit_nm = _init_upstream_repo(nm_repo)
+    (nm_repo / "setup.py").write_text("", encoding="utf-8")
+    nm_c0 = commit_nm("c0: control")
+    nm_shas = [nm_c0]
+    for idx in range(1, 5):
+        (nm_repo / "README.md").write_text(f"nm {idx}\n", encoding="utf-8")
+        nm_shas.append(commit_nm(f"c{idx}"))
+
+    # During triage probes (`PROBE_RESULT_JSON` without `REPRO_KIND`), c1/c2/c4 fail as `rust_frontend_build`
+    # and c0/c3 pass. During `verify_non_ppu_reproducer` (`REPRO_KIND=cpu_empty_build`), c1 and c4 fail in the
+    # SAME phase (`build_install`) with `VLLM_TARGET_DEVICE=empty` (setup.py RuntimeError).
+    nm_probe_cmd = (
+        "set -euo pipefail\n"
+        f'if [ "$CANDIDATE_SHA" = "{nm_shas[0]}" ] || [ "$CANDIDATE_SHA" = "{nm_shas[3]}" ]; then\n'
+        f'  PYTHONPATH="{nm_repo}" "{sys.executable}" "$STUB_CHECK_SCRIPT"\n'
+        "  exit 0\n"
+        "fi\n"
+        'if [ "${REPRO_KIND:-}" = "cpu_empty_build" ]; then\n'
+        "  cat >&2 <<'EOF'\n"
+        "Traceback (most recent call last):\n"
+        '  File "/tmp/vllm/setup.py", line 4, in <module>\n'
+        '    raise RuntimeError("different build_install signature")\n'
+        "RuntimeError: different build_install signature\n"
+        "EOF\n"
+        "  exit 1\n"
+        "fi\n"
+        "cat >&2 <<'EOF'\n"
+        "error[E0425]: cannot find value `x`\n"
+        "  --> rust/src/cmd/src/main.rs:9:5\n"
+        "EOF\n"
+        "exit 101\n"
+    )
+    nm_out = tmp_path / "nm-sig-out"
+    res_nm = post_merge.run_source_only_build_triage(
+        vllm_repo=nm_repo,
+        sail_root=sail_dir,
+        target_sha=nm_shas[4],
+        verified_pin=nm_shas[0],
+        last_green_sha=nm_shas[0],
+        output_dir=nm_out,
+        probe_cmd=nm_probe_cmd,
+    )
+    assert res_nm["bisect"]["bisect_status"] == "unverified_target_boundary"
+    assert res_nm["bisect"]["first_failing_sha"] == ""
+    assert res_nm["bisect"]["target_signature"] == "rust_frontend_build"
+    assert res_nm["non_ppu_repro"]["verified"] is False
+    assert res_nm["non_ppu_repro"]["observed_signature"] == "VLLM_TARGET_DEVICE=empty"
+    assert any(h["role"] == "boundary_recheck" for h in res_nm["bisect"]["history"])
+
+    # Consumer `classify_failure` also rejects mismatched canonical wheel_build `observed_signature`
+    mismatched_ev = post_merge.NonPpuReproEvidence(
+        mode="cpu_empty_build",
+        repro_kind="cpu_empty_build",
+        last_good_sha=nm_shas[3],
+        first_failing_sha=nm_shas[4],
+        last_good_exit_code=0,
+        first_failing_exit_code=1,
+        verified=True,
+        last_good_phase="build_import",
+        first_failing_phase="build_install",
+        last_good_check_executed=True,
+        first_failing_check_executed=False,
+        infra_error=False,
+        failure_source="upstream_build_source",
+        observed_signature="VLLM_TARGET_DEVICE=empty",
+    )
+    mismatch_triage = post_merge.classify_failure(
+        post_merge.ProbeOutcome(
+            status="fail",
+            stage="wheel_build",
+            target_signature="rust_frontend_build",
+            is_public_plugin_interface=True,
+            non_ppu_repro=mismatched_ev,
+        ),
+        last_good_sha=nm_shas[3],
+        first_failing_sha=nm_shas[4],
+        require_shas=True,
+    )
+    assert mismatch_triage["classification"] == "sail_internal_patch_drift"
+    assert mismatch_triage["non_ppu_repro_verified"] is False
