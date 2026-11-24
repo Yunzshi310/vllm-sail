@@ -2082,20 +2082,26 @@ def _make_mock_vllm_git_repo(repo_dir: Path) -> dict[str, str]:
             ),
             "vllm/model_executor/__init__.py": "",
             "vllm/model_executor/custom_op.py": (
+                "op_registry = {}\n"
+                "op_registry_oot = {}\n\n\n"
                 "class CustomOp:\n"
-                "    op_registry = {}\n"
-                "    op_registry_oot = {}\n\n"
+                "    def __new__(cls, *args, **kwargs):\n"
+                "        op_name = cls.__name__\n"
+                "        target = op_registry_oot.get(op_name, cls)\n"
+                "        return super().__new__(target)\n\n"
                 "    @classmethod\n"
-                "    def register(cls, name: str):\n"
+                "    def register(cls, name: str, dynamic_arg_dims=None):\n"
                 "        def _dec(sub):\n"
-                "            cls.op_registry[name] = sub\n"
+                "            sub.name = name\n"
+                "            op_registry[name] = sub\n"
                 "            return sub\n"
                 "        return _dec\n\n"
                 "    @classmethod\n"
                 "    def register_oot(cls, _decorated_op_cls=None, name: str | None = None):\n"
                 "        def _dec(sub):\n"
-                "            key = name or sub.__name__\n"
-                "            cls.op_registry_oot[key] = sub\n"
+                "            reg_name = name if name is not None else cls.__name__\n"
+                "            sub.name = reg_name\n"
+                "            op_registry_oot[reg_name] = sub\n"
                 "            return sub\n"
                 "        return _dec if _decorated_op_cls is None else _dec(_decorated_op_cls)\n"
             ),
@@ -2151,13 +2157,16 @@ def _make_mock_vllm_git_repo(repo_dir: Path) -> dict[str, str]:
         ),
         "register_oot": (
             "vllm/model_executor/custom_op.py",
+            "op_registry = {}\n"
+            "op_registry_oot = {}\n\n\n"
             "class CustomOp:\n"
-            "    op_registry = {}\n"
-            "    op_registry_oot = {}\n"
+            "    def __new__(cls, *args, **kwargs):\n"
+            "        return super().__new__(cls)\n\n"
             "    @classmethod\n"
-            "    def register(cls, name: str):\n"
+            "    def register(cls, name: str, dynamic_arg_dims=None):\n"
             "        def _dec(sub):\n"
-            "            cls.op_registry[name] = sub\n"
+            "            sub.name = name\n"
+            "            op_registry[name] = sub\n"
             "            return sub\n"
             "        return _dec\n",
         ),
@@ -3661,3 +3670,420 @@ def test_review_r1_p1_install_infra_and_unexecuted_stub_cannot_verify_or_classif
             == "plugin_interface_break"
         )
         assert pub_st["issue_payload"]["upstream_reproducer_markdown"] != ""
+
+
+def test_review_pr374_four_inline_comments_end_to_end(tmp_path, monkeypatch):
+    """Regression coverage for PR #374 review comments (3 P1s + 1 P2)."""
+    import traceback
+
+    git_env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "Test",
+        "GIT_AUTHOR_EMAIL": "test@example.com",
+        "GIT_COMMITTER_NAME": "Test",
+        "GIT_COMMITTER_EMAIL": "test@example.com",
+    }
+
+    # --- 1. [P1] Rename from runtime path (`vllm/v1/worker/`) into `examples/` must NOT skip PPU ---
+    wf_raw = (REPO_ROOT / ".github/workflows/upstream-canary.yaml").read_text(
+        encoding="utf-8"
+    )
+    assert "diff --no-renames --name-only" in wf_raw
+
+    ren_repo = tmp_path / "rename-repo"
+    ren_repo.mkdir()
+    subprocess.run(["git", "-C", str(ren_repo), "init", "-q"], check=True)
+    worker_file = ren_repo / "vllm" / "v1" / "worker" / "gpu_probe.py"
+    worker_file.parent.mkdir(parents=True, exist_ok=True)
+    worker_file.write_text("def run_worker():\n    return 1\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(ren_repo), "add", "-A"], check=True)
+    subprocess.run(
+        ["git", "-C", str(ren_repo), "commit", "-qm", "base"],
+        check=True,
+        env=git_env,
+    )
+    c_base = subprocess.check_output(
+        ["git", "-C", str(ren_repo), "rev-parse", "HEAD"], text=True
+    ).strip()
+
+    dst_file = ren_repo / "examples" / "gpu_probe.py"
+    dst_file.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(ren_repo),
+            "mv",
+            "vllm/v1/worker/gpu_probe.py",
+            "examples/gpu_probe.py",
+        ],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(ren_repo), "commit", "-qm", "move worker to examples"],
+        check=True,
+        env=git_env,
+    )
+    c_moved = subprocess.check_output(
+        ["git", "-C", str(ren_repo), "rev-parse", "HEAD"], text=True
+    ).strip()
+
+    no_rename_lines = subprocess.check_output(
+        [
+            "git",
+            "-C",
+            str(ren_repo),
+            "diff",
+            "--no-renames",
+            "--name-only",
+            c_base,
+            c_moved,
+        ],
+        text=True,
+    ).splitlines()
+    assert "vllm/v1/worker/gpu_probe.py" in no_rename_lines
+    assert "examples/gpu_probe.py" in no_rename_lines
+    assert post_merge.should_skip_ppu_for_paths(no_rename_lines) is False
+
+    # Defense-in-depth: even `--name-status` (`R100\tvllm/v1/worker/...\texamples/...`) requires PPU!
+    name_status_lines = subprocess.check_output(
+        ["git", "-C", str(ren_repo), "diff", "--name-status", c_base, c_moved],
+        text=True,
+    ).splitlines()
+    assert post_merge.should_skip_ppu_for_paths(name_status_lines) is False
+
+    dec_moved = post_merge.route_three_gears(
+        ls_remote_data={"main_sha": c_moved, "tags": {}},
+        verified_pin=c_base,
+        release_baseline_tag="v0.33.0",
+        requested_gear="probe",
+        cursor=None,
+        changed_paths_since_ppu=no_rename_lines,
+        changed_files_base_sha=c_base,
+    )
+    assert dec_moved["run_ppu"] is True
+    assert dec_moved["ppu_skip_reason"] == "none"
+
+    # CPU-only pass without PPU execution on a renamed runtime file must NOT qualify for daily_pin_bump!
+    cur_cpu_only = post_merge.advance_cursor(
+        None,
+        verified_pin=c_base,
+        selected_gear="probe",
+        target_sha=c_moved,
+        status="deferred",
+        cpu_status="pass",
+        ppu_status="skipped",
+        ppu_skip_reason="deferred_for_sail_pr_ci",
+    )
+    assert (
+        post_merge.route_three_gears(
+            ls_remote_data={"main_sha": c_moved, "tags": {}},
+            verified_pin=c_base,
+            release_baseline_tag="v0.33.0",
+            requested_gear="daily_pin_bump",
+            cursor=cur_cpu_only,
+        )["target_sha"]
+        == ""
+    )
+    # Normal control: rename strictly between two allowlisted paths still skips PPU.
+    assert (
+        post_merge.should_skip_ppu_for_paths(["R100\tdocs/old.md\texamples/demo.py"])
+        is True
+    )
+
+    # --- 2. [P1] Initial wheel-build failure runs source-only control-first triage & bisection ---
+    assert "source-build-triage" in wf_raw
+    assert "if: needs.build.result == 'success'" in wf_raw
+
+    # 2a. Untriaged/skipped fallback (exact replay from review): must be infra_error, NOT file SAIL issue!
+    untriaged_out = post_merge.evaluate_workflow_outcome(
+        selected_gear="probe",
+        target_sha=c_moved,
+        run_cpu=True,
+        run_ppu=True,
+        ppu_skip_reason="none",
+        build_result="failure",
+        cpu_result="skipped",
+        ppu_smoke_result="skipped",
+    )
+    untriaged_dir = tmp_path / "pub-untriaged-build"
+    assert (
+        post_merge.main(
+            [
+                "publish",
+                "--gear",
+                "probe",
+                "--status",
+                untriaged_out["status"],
+                "--sail-sha",
+                _sha(950),
+                "--upstream-sha",
+                c_moved,
+                "--cpu-status",
+                untriaged_out["cpu_status"],
+                "--ppu-status",
+                untriaged_out["ppu_status"],
+                "--ppu-skip-reason",
+                untriaged_out["ppu_skip_reason"],
+                "--failure-stage",
+                untriaged_out["failure_stage"],
+                "--public-dir",
+                str(untriaged_dir),
+            ]
+        )
+        == 0
+    )
+    untriaged_sum = json.loads(
+        (untriaged_dir / "public-summary.json").read_text(encoding="utf-8")
+    )
+    untriaged_iss = json.loads(
+        (untriaged_dir / "issue-payload.json").read_text(encoding="utf-8")
+    )
+    assert untriaged_sum["status"] == "infra_error"
+    assert untriaged_sum["triage"]["classification"] == "infra_error"
+    assert untriaged_iss["should_file_sail_issue"] is False
+
+    # Build a 4-commit upstream repo where commits[2] breaks VLLM_TARGET_DEVICE=empty setup.py
+    src_repo = tmp_path / "src-bisect-repo"
+    src_repo.mkdir()
+    subprocess.run(["git", "-C", str(src_repo), "init", "-q"], check=True)
+    (src_repo / "vllm").mkdir()
+    (src_repo / "vllm" / "__init__.py").write_text(
+        "__version__ = '0.1'\n", encoding="utf-8"
+    )
+    (src_repo / "setup.py").write_text("# ok\n", encoding="utf-8")
+    src_shas: list[str] = []
+    for idx in range(5):
+        (src_repo / "README.md").write_text(f"step {idx}\n", encoding="utf-8")
+        if idx == 3:
+            (src_repo / "setup.py").write_text(
+                'raise RuntimeError("VLLM_TARGET_DEVICE=empty broken")\n',
+                encoding="utf-8",
+            )
+        subprocess.run(["git", "-C", str(src_repo), "add", "-A"], check=True)
+        subprocess.run(
+            ["git", "-C", str(src_repo), "commit", "-qm", f"c{idx}"],
+            check=True,
+            env=git_env,
+        )
+        src_shas.append(
+            subprocess.check_output(
+                ["git", "-C", str(src_repo), "rev-parse", "HEAD"], text=True
+            ).strip()
+        )
+    pin_file = tmp_path / "verified.commit"
+    pin_file.write_text(src_shas[0] + "\n", encoding="utf-8")
+
+    # 2b. Control-first failure -> baseline_control_failed -> infra_error, zero issues!
+    ctrl_fail_dir = tmp_path / "sbt-ctrl-fail"
+    assert (
+        post_merge.main(
+            [
+                "source-build-triage",
+                "--vllm-repo",
+                str(src_repo),
+                "--sail-root",
+                str(REPO_ROOT),
+                "--target-sha",
+                src_shas[4],
+                "--last-green-sha",
+                src_shas[0],
+                "--verified-pin-file",
+                str(pin_file),
+                "--probe-cmd",
+                "echo 'Connection reset by peer' >&2; exit 1",
+                "--output-dir",
+                str(ctrl_fail_dir),
+            ]
+        )
+        == 0
+    )
+    pub_ctrl_fail = tmp_path / "pub-sbt-ctrl-fail"
+    assert (
+        post_merge.main(
+            [
+                "publish",
+                "--gear",
+                "probe",
+                "--status",
+                "fail",
+                "--sail-sha",
+                _sha(951),
+                "--upstream-sha",
+                src_shas[4],
+                "--verified-pin-file",
+                str(pin_file),
+                "--failure-stage",
+                "wheel_build",
+                "--cpu-result-json",
+                str(ctrl_fail_dir / "cpu-result.json"),
+                "--bisect-result-json",
+                str(ctrl_fail_dir / "bisect-result.json"),
+                "--public-dir",
+                str(pub_ctrl_fail),
+            ]
+        )
+        == 0
+    )
+    cf_sum = json.loads(
+        (pub_ctrl_fail / "public-summary.json").read_text(encoding="utf-8")
+    )
+    cf_iss = json.loads(
+        (pub_ctrl_fail / "issue-payload.json").read_text(encoding="utf-8")
+    )
+    assert cf_sum["status"] == "infra_error"
+    assert cf_sum["triage"]["classification"] == "infra_error"
+    assert cf_iss["should_file_sail_issue"] is False
+
+    # 2c. Genuine upstream VLLM_TARGET_DEVICE=empty build break at src_shas[3] -> converges & verifies!
+    sbt_probe_cmd = (
+        "set -euo pipefail\n"
+        'wt="$(mktemp -d)"\n'
+        'trap \'git -C "$VLLM_REPO" worktree remove --force "$wt" >/dev/null 2>&1 || rm -rf "$wt"\' EXIT\n'
+        'git -C "$VLLM_REPO" worktree add --quiet --detach "$wt" "$CANDIDATE_SHA"\n'
+        f'"{sys.executable}" "$wt/setup.py"\n'
+        f'PYTHONPATH="$wt" "{sys.executable}" "$STUB_CHECK_SCRIPT"\n'
+    )
+    real_sbt_dir = tmp_path / "sbt-converged"
+    assert (
+        post_merge.main(
+            [
+                "source-build-triage",
+                "--vllm-repo",
+                str(src_repo),
+                "--sail-root",
+                str(REPO_ROOT),
+                "--target-sha",
+                src_shas[4],
+                "--last-green-sha",
+                src_shas[0],
+                "--verified-pin-file",
+                str(pin_file),
+                "--probe-cmd",
+                sbt_probe_cmd,
+                "--output-dir",
+                str(real_sbt_dir),
+            ]
+        )
+        == 0
+    )
+    pub_sbt_ok = tmp_path / "pub-sbt-converged"
+    assert (
+        post_merge.main(
+            [
+                "publish",
+                "--gear",
+                "probe",
+                "--status",
+                "fail",
+                "--sail-sha",
+                _sha(952),
+                "--upstream-sha",
+                src_shas[4],
+                "--verified-pin-file",
+                str(pin_file),
+                "--failure-stage",
+                "wheel_build",
+                "--first-failing-author",
+                "kevin-luu",
+                "--cpu-result-json",
+                str(real_sbt_dir / "cpu-result.json"),
+                "--bisect-result-json",
+                str(real_sbt_dir / "bisect-result.json"),
+                "--non-ppu-repro-json",
+                str(real_sbt_dir / "non-ppu-repro.json"),
+                "--public-dir",
+                str(pub_sbt_ok),
+            ]
+        )
+        == 0
+    )
+    ok_sum = json.loads(
+        (pub_sbt_ok / "public-summary.json").read_text(encoding="utf-8")
+    )
+    ok_iss = json.loads((pub_sbt_ok / "issue-payload.json").read_text(encoding="utf-8"))
+    assert ok_sum["status"] == "fail"
+    assert ok_sum["bisect"]["first_failing_sha"] == src_shas[3]
+    assert ok_sum["bisect"]["last_good_sha"] == src_shas[2]
+    assert ok_sum["bisect"]["steps"] > 0
+    assert ok_sum["triage"]["classification"] == "plugin_interface_break"
+    assert ok_sum["triage"]["non_ppu_repro_verified"] is True
+    assert ok_iss["should_file_sail_issue"] is False
+    assert "(cc @kevin-luu)" in ok_iss["upstream_reproducer_markdown"]
+
+    # --- 3. [P1] CustomOp.register_oot against module-level `op_registry_oot` (no class attr!) ---
+    inline_repo = tmp_path / "custom-op-repo"
+    inline_shas = _make_mock_vllm_git_repo(inline_repo)
+    custom_op_probe = (
+        "set -euo pipefail\n"
+        'wt="$(mktemp -d)"\n'
+        'trap \'git -C "$VLLM_REPO" worktree remove --force "$wt" >/dev/null 2>&1 || rm -rf "$wt"\' EXIT\n'
+        'git -C "$VLLM_REPO" worktree add --quiet --detach "$wt" "$CANDIDATE_SHA"\n'
+        f'PYTHONPATH="$STUB_SITE_DIR:$wt" "{sys.executable}" -c '
+        "\"from vllm.model_executor.custom_op import CustomOp; assert not hasattr(CustomOp, 'op_registry_oot')\"\n"
+        f'PYTHONPATH="$STUB_SITE_DIR:$wt" "{sys.executable}" "$STUB_CHECK_SCRIPT"\n'
+    )
+    ev_reg_oot = post_merge.verify_non_ppu_reproducer(
+        vllm_repo=inline_repo,
+        last_good_sha=inline_shas["good"],
+        first_failing_sha=inline_shas["register_oot"],
+        stage="plugin_registration",
+        target_signature="CustomOp.register_oot",
+        probe_cmd=custom_op_probe,
+    )
+    assert ev_reg_oot.verified is True
+    assert ev_reg_oot.last_good_exit_code == 0
+    assert ev_reg_oot.first_failing_exit_code != 0
+    assert ev_reg_oot.failure_source == "stub_plugin_check"
+
+    # --- 4. [P2] Mixed tree-formatted `ExceptionGroup` alongside valid setup.py traceback fails closed ---
+    if sys.version_info >= (3, 11):
+        try:
+            raise ExceptionGroup(  # noqa: F821
+                "runner worker pool exhausted", [Exception("runner worker failed")]
+            )
+        except BaseException as eg:
+            eg_text = "".join(traceback.format_exception(eg)).rstrip()
+    else:
+        eg_text = (
+            "  + Exception Group Traceback (most recent call last):\n"
+            '  |   File "<stdin>", line 1, in <module>\n'
+            "  | ExceptionGroup: runner worker pool exhausted (1 sub-exception)\n"
+            "  +-+---------------- 1 ----------------\n"
+            "    | Exception: runner worker failed\n"
+            "    +------------------------------------"
+        )
+
+    mixed_stderr = (
+        "Traceback (most recent call last):\n"
+        '  File "/tmp/vllm-bbbbbbbbbbbb/setup.py", line 12, in <module>\n'
+        '    raise RuntimeError("VLLM_TARGET_DEVICE=empty unsupported")\n'
+        "RuntimeError: VLLM_TARGET_DEVICE=empty unsupported\n" + eg_text
+    )
+    phase_eg, src_eg, infra_eg = post_merge._classify_install_failure(
+        1, mixed_stderr, "", mode="cpu_empty_build"
+    )
+    assert (phase_eg, src_eg, infra_eg) == ("infra_error", "infra_or_unknown", True)
+
+    good_vllm_dir = tmp_path / "good_vllm_eg"
+    (good_vllm_dir / "vllm").mkdir(parents=True, exist_ok=True)
+    (good_vllm_dir / "vllm" / "__init__.py").write_text(
+        "__version__ = '0.1'\n", encoding="utf-8"
+    )
+    eg_err_file = tmp_path / "mixed_eg.txt"
+    eg_err_file.write_text(mixed_stderr + "\n", encoding="utf-8")
+    ev_eg = post_merge.verify_non_ppu_reproducer(
+        vllm_repo=tmp_path,
+        last_good_sha=_sha(960),
+        first_failing_sha=_sha(961),
+        stage="wheel_build",
+        target_signature="VLLM_TARGET_DEVICE=empty",
+        probe_cmd=(
+            f'if [ "$CANDIDATE_SHA" = "{_sha(960)}" ]; then '
+            f'PYTHONPATH="{good_vllm_dir}" "{sys.executable}" "$STUB_CHECK_SCRIPT"; '
+            f'else cat "{eg_err_file}" >&2; exit 1; fi'
+        ),
+    )
+    assert ev_eg.verified is False
+    assert ev_eg.infra_error is True
+    assert ev_eg.failure_source == "infra_or_unknown"

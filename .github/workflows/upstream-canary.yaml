@@ -172,7 +172,7 @@ jobs:
           if [[ "$target_for_diff" =~ ^[0-9a-f]{40}$ && "$base_ppu_green_sha" =~ ^[0-9a-f]{40}$ && "$target_for_diff" != "$base_ppu_green_sha" ]]; then
             git init -q state/vllm-diff
             if git -C state/vllm-diff fetch --quiet --depth=120 https://github.com/vllm-project/vllm.git "$target_for_diff" "$base_ppu_green_sha" 2>/dev/null; then
-              git -C state/vllm-diff diff --name-only "$base_ppu_green_sha" "$target_for_diff" > state/changed-files.txt || true
+              git -C state/vllm-diff diff --no-renames --name-only "$base_ppu_green_sha" "$target_for_diff" > state/changed-files.txt || true
             fi
             rm -rf state/vllm-diff
           fi
@@ -224,9 +224,13 @@ jobs:
     name: SDK container CPU fast check & static bisect
     needs: [route, build]
     if: >-
+      !cancelled() &&
       needs.route.outputs.target_sha != '' &&
-      needs.route.outputs.run_cpu == 'true' &&
-      needs.build.result == 'success'
+      (
+        (needs.route.outputs.run_cpu == 'true' && needs.build.result == 'success') ||
+        ((needs.route.outputs.run_cpu == 'true' || needs.route.outputs.run_ppu == 'true') &&
+         needs.build.result != 'success' && needs.build.result != 'skipped')
+      )
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     container:
@@ -235,6 +239,7 @@ jobs:
       SAIL_PIP_INDEX_URL: https://mirrors.aliyun.com/pypi/simple/
       TARGET_SHA: ${{ needs.route.outputs.target_sha }}
       LAST_GREEN_SHA: ${{ needs.route.outputs.last_green_sha }}
+      BUILD_RESULT: ${{ needs.build.result }}
     steps:
       - name: Disable internal GitHub mirror rewrite silently
         shell: bash
@@ -256,6 +261,7 @@ jobs:
           persist-credentials: false
 
       - name: Download built wheels & prior cursor
+        if: needs.build.result == 'success'
         uses: actions/download-artifact@v4
         with:
           name: ppu-wheels-${{ github.run_id }}
@@ -276,6 +282,27 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p /tmp/post-merge-cpu
+          verified_pin="$(tr -d '[:space:]' < .github/vllm-main-verified.commit)"
+          control_sha="${LAST_GREEN_SHA:-$verified_pin}"
+
+          git init -q /tmp/vllm-src
+          git -C /tmp/vllm-src remote add origin https://github.com/vllm-project/vllm.git
+          git -C /tmp/vllm-src fetch --quiet --depth=250 origin "${TARGET_SHA}"
+          if [[ -n "${control_sha}" && "${control_sha}" != "${TARGET_SHA}" ]] && ! git -C /tmp/vllm-src cat-file -e "${control_sha}^{commit}" 2>/dev/null; then
+            git -C /tmp/vllm-src fetch --quiet --depth=1 origin "${control_sha}" || true
+          fi
+          git -C /tmp/vllm-src checkout --quiet --detach "${TARGET_SHA}"
+
+          if [[ "${BUILD_RESULT}" != "success" ]]; then
+            python3 scripts/ci/ppu_upstream_post_merge.py source-build-triage \
+              --vllm-repo /tmp/vllm-src \
+              --sail-root "$PWD" \
+              --target-sha "${TARGET_SHA}" \
+              --last-green-sha "${control_sha}" \
+              --output-dir /tmp/post-merge-cpu
+            exit 1
+          fi
+
           python3 scripts/ci/ppu_wheel_manifest.py verify /tmp/post-merge-wheels \
             --sail-commit "${GITHUB_SHA}" \
             --vllm-commit "${TARGET_SHA}" >/dev/null
@@ -284,14 +311,6 @@ jobs:
             /tmp/post-merge-wheels/vllm/*.whl \
             /tmp/post-merge-wheels/vllm-sail/*.whl
           python3 -m pip install -q --index-url "${SAIL_PIP_INDEX_URL}" -r requirements/dev.txt
-
-          git init -q /tmp/vllm-src
-          git -C /tmp/vllm-src remote add origin https://github.com/vllm-project/vllm.git
-          git -C /tmp/vllm-src fetch --quiet --depth=250 origin "${TARGET_SHA}"
-          if [[ -n "${LAST_GREEN_SHA}" && "${LAST_GREEN_SHA}" != "${TARGET_SHA}" ]]; then
-            git -C /tmp/vllm-src fetch --quiet --depth=1 origin "${LAST_GREEN_SHA}" || true
-          fi
-          git -C /tmp/vllm-src checkout --quiet --detach "${TARGET_SHA}"
 
           baseline_arg=()
           if [[ -f /tmp/post-merge-route/cursor.json ]]; then
@@ -766,7 +785,7 @@ jobs:
           git init -q /tmp/vllm-pin-ancestry
           git -C /tmp/vllm-pin-ancestry remote add origin https://github.com/vllm-project/vllm.git
           git -C /tmp/vllm-pin-ancestry fetch --quiet --depth=250 origin "${TARGET_SHA}"
-          if [[ "${TARGET_SHA}" != "${verified}" ]]; then
+          if [[ "${TARGET_SHA}" != "${verified}" ]] && ! git -C /tmp/vllm-pin-ancestry cat-file -e "${verified}^{commit}" 2>/dev/null; then
             git -C /tmp/vllm-pin-ancestry fetch --quiet --depth=1 origin "${verified}" || true
           fi
           python3 scripts/ci/ppu_upstream_post_merge.py prepare-pin-bump \
@@ -984,7 +1003,8 @@ jobs:
             --public-dir /tmp/post-merge-public \
             --step-summary "${GITHUB_STEP_SUMMARY}" \
             "${extra_args[@]}"
-          printf 'final_status=%s\n' "${status}" >> "$GITHUB_OUTPUT"
+          final_st="$(python3 -c 'import json, pathlib; print(json.loads(pathlib.Path("/tmp/post-merge-public/public-summary.json").read_text(encoding="utf-8"))["status"])')"
+          printf 'final_status=%s\n' "${final_st}" >> "$GITHUB_OUTPUT"
 
       - name: Upload allowlisted public summary artifact
         if: always()
