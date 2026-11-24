@@ -3301,11 +3301,7 @@ def publish_sanitized_channels(
         "should_file_sail_issue": bool(
             triage["classification"] == "sail_internal_patch_drift"
             and issue_title
-            and not (
-                triage["stage"] == "wheel_build"
-                and not safe_first_bad
-                and bisect_steps == 0
-            )
+            and not (triage["stage"] == "wheel_build" and not safe_first_bad)
         ),
         "should_file_upstream_issue": False,
         "non_ppu_repro_verified": bool(triage["non_ppu_repro_verified"]),
@@ -4367,8 +4363,21 @@ def run_source_only_build_triage(
         chosen_bad = str(res["first_failing_sha"])
         win: ProbeOutcome = res["winning_outcome"]
 
-        # 3. Verify the failure across the chosen `(last_good_sha, first_failing_sha)` boundary.
+        # 3. Verify the target failure across `(last_good_sha, first_failing_sha)`.
+        # Never substitute an earlier failure of a different phase or signature when the
+        # target boundary cannot be verified.
+        def _repro_matches_target_outcome(ev: NonPpuReproEvidence) -> bool:
+            if not ev.verified or ev.infra_error:
+                return False
+            if (
+                red_outcome.detail_code in ("build_install", "build_import")
+                and ev.first_failing_phase != red_outcome.detail_code
+            ):
+                return False
+            return True
+
         final_cpu_status = "fail"
+        final_bisect_status = "converged"
         repro_dict: dict[str, Any] | None = None
         if win.is_public_plugin_interface or win.stage in (
             "wheel_build",
@@ -4378,99 +4387,86 @@ def run_source_only_build_triage(
                 vllm_repo=vllm_repo,
                 last_good_sha=chosen_good,
                 first_failing_sha=chosen_bad,
-                stage=win.stage,
-                target_signature=win.target_signature,
+                stage=red_outcome.stage,
+                target_signature=red_outcome.target_signature,
                 probe_cmd=probe_cmd,
                 python_exe=python_exe,
                 timeout_sec=timeout_sec,
             )
-            # Fallback if an intermediate revision failed a different phase (making `chosen_good`
-            # fail `repro_check.py`) or if non-monotonic history reverted and re-broke before `target`.
-            if not repro_ev.verified and not repro_ev.infra_error:
-                raw_good_probe = _probe_wheel_only(chosen_good)
-                if raw_good_probe.status == "fail" and chosen_good != control:
-                    prefix_idx = commits.index(chosen_good)
-                    prefix_commits = commits[: prefix_idx + 1]
-                    any_res = bisect_first_failing_sha(
-                        last_green_sha=control,
-                        red_sha=chosen_good,
-                        commits=prefix_commits,
-                        probe_fn=lambda s: (
-                            _probe_wheel_only(s)
-                            if _probe_wheel_only(s).stage in ("none", "wheel_build")
-                            else ProbeOutcome(status="pass", detail_code="pass")
-                        ),
-                        verify_baseline_first=False,
-                        initial_red_outcome=raw_good_probe,
+            if (
+                not _repro_matches_target_outcome(repro_ev)
+                and not repro_ev.infra_error
+                and chosen_bad != target
+                and len(commits) >= 2
+            ):
+                parent_sha = commits[-2]
+                parent_probe = _probe_wheel_only(parent_sha)
+                total_steps += 1
+                merged_hist.append(
+                    {
+                        "sha": parent_sha,
+                        "role": "boundary_recheck",
+                        "status": parent_probe.status,
+                    }
+                )
+                if parent_probe.status == "pass":
+                    alt_ev = verify_non_ppu_reproducer(
+                        vllm_repo=vllm_repo,
+                        last_good_sha=parent_sha,
+                        first_failing_sha=target,
+                        stage=red_outcome.stage,
+                        target_signature=red_outcome.target_signature,
+                        probe_cmd=probe_cmd,
+                        python_exe=python_exe,
+                        timeout_sec=timeout_sec,
                     )
-                    if any_res["bisect_status"] == "converged":
-                        alt_win: ProbeOutcome = any_res["winning_outcome"]
-                        alt_ev = verify_non_ppu_reproducer(
-                            vllm_repo=vllm_repo,
-                            last_good_sha=str(any_res["last_good_sha"]),
-                            first_failing_sha=str(any_res["first_failing_sha"]),
-                            stage=alt_win.stage,
-                            target_signature=alt_win.target_signature,
-                            probe_cmd=probe_cmd,
-                            python_exe=python_exe,
-                            timeout_sec=timeout_sec,
-                        )
-                        if alt_ev.verified:
-                            chosen_good = str(any_res["last_good_sha"])
-                            chosen_bad = str(any_res["first_failing_sha"])
-                            win = alt_win
-                            repro_ev = alt_ev
-                            total_steps += int(any_res["steps_executed"])
-                            merged_hist.extend(list(any_res["history"]))
-                elif chosen_bad != target and len(commits) >= 2:
-                    parent_sha = commits[-2]
-                    parent_probe = _probe_wheel_only(parent_sha)
-                    total_steps += 1
-                    merged_hist.append(
-                        {
-                            "sha": parent_sha,
-                            "role": "boundary_recheck",
-                            "status": parent_probe.status,
-                        }
-                    )
-                    if parent_probe.status == "pass":
-                        alt_ev = verify_non_ppu_reproducer(
-                            vllm_repo=vllm_repo,
-                            last_good_sha=parent_sha,
-                            first_failing_sha=target,
-                            stage=red_outcome.stage,
-                            target_signature=red_outcome.target_signature,
-                            probe_cmd=probe_cmd,
-                            python_exe=python_exe,
-                            timeout_sec=timeout_sec,
-                        )
-                        if alt_ev.verified:
-                            chosen_good = parent_sha
-                            chosen_bad = target
-                            win = red_outcome
-                            repro_ev = alt_ev
+                    if _repro_matches_target_outcome(alt_ev):
+                        chosen_good = parent_sha
+                        chosen_bad = target
+                        win = red_outcome
+                        repro_ev = alt_ev
 
+            boundary_ok = _repro_matches_target_outcome(repro_ev)
+            if not boundary_ok and repro_ev.verified:
+                repro_ev = NonPpuReproEvidence(
+                    mode=repro_ev.mode,
+                    repro_kind=repro_ev.repro_kind,
+                    last_good_sha=repro_ev.last_good_sha,
+                    first_failing_sha=repro_ev.first_failing_sha,
+                    last_good_exit_code=repro_ev.last_good_exit_code,
+                    first_failing_exit_code=repro_ev.first_failing_exit_code,
+                    verified=False,
+                    last_good_phase=repro_ev.last_good_phase,
+                    first_failing_phase=repro_ev.first_failing_phase,
+                    last_good_check_executed=repro_ev.last_good_check_executed,
+                    first_failing_check_executed=repro_ev.first_failing_check_executed,
+                    infra_error=repro_ev.infra_error,
+                    failure_source=repro_ev.failure_source,
+                )
             repro_dict = repro_ev.to_public_dict()
             _write_sanitized(repro_json_path, repro_dict)
-            if repro_ev.infra_error or (
-                win.stage == "wheel_build"
-                and not probe_cmd.strip()
-                and not repro_ev.verified
-            ):
+            if repro_ev.infra_error:
                 final_cpu_status = "infra_error"
+                final_bisect_status = "aborted_infra_error"
+            elif not boundary_ok:
+                final_bisect_status = "unverified_target_boundary"
+                win = red_outcome
 
+        unconverged = final_bisect_status != "converged"
         out = _write_cpu_and_bisect(
             cpu_status=final_cpu_status,
-            stage=win.stage,
-            target_sig=win.target_signature,
-            is_public=win.is_public_plugin_interface,
-            bisect_status=(
-                "aborted_infra_error"
-                if final_cpu_status == "infra_error"
-                else "converged"
+            stage=red_outcome.stage if unconverged else win.stage,
+            target_sig=(
+                red_outcome.target_signature if unconverged else win.target_signature
             ),
-            first_failing="" if final_cpu_status == "infra_error" else chosen_bad,
-            last_good=control if final_cpu_status == "infra_error" else chosen_good,
+            is_public=(
+                red_outcome.is_public_plugin_interface
+                if unconverged
+                else win.is_public_plugin_interface
+            ),
+            bisect_status=final_bisect_status,
+            first_failing="" if unconverged else chosen_bad,
+            last_good=control if unconverged else chosen_good,
             steps_executed=total_steps,
             probe_steps_on_range=int(res["probe_steps_on_range"]),
             history=merged_hist,

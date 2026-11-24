@@ -4416,3 +4416,89 @@ def test_review_pr374_rereview_mandatory_rust_and_target_matched_bisect(
     assert res_kern["bisect"]["stage"] == "kernel_port_check"
     assert res_kern["bisect"]["first_failing_sha"] == mix_drift
     assert not (kern_out / "non-ppu-repro.json").exists()
+
+    # --- 2c. [R1 B1] A(pass) -> B(import fail, wheel builds) -> C(Rust compile fail):
+    #         never replace C's target failure with B's earlier import failure! ---
+    b1_repo = tmp_path / "b1-repo"
+    commit_b1 = _init_upstream_repo(b1_repo)
+    (b1_repo / "setup.py").write_text("", encoding="utf-8")
+    (b1_repo / "tools").mkdir(parents=True, exist_ok=True)
+    (b1_repo / "tools/build_rust.py").write_text(
+        "from pathlib import Path\n"
+        "def rust_py_extension_module_names():\n"
+        "    return []\n"
+        "if __name__ == '__main__':\n"
+        "    (Path(__file__).resolve().parents[1] / 'vllm' / 'vllm-rs').write_bytes(b'#!/bin/sh\\n')\n",
+        encoding="utf-8",
+    )
+    sha_a = commit_b1("A: healthy")
+    (b1_repo / "vllm/__init__.py").write_text(
+        'raise RuntimeError("earlier import regression")\n', encoding="utf-8"
+    )
+    sha_b = commit_b1("B: wheel builds, import fails")
+    (b1_repo / "tools/build_rust.py").write_text(
+        "import sys\n"
+        "def rust_py_extension_module_names():\n"
+        "    return []\n"
+        "if __name__ == '__main__':\n"
+        "    sys.stderr.write('error: expected `;`\\n  --> rust/src/cmd/src/main.rs:19:5\\n')\n"
+        "    raise SystemExit(101)\n",
+        encoding="utf-8",
+    )
+    sha_c = commit_b1("C: Rust compile error on top of B")
+
+    b1_out = tmp_path / "b1-out"
+    res_b1 = post_merge.run_source_only_build_triage(
+        vllm_repo=b1_repo,
+        sail_root=sail_dir,
+        target_sha=sha_c,
+        verified_pin=sha_a,
+        last_green_sha=sha_a,
+        output_dir=b1_out,
+        python_exe=str(py_shim),
+    )
+    assert res_b1["bisect"]["bisect_status"] == "unverified_target_boundary"
+    assert res_b1["bisect"]["first_failing_sha"] == ""
+    assert res_b1["bisect"]["first_failing_sha"] != sha_b
+    assert res_b1["bisect"]["stage"] == "wheel_build"
+    assert res_b1["bisect"]["target_signature"] == "rust_frontend_build"
+    assert res_b1["non_ppu_repro"]["verified"] is False
+
+    b1_pub = tmp_path / "b1-pub"
+    b1_pin = tmp_path / "b1.pin"
+    b1_pin.write_text(sha_a + "\n", encoding="utf-8")
+    assert (
+        post_merge.main(
+            [
+                "publish",
+                "--gear",
+                "probe",
+                "--status",
+                "fail",
+                "--sail-sha",
+                _sha(972),
+                "--upstream-sha",
+                sha_c,
+                "--verified-pin-file",
+                str(b1_pin),
+                "--failure-stage",
+                "wheel_build",
+                "--cpu-result-json",
+                str(b1_out / "cpu-result.json"),
+                "--bisect-result-json",
+                str(b1_out / "bisect-result.json"),
+                "--non-ppu-repro-json",
+                str(b1_out / "non-ppu-repro.json"),
+                "--public-dir",
+                str(b1_pub),
+            ]
+        )
+        == 0
+    )
+    b1_sum = json.loads((b1_pub / "public-summary.json").read_text(encoding="utf-8"))
+    b1_iss = json.loads((b1_pub / "issue-payload.json").read_text(encoding="utf-8"))
+    assert b1_sum["bisect"]["first_failing_sha"] is None
+    assert b1_sum["triage"]["target_signature"] == "rust_frontend_build"
+    assert b1_sum["triage"]["non_ppu_repro_verified"] is False
+    assert b1_iss["should_file_sail_issue"] is False
+    assert b1_iss["upstream_reproducer_markdown"] == ""
