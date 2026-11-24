@@ -9,7 +9,8 @@ or cross-repository write permissions:
      ``(last_green_sha..red_sha]`` when red;
   2. ``daily_pin_bump`` (1x daily): promotes the latest probe-verified upstream
      commit to ``.github/vllm-main-verified.commit`` via a normal SAIL PR;
-  3. ``rc_qualify`` (on new ``vX.Y.0rc*`` tags): runs the full PPU gate suite
+  3. ``rc_qualify`` (on new ``vX.Y.0rc*`` tags and active-RC-window
+     ``releases/vX.Y.0`` branch tips): runs the full PPU gate suite
      (wheel build + CPU fast check + pin-UT + Fast Sanity + Model Sanity +
      optional ops qualification).
 
@@ -49,6 +50,7 @@ SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
 OPAQUE_PATCH_KEY_RE = re.compile(r"^t_[0-9a-f]{24}$")
 IMAGE_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
 RC_TAG_RE = re.compile(r"^v(\d+)\.(\d+)\.0rc(\d+)$")
+RELEASE_BRANCH_RE = re.compile(r"^releases/v(\d+)\.(\d+)\.0$")
 RELEASE_LINE_RE = re.compile(r"^v?(\d+)\.(\d+)(?:\.(\d+))?")
 SAFE_SYMBOL_RE = re.compile(r"^[A-Za-z0-9_./:<>\[\]()!?,* -]{1,160}$")
 PUBLIC_GITHUB_URL_RE = re.compile(
@@ -547,8 +549,25 @@ def _sanitize_patch_target_signature(
 
 
 # ---------------------------------------------------------------------------
-# 1. Dual polling (refs/heads/main + refs/tags/v*) & Three-Gear Router
+# 1. Polling (refs/heads/main + refs/heads/releases/v* + refs/tags/v*) & Router
 # ---------------------------------------------------------------------------
+
+
+def _normalize_rc_ref(value: str) -> str:
+    cleaned = value.strip()
+    if cleaned.startswith("refs/heads/"):
+        cand = cleaned.removeprefix("refs/heads/")
+        if RELEASE_BRANCH_RE.fullmatch(cand):
+            return cand
+    elif cleaned.startswith("refs/tags/"):
+        cand = cleaned.removeprefix("refs/tags/")
+        if RC_TAG_RE.fullmatch(cand):
+            return cand
+    return cleaned
+
+
+def _is_valid_rc_ref(value: str) -> bool:
+    return bool(RC_TAG_RE.fullmatch(value) or RELEASE_BRANCH_RE.fullmatch(value))
 
 
 def parse_ls_remote(output: str) -> dict[str, Any]:
@@ -556,6 +575,7 @@ def parse_ls_remote(output: str) -> dict[str, Any]:
     main_sha: str | None = None
     raw_tags: dict[str, str] = {}
     peeled_tags: dict[str, str] = {}
+    release_branches: dict[str, str] = {}
 
     for raw_line in output.splitlines():
         line = raw_line.strip()
@@ -569,6 +589,10 @@ def parse_ls_remote(output: str) -> dict[str, Any]:
             continue
         if ref == "refs/heads/main":
             main_sha = sha
+        elif ref.startswith("refs/heads/"):
+            branch_part = ref.removeprefix("refs/heads/")
+            if RELEASE_BRANCH_RE.fullmatch(branch_part):
+                release_branches[branch_part] = sha
         elif ref.startswith("refs/tags/"):
             tag_part = ref.removeprefix("refs/tags/")
             if tag_part.endswith("^{}"):
@@ -577,7 +601,11 @@ def parse_ls_remote(output: str) -> dict[str, Any]:
                 raw_tags[tag_part] = sha
 
     tags = {**raw_tags, **peeled_tags}
-    return {"main_sha": main_sha, "tags": dict(sorted(tags.items()))}
+    return {
+        "main_sha": main_sha,
+        "tags": dict(sorted(tags.items())),
+        "release_branches": dict(sorted(release_branches.items())),
+    }
 
 
 def select_newest_rc_tag(
@@ -599,25 +627,199 @@ def select_newest_rc_tag(
     candidates: list[tuple[tuple[int, int, int], str, str]] = []
     for tag, sha in tags.items():
         match = RC_TAG_RE.fullmatch(tag)
-        if not match or tag in tested:
+        if not match or tag in tested or not SHA1_RE.fullmatch(sha):
             continue
-        prior = states.get(tag)
-        if isinstance(prior, dict) and prior.get("sha") == sha:
-            if prior.get("status") == "pass" or not include_failed:
-                continue
         major, minor, rc_num = (
             int(match.group(1)),
             int(match.group(2)),
             int(match.group(3)),
         )
-        if (major, minor) > base_line:
-            candidates.append(((major, minor, rc_num), tag, sha))
+        if (major, minor) <= base_line or f"v{major}.{minor}.0" in tags:
+            continue
+        prior = states.get(tag)
+        if isinstance(prior, dict) and prior.get("sha") == sha:
+            if prior.get("status") == "pass" or not include_failed:
+                continue
+        candidates.append(((major, minor, rc_num), tag, sha))
 
     if not candidates:
         return None
     candidates.sort(key=lambda item: item[0])
     _, best_tag, best_sha = candidates[-1]
     return best_tag, best_sha
+
+
+def select_newest_rc_target(
+    tags: dict[str, str],
+    release_branches: dict[str, str] | None = None,
+    *,
+    release_baseline_tag: str,
+    tested_rc_tags: Sequence[str] = (),
+    rc_tag_states: dict[str, dict[str, str]] | None = None,
+    rc_branch_states: dict[str, dict[str, str]] | None = None,
+    include_failed: bool = False,
+) -> tuple[str, str] | None:
+    """Return ``(rc_ref, commit_sha)`` for the newest active-window RC tag or branch.
+
+    Named ``vX.Y.0rcN`` tags take priority over ``releases/vX.Y.0`` branch tips.
+    A ``releases/vX.Y.0`` branch is eligible only when ``(X, Y) > base_line``,
+    the final ``vX.Y.0`` tag does not yet exist in ``tags``, and its ``tip_sha``
+    has not already passed (or failed/errored without ``include_failed``) in
+    ``rc_branch_states`` or any same-line ``rc_tag_states`` / ``tested_rc_tags``.
+    """
+    tag_hit = select_newest_rc_tag(
+        tags,
+        release_baseline_tag=release_baseline_tag,
+        tested_rc_tags=tested_rc_tags,
+        rc_tag_states=rc_tag_states,
+        include_failed=include_failed,
+    )
+    if tag_hit is not None:
+        return tag_hit
+
+    base_match = RELEASE_LINE_RE.match(release_baseline_tag.strip())
+    if not base_match:
+        raise ValueError(f"invalid release baseline tag: {release_baseline_tag!r}")
+    base_line = (int(base_match.group(1)), int(base_match.group(2)))
+    branches = release_branches or {}
+    tested = set(tested_rc_tags)
+    tag_states = rc_tag_states or {}
+    branch_states = rc_branch_states or {}
+
+    branch_candidates: list[tuple[tuple[int, int], str, str]] = []
+    for branch, tip_sha in branches.items():
+        b_match = RELEASE_BRANCH_RE.fullmatch(branch)
+        if not b_match or not SHA1_RE.fullmatch(tip_sha):
+            continue
+        major, minor = int(b_match.group(1)), int(b_match.group(2))
+        if (major, minor) <= base_line or f"v{major}.{minor}.0" in tags:
+            continue
+
+        prior_br = branch_states.get(branch)
+        if isinstance(prior_br, dict):
+            if prior_br.get("last_green_sha") == tip_sha:
+                continue
+            if prior_br.get("sha") == tip_sha and (
+                prior_br.get("status") == "pass" or not include_failed
+            ):
+                continue
+
+        covered_by_tag = False
+        for t_name, t_entry in tag_states.items():
+            t_match = RC_TAG_RE.fullmatch(t_name)
+            if (
+                not t_match
+                or (int(t_match.group(1)), int(t_match.group(2))) != (major, minor)
+                or not isinstance(t_entry, dict)
+            ):
+                continue
+            if t_entry.get("sha") == tip_sha and (
+                t_entry.get("status") == "pass" or not include_failed
+            ):
+                covered_by_tag = True
+                break
+        if covered_by_tag:
+            continue
+
+        for t_name in tested:
+            t_match = RC_TAG_RE.fullmatch(t_name)
+            if (
+                t_match
+                and (int(t_match.group(1)), int(t_match.group(2))) == (major, minor)
+                and tags.get(t_name) == tip_sha
+            ):
+                covered_by_tag = True
+                break
+        if covered_by_tag:
+            continue
+
+        branch_candidates.append(((major, minor), branch, tip_sha))
+
+    if not branch_candidates:
+        return None
+    branch_candidates.sort(key=lambda item: item[0])
+    _, best_branch, best_sha = branch_candidates[-1]
+    return best_branch, best_sha
+
+
+def _resolve_rc_last_green_sha(
+    rc_ref: str,
+    *,
+    target_sha: str,
+    tags: dict[str, str],
+    release_branches: dict[str, str],
+    rc_branch_states: dict[str, dict[str, str]],
+    rc_tag_states: dict[str, dict[str, str]],
+    tested_rc_tags: Sequence[str],
+    fallback_green: str,
+) -> str:
+    """Return the newest passing same-line RC SHA, falling back to ``fallback_green``."""
+    line: tuple[int, int] | None = None
+    t_match = RC_TAG_RE.fullmatch(rc_ref)
+    b_match = RELEASE_BRANCH_RE.fullmatch(rc_ref) if not t_match else None
+    if t_match:
+        line = (int(t_match.group(1)), int(t_match.group(2)))
+    elif b_match:
+        line = (int(b_match.group(1)), int(b_match.group(2)))
+    elif target_sha and SHA1_RE.fullmatch(target_sha):
+        matched_lines: set[tuple[int, int]] = set()
+        for br_name, br_sha in release_branches.items():
+            bm = RELEASE_BRANCH_RE.fullmatch(br_name)
+            if bm and br_sha == target_sha:
+                matched_lines.add((int(bm.group(1)), int(bm.group(2))))
+        for tg_name, tg_sha in tags.items():
+            tm = RC_TAG_RE.fullmatch(tg_name)
+            if tm and tg_sha == target_sha:
+                matched_lines.add((int(tm.group(1)), int(tm.group(2))))
+        if len(matched_lines) == 1:
+            line = next(iter(matched_lines))
+
+    if line is None:
+        return fallback_green
+
+    major, minor = line
+    branch_key = f"releases/v{major}.{minor}.0"
+    candidates: list[str] = []
+
+    br_entry = rc_branch_states.get(branch_key)
+    if isinstance(br_entry, dict):
+        br_green = str(br_entry.get("last_green_sha") or "").strip()
+        if SHA1_RE.fullmatch(br_green):
+            candidates.append(br_green)
+        elif br_entry.get("status") == "pass":
+            br_sha = str(br_entry.get("sha") or "").strip()
+            if SHA1_RE.fullmatch(br_sha):
+                candidates.append(br_sha)
+
+    passing_tags: list[tuple[int, str]] = []
+    for tg_name, tg_entry in rc_tag_states.items():
+        tm = RC_TAG_RE.fullmatch(tg_name)
+        if (
+            tm
+            and (int(tm.group(1)), int(tm.group(2))) == line
+            and isinstance(tg_entry, dict)
+            and tg_entry.get("status") == "pass"
+        ):
+            tg_sha = str(tg_entry.get("sha") or "").strip()
+            if SHA1_RE.fullmatch(tg_sha):
+                passing_tags.append((int(tm.group(3)), tg_sha))
+    for tg_name in tested_rc_tags:
+        tm = RC_TAG_RE.fullmatch(tg_name)
+        if tm and (int(tm.group(1)), int(tm.group(2))) == line:
+            tg_sha = str(tags.get(tg_name) or "").strip()
+            if SHA1_RE.fullmatch(tg_sha):
+                passing_tags.append((int(tm.group(3)), tg_sha))
+    passing_tags.sort(key=lambda item: item[0], reverse=True)
+    for _, tg_sha in passing_tags:
+        if tg_sha not in candidates:
+            candidates.append(tg_sha)
+
+    for cand in candidates:
+        if cand != target_sha:
+            return cand
+    if candidates:
+        return candidates[0]
+    return fallback_green
 
 
 def is_safe_ppu_skip_path(path: str) -> bool:
@@ -734,6 +936,7 @@ def _sanitize_cursor(
             "last_ppu_status": "pass",
             "tested_rc_tags": [],
             "rc_tag_states": {},
+            "rc_branch_states": {},
             "patch_fingerprints": {},
             "probe_history": [],
         }
@@ -776,6 +979,38 @@ def _sanitize_cursor(
         clean_rc_states[tag_clean] = {"sha": rc_sha, "status": rc_st}
         if rc_st == "pass" and tag_clean not in tested_rcs:
             tested_rcs.append(tag_clean)
+
+    raw_branch_states = cursor.get("rc_branch_states") or {}
+    if not isinstance(raw_branch_states, dict):
+        raise ValueError("rc_branch_states must be an object")
+    clean_branch_states: dict[str, dict[str, str]] = {}
+    for raw_branch, raw_entry in raw_branch_states.items():
+        if not isinstance(raw_branch, str) or not RELEASE_BRANCH_RE.fullmatch(
+            raw_branch.strip()
+        ):
+            raise ValueError(
+                f"invalid release branch key in rc_branch_states: {raw_branch!r}"
+            )
+        if not isinstance(raw_entry, dict):
+            raise ValueError("rc_branch_states entry must be an object")
+        br_sha = _require_sha1(str(raw_entry.get("sha", "")), "rc_branch_states.sha")
+        br_st = str(raw_entry.get("status", "fail"))
+        if br_st not in ("pass", "fail", "infra_error"):
+            raise ValueError(f"invalid rc_branch_states status: {br_st!r}")
+        br_clean = raw_branch.strip()
+        entry_clean: dict[str, str] = {"sha": br_sha, "status": br_st}
+        raw_green = raw_entry.get("last_green_sha")
+        if raw_green is not None and raw_green != "":
+            if not isinstance(raw_green, str):
+                raise ValueError(
+                    "rc_branch_states.last_green_sha must be a 40-character lowercase hex SHA"
+                )
+            entry_clean["last_green_sha"] = _require_sha1(
+                raw_green, "rc_branch_states.last_green_sha"
+            )
+        elif br_st == "pass":
+            entry_clean["last_green_sha"] = br_sha
+        clean_branch_states[br_clean] = entry_clean
 
     raw_fps = cursor.get("patch_fingerprints") or {}
     if not isinstance(raw_fps, dict):
@@ -830,6 +1065,7 @@ def _sanitize_cursor(
         "last_ppu_status": last_ppu_st,
         "tested_rc_tags": tested_rcs,
         "rc_tag_states": dict(sorted(clean_rc_states.items())),
+        "rc_branch_states": dict(sorted(clean_branch_states.items())),
         "patch_fingerprints": dict(sorted(clean_fps.items())),
         "probe_history": [],
     }
@@ -918,6 +1154,7 @@ def route_three_gears(
     requested_gear: str = "auto",
     schedule_cron: str = "",
     upstream_ref_override: str = "",
+    last_green_sha_override: str = "",
     cursor: dict[str, Any] | None = None,
     changed_paths_since_ppu: Sequence[str] | None = None,
     changed_files_base_sha: str = "",
@@ -929,15 +1166,23 @@ def route_three_gears(
     if requested_gear not in VALID_GEARS:
         raise ValueError(f"unsupported gear: {requested_gear!r}")
     pin = _require_sha1(verified_pin, "verified_pin")
+    override_green = (
+        _require_sha1(last_green_sha_override, "last_green_sha")
+        if last_green_sha_override.strip()
+        else ""
+    )
     state = _sanitize_cursor(cursor, verified_pin=pin)
     last_cpu_green = state["last_cpu_green_sha"]
     last_ppu_tested = state["last_ppu_tested_sha"]
     last_ppu_green = state["last_ppu_green_sha"]
     tested_rcs = list(state["tested_rc_tags"])
     tags: dict[str, str] = dict(ls_remote_data.get("tags") or {})
+    release_branches: dict[str, str] = dict(
+        ls_remote_data.get("release_branches") or {}
+    )
     main_sha = ls_remote_data.get("main_sha")
 
-    override = upstream_ref_override.strip()
+    override = _normalize_rc_ref(upstream_ref_override)
     effective_gear = requested_gear
     rc_tag = ""
     target_sha = ""
@@ -945,14 +1190,16 @@ def route_three_gears(
     if effective_gear == "auto":
         if schedule_cron.strip() == DAILY_PIN_CRON:
             effective_gear = "daily_pin_bump"
-        elif override and RC_TAG_RE.fullmatch(override):
+        elif override and _is_valid_rc_ref(override):
             effective_gear = "rc_qualify"
         else:
-            rc_hit = select_newest_rc_tag(
+            rc_hit = select_newest_rc_target(
                 tags,
+                release_branches,
                 release_baseline_tag=release_baseline_tag,
                 tested_rc_tags=tested_rcs,
                 rc_tag_states=state["rc_tag_states"],
+                rc_branch_states=state["rc_branch_states"],
                 include_failed=force,
             )
             if rc_hit is not None and not override:
@@ -969,14 +1216,23 @@ def route_three_gears(
                         raise ValueError(f"RC tag {override!r} not found in upstream")
                     rc_tag = override
                     target_sha = tags[override]
+                elif RELEASE_BRANCH_RE.fullmatch(override):
+                    if override not in release_branches:
+                        raise ValueError(
+                            f"RC release branch {override!r} not found in upstream"
+                        )
+                    rc_tag = override
+                    target_sha = release_branches[override]
                 else:
                     target_sha = _require_sha1(override, "upstream_ref")
             else:
-                rc_hit = select_newest_rc_tag(
+                rc_hit = select_newest_rc_target(
                     tags,
+                    release_branches,
                     release_baseline_tag=release_baseline_tag,
-                    tested_rc_tags=() if force else tested_rcs,
+                    tested_rc_tags=tested_rcs,
                     rc_tag_states=state["rc_tag_states"],
+                    rc_branch_states=state["rc_branch_states"],
                     include_failed=force,
                 )
                 if rc_hit is None:
@@ -984,23 +1240,39 @@ def route_three_gears(
                         "selected_gear": "rc_qualify",
                         "target_sha": "",
                         "rc_tag": "",
-                        "last_green_sha": last_ppu_green,
+                        "last_green_sha": override_green or last_ppu_green,
                         "last_ppu_tested_sha": last_ppu_tested,
                         "run_cpu": False,
                         "run_ppu": False,
                         "ppu_skip_reason": "not_applicable",
                     }
                 rc_tag, target_sha = rc_hit
+        clean_target = _require_sha1(target_sha, "rc_target_sha")
+        rc_green = override_green or _resolve_rc_last_green_sha(
+            rc_tag,
+            target_sha=clean_target,
+            tags=tags,
+            release_branches=release_branches,
+            rc_branch_states=state["rc_branch_states"],
+            rc_tag_states=state["rc_tag_states"],
+            tested_rc_tags=tested_rcs,
+            fallback_green=last_ppu_green,
+        )
         return {
             "selected_gear": "rc_qualify",
-            "target_sha": _require_sha1(target_sha, "rc_target_sha"),
+            "target_sha": clean_target,
             "rc_tag": rc_tag,
-            "last_green_sha": last_ppu_green,
+            "last_green_sha": rc_green,
             "last_ppu_tested_sha": last_ppu_tested,
             "run_cpu": True,
             "run_ppu": True,
             "ppu_skip_reason": "none",
         }
+
+    if override_green:
+        last_ppu_green = override_green
+        last_ppu_tested = override_green
+        state["last_ppu_status"] = "pass"
 
     if effective_gear == "daily_pin_bump":
         history = list(probe_history)
@@ -1255,27 +1527,93 @@ def advance_cursor(
     if selected_gear == "rc_qualify":
         # RC qualification runs on release-branch commits and must NEVER mutate
         # main-branch CPU/PPU cursors, patch fingerprints, or bisection baselines.
-        if rc_tag and RC_TAG_RE.fullmatch(rc_tag):
-            rc_passed = (
-                status == "pass" and cpu_status == "pass" and ppu_status == "pass"
+        rc_passed = status == "pass" and cpu_status == "pass" and ppu_status == "pass"
+        rc_st = (
+            "pass"
+            if rc_passed
+            else ("infra_error" if status == "infra_error" else "fail")
+        )
+        rc_clean = _normalize_rc_ref(rc_tag)
+        tag_match = RC_TAG_RE.fullmatch(rc_clean) if rc_clean else None
+        branch_match = (
+            RELEASE_BRANCH_RE.fullmatch(rc_clean)
+            if (rc_clean and not tag_match)
+            else None
+        )
+        if tag_match:
+            major, minor, rc_num = (
+                int(tag_match.group(1)),
+                int(tag_match.group(2)),
+                int(tag_match.group(3)),
             )
-            rc_st = (
-                "pass"
-                if rc_passed
-                else ("infra_error" if status == "infra_error" else "fail")
+            prev_max_rc_num = max(
+                (
+                    int(m.group(3))
+                    for t_name in (
+                        *updated["rc_tag_states"].keys(),
+                        *updated["tested_rc_tags"],
+                    )
+                    if (m := RC_TAG_RE.fullmatch(t_name))
+                    and (int(m.group(1)), int(m.group(2))) == (major, minor)
+                ),
+                default=-1,
             )
-            updated["rc_tag_states"][rc_tag] = {
+            updated["rc_tag_states"][rc_clean] = {
                 "sha": target_sha,
                 "status": rc_st,
             }
             updated["rc_tag_states"] = dict(sorted(updated["rc_tag_states"].items()))
             if rc_passed:
-                if rc_tag not in updated["tested_rc_tags"]:
-                    updated["tested_rc_tags"].append(rc_tag)
-            elif rc_tag in updated["tested_rc_tags"]:
+                if rc_clean not in updated["tested_rc_tags"]:
+                    updated["tested_rc_tags"].append(rc_clean)
+                branch_key = f"releases/v{major}.{minor}.0"
+                if (
+                    branch_key in updated["rc_branch_states"]
+                    and rc_num > prev_max_rc_num
+                ):
+                    updated["rc_branch_states"][branch_key]["last_green_sha"] = (
+                        target_sha
+                    )
+            elif rc_clean in updated["tested_rc_tags"]:
                 updated["tested_rc_tags"] = [
-                    t for t in updated["tested_rc_tags"] if t != rc_tag
+                    t for t in updated["tested_rc_tags"] if t != rc_clean
                 ]
+        elif branch_match:
+            major, minor = int(branch_match.group(1)), int(branch_match.group(2))
+            prior_br = updated["rc_branch_states"].get(rc_clean) or {}
+            prev_green = str(prior_br.get("last_green_sha") or "").strip()
+            if not SHA1_RE.fullmatch(prev_green) and prior_br.get("status") == "pass":
+                cand_sha = str(prior_br.get("sha") or "").strip()
+                if SHA1_RE.fullmatch(cand_sha):
+                    prev_green = cand_sha
+            if not SHA1_RE.fullmatch(prev_green):
+                passing_tags: list[tuple[int, str]] = []
+                for t_name, t_entry in updated["rc_tag_states"].items():
+                    tm = RC_TAG_RE.fullmatch(t_name)
+                    if (
+                        tm
+                        and (int(tm.group(1)), int(tm.group(2))) == (major, minor)
+                        and isinstance(t_entry, dict)
+                        and t_entry.get("status") == "pass"
+                    ):
+                        t_sha = str(t_entry.get("sha") or "").strip()
+                        if SHA1_RE.fullmatch(t_sha):
+                            passing_tags.append((int(tm.group(3)), t_sha))
+                if passing_tags:
+                    passing_tags.sort(key=lambda item: item[0], reverse=True)
+                    prev_green = passing_tags[0][1]
+            br_entry: dict[str, str] = {
+                "sha": target_sha,
+                "status": rc_st,
+            }
+            if rc_passed:
+                br_entry["last_green_sha"] = target_sha
+            elif SHA1_RE.fullmatch(prev_green):
+                br_entry["last_green_sha"] = prev_green
+            updated["rc_branch_states"][rc_clean] = br_entry
+            updated["rc_branch_states"] = dict(
+                sorted(updated["rc_branch_states"].items())
+            )
         return updated
 
     pre_lane_failure = (
@@ -3267,7 +3605,8 @@ def publish_sanitized_channels(
     sail = _require_sha1(sail_sha, "sail_sha")
     pin = _require_sha1(verified_pin, "verified_pin")
     up_sha = _require_sha1(upstream_sha, "upstream_sha") if upstream_sha else ""
-    safe_rc = rc_tag if (rc_tag and RC_TAG_RE.fullmatch(rc_tag)) else ""
+    norm_rc = _normalize_rc_ref(rc_tag)
+    safe_rc = norm_rc if (norm_rc and _is_valid_rc_ref(norm_rc)) else ""
     safe_skip = ppu_skip_reason if ppu_skip_reason in VALID_PPU_SKIP_REASONS else "none"
     safe_url = run_url if PUBLIC_GITHUB_URL_RE.fullmatch(run_url or "") else ""
     build_digest = extract_image_digest(build_image)
@@ -4653,6 +4992,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     p_route.add_argument("--gear", choices=VALID_GEARS, default="auto")
     p_route.add_argument("--schedule-cron", default="")
     p_route.add_argument("--upstream-ref", default="")
+    p_route.add_argument("--last-green-sha", default="")
     p_route.add_argument("--cursor-file", type=Path, default=None)
     p_route.add_argument("--changed-files-file", type=Path, default=None)
     p_route.add_argument("--changed-files-base-sha", default="")
@@ -4790,6 +5130,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "ls-remote",
                     args.upstream_url,
                     "refs/heads/main",
+                    "refs/heads/releases/v*",
                     "refs/tags/v*",
                 ],
                 text=True,
@@ -4822,6 +5163,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             requested_gear=args.gear,
             schedule_cron=args.schedule_cron,
             upstream_ref_override=args.upstream_ref,
+            last_green_sha_override=args.last_green_sha,
             cursor=cursor,
             changed_paths_since_ppu=changed,
             changed_files_base_sha=args.changed_files_base_sha,

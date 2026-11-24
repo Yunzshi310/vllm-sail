@@ -19,7 +19,7 @@ on:
           - daily_pin_bump
           - rc_qualify
       upstream_ref:
-        description: Optional 40-char upstream vLLM SHA or vX.Y.0rc* tag override
+        description: Optional 40-char upstream vLLM SHA, vX.Y.0rc* tag, or releases/vX.Y.0 branch override
         required: false
         default: ""
         type: string
@@ -144,29 +144,22 @@ jobs:
           FORCE_PROBE: ${{ inputs.force || false }}
         run: |
           mkdir -p state
-          git ls-remote https://github.com/vllm-project/vllm.git refs/heads/main "refs/tags/v*" > state/ls-remote.txt
+          git ls-remote https://github.com/vllm-project/vllm.git refs/heads/main "refs/heads/releases/v*" "refs/tags/v*" > state/ls-remote.txt
           if [[ -f state/prior-cursor/cursor.json ]]; then
             cp state/prior-cursor/cursor.json state/cursor.json
-          fi
-          if [[ -n "${LAST_GREEN_OVERRIDE}" ]]; then
-            python3 - <<'PY'
-          import json, os, re
-          from pathlib import Path
-          override = os.environ["LAST_GREEN_OVERRIDE"].strip()
-          if not re.fullmatch(r"[0-9a-f]{40}", override):
-              raise SystemExit("last_green_sha override must be a 40-character lowercase hex SHA")
-          p = Path("state/cursor.json")
-          data = json.loads(p.read_text(encoding="utf-8")) if p.is_file() else {}
-          data["last_ppu_green_sha"] = override
-          data["last_ppu_tested_sha"] = override
-          data["last_ppu_status"] = "pass"
-          p.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-          PY
           fi
 
           # Pre-compute changed upstream paths since last_ppu_green_sha (never a red SHA).
           verified="$(tr -d '[:space:]' < .github/vllm-main-verified.commit)"
-          base_ppu_green_sha="$(python3 -c 'import json, pathlib, sys; p=pathlib.Path("state/cursor.json"); print(json.loads(p.read_text()).get("last_ppu_green_sha", sys.argv[1]) if p.is_file() else sys.argv[1])' "$verified")"
+          if [[ -n "${LAST_GREEN_OVERRIDE}" ]]; then
+            if [[ ! "${LAST_GREEN_OVERRIDE}" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "last_green_sha override must be a 40-character lowercase hex SHA" >&2
+              exit 1
+            fi
+            base_ppu_green_sha="${LAST_GREEN_OVERRIDE}"
+          else
+            base_ppu_green_sha="$(python3 -c 'import json, pathlib, sys; p=pathlib.Path("state/cursor.json"); print(json.loads(p.read_text()).get("last_ppu_green_sha", sys.argv[1]) if p.is_file() else sys.argv[1])' "$verified")"
+          fi
           head_main_sha="$(awk '$2 == "refs/heads/main" { print $1 }' state/ls-remote.txt)"
           target_for_diff="${UPSTREAM_REF_OVERRIDE:-$head_main_sha}"
           if [[ "$target_for_diff" =~ ^[0-9a-f]{40}$ && "$base_ppu_green_sha" =~ ^[0-9a-f]{40}$ && "$target_for_diff" != "$base_ppu_green_sha" ]]; then
@@ -182,17 +175,35 @@ jobs:
           if [[ "${FORCE_PROBE}" == "true" ]]; then
             force_arg=(--force)
           fi
-          python3 scripts/ci/ppu_upstream_post_merge.py route \
+          route_json="$(python3 scripts/ci/ppu_upstream_post_merge.py route \
             --ls-remote-file state/ls-remote.txt \
             --gear "${REQUESTED_GEAR}" \
             --schedule-cron "${SCHEDULE_CRON}" \
             --upstream-ref "${UPSTREAM_REF_OVERRIDE}" \
+            --last-green-sha "${LAST_GREEN_OVERRIDE}" \
             --cursor-file state/cursor.json \
             --changed-files-file state/changed-files.txt \
             --changed-files-base-sha "${base_ppu_green_sha}" \
             --active-pr-runs "${active_pr}" \
             "${force_arg[@]}" \
-            --github-output "$GITHUB_OUTPUT"
+            --github-output "$GITHUB_OUTPUT")"
+          printf '%s\n' "${route_json}"
+
+          if [[ -n "${LAST_GREEN_OVERRIDE}" ]]; then
+            ROUTE_JSON="${route_json}" python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          decision = json.loads(os.environ["ROUTE_JSON"])
+          if decision.get("selected_gear") == "probe":
+              override = os.environ["LAST_GREEN_OVERRIDE"].strip()
+              p = Path("state/cursor.json")
+              data = json.loads(p.read_text(encoding="utf-8")) if p.is_file() else {}
+              data["last_ppu_green_sha"] = override
+              data["last_ppu_tested_sha"] = override
+              data["last_ppu_status"] = "pass"
+              p.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+          PY
+          fi
 
       - name: Upload sanitized routing state for downstream jobs
         uses: actions/upload-artifact@v4

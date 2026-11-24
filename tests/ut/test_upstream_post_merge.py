@@ -1163,6 +1163,11 @@ def test_gate6_upstream_canary_workflow_three_gears_contract():
     assert "ppu-build-and-test.yaml" not in wf_raw
     for rc_job in ("rc-pin-ut", "rc-fast-sanity", "rc-model-sanity", "rc-ops-tests"):
         assert "rc_qualify" in jobs[rc_job]["if"]
+    route_run = next(s["run"] for s in jobs["route"]["steps"] if s.get("id") == "route")
+    assert (
+        'git ls-remote https://github.com/vllm-project/vllm.git refs/heads/main "refs/heads/releases/v*" "refs/tags/v*"'
+        in route_run
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -4663,3 +4668,542 @@ def test_review_pr374_rereview_mandatory_rust_and_target_matched_bisect(
     forged_sig_dict = rev_ev.to_public_dict()
     forged_sig_dict["observed_signature"] = "/Users/leak/secret"
     assert post_merge.parse_non_ppu_repro_evidence(forged_sig_dict) is None
+
+
+# ---------------------------------------------------------------------------
+# Active RC Window `refs/heads/releases/v*` Tracking & Deduplication Suite
+# ---------------------------------------------------------------------------
+
+
+def test_rc_release_branch_ls_remote_filtering_and_real_v034_final_tag_cutoff():
+    sha_main = _sha(980)
+    sha_exp = _sha(981)
+    sha_patch_br = _sha(982)
+    sha_v034_tag_obj = "0c57b4195da4a6b69a7725908e428053e51e51b8"
+    sha_v034_commit = "62d4bc3c7e33b1b6c906e233e6af2d3506c482ca"
+    sha_v034_rc3 = "9950ce36a2e1f4307e99bb4972202c1618b4787e"
+    sha_v035_br = _sha(985)
+
+    # 1. Strict RELEASE_BRANCH_RE filtering in parse_ls_remote.
+    raw_ls = "\n".join(
+        [
+            f"{sha_main}\trefs/heads/main",
+            f"{sha_exp}\trefs/heads/releases/v0.20.1-python-from-source",
+            f"{sha_patch_br}\trefs/heads/releases/v0.34.1",
+            f"{sha_exp}\trefs/heads/releases/v0.35.0-experimental",
+            f"{sha_exp}\trefs/heads/releases/v0.35.0rc0",
+            f"{sha_v035_br}\trefs/heads/releases/v0.35.0",
+            f"{sha_v034_commit}\trefs/heads/releases/v0.34.0",
+            f"{sha_v034_tag_obj}\trefs/tags/v0.34.0",
+            f"{sha_v034_commit}\trefs/tags/v0.34.0^{{}}",
+            f"{sha_v034_rc3}\trefs/tags/v0.34.0rc3",
+            f"{sha_v034_commit}\trefs/tags/v0.34.0rc4",
+        ]
+    )
+    parsed = post_merge.parse_ls_remote(raw_ls)
+    assert parsed["main_sha"] == sha_main
+    assert parsed["release_branches"] == {
+        "releases/v0.34.0": sha_v034_commit,
+        "releases/v0.35.0": sha_v035_br,
+    }
+
+    # 2. Real upstream v0.34.0 snapshot (final v0.34.0 tag already exists, RELEASE_TAG == v0.31.0):
+    #    neither releases/v0.34.0 nor historical v0.34.0rc* may trigger rc_qualify!
+    v034_only = {
+        "main_sha": sha_main,
+        "tags": parsed["tags"],
+        "release_branches": {"releases/v0.34.0": sha_v034_commit},
+    }
+    d_auto_v034 = post_merge.route_three_gears(
+        ls_remote_data=v034_only,
+        verified_pin=VERIFIED_PIN,
+        release_baseline_tag=RELEASE_TAG,
+        requested_gear="auto",
+    )
+    assert d_auto_v034["selected_gear"] == "probe"
+    assert d_auto_v034["target_sha"] == sha_main
+    assert d_auto_v034["rc_tag"] == ""
+
+    d_rc_v034 = post_merge.route_three_gears(
+        ls_remote_data=v034_only,
+        verified_pin=VERIFIED_PIN,
+        release_baseline_tag=RELEASE_TAG,
+        requested_gear="rc_qualify",
+    )
+    assert d_rc_v034["selected_gear"] == "rc_qualify"
+    assert d_rc_v034["target_sha"] == ""
+    assert d_rc_v034["rc_tag"] == ""
+    assert d_rc_v034["run_cpu"] is False and d_rc_v034["run_ppu"] is False
+    assert (
+        post_merge.evaluate_workflow_outcome(
+            selected_gear=d_rc_v034["selected_gear"],
+            target_sha=d_rc_v034["target_sha"],
+            run_cpu=d_rc_v034["run_cpu"],
+            run_ppu=d_rc_v034["run_ppu"],
+            ppu_skip_reason=d_rc_v034["ppu_skip_reason"],
+        )["status"]
+        == "noop"
+    )
+
+    # Even if post-GA commits land on releases/v0.34.0, presence of v0.34.0 tag keeps RC polling closed.
+    v034_post_ga = {
+        "main_sha": sha_main,
+        "tags": parsed["tags"],
+        "release_branches": {"releases/v0.34.0": _sha(986)},
+    }
+    assert (
+        post_merge.select_newest_rc_target(
+            v034_post_ga["tags"],
+            v034_post_ga["release_branches"],
+            release_baseline_tag=RELEASE_TAG,
+        )
+        is None
+    )
+
+    # Meanwhile active-window releases/v0.35.0 (no v0.35.0 final tag yet) IS selected!
+    d_active_v035 = post_merge.route_three_gears(
+        ls_remote_data=parsed,
+        verified_pin=VERIFIED_PIN,
+        release_baseline_tag=RELEASE_TAG,
+        requested_gear="auto",
+    )
+    assert d_active_v035["selected_gear"] == "rc_qualify"
+    assert d_active_v035["rc_tag"] == "releases/v0.35.0"
+    assert d_active_v035["target_sha"] == sha_v035_br
+
+    # Once final tag v0.35.0 is pushed, releases/v0.35.0 window closes immediately.
+    closed_v035 = {
+        **parsed,
+        "tags": {**parsed["tags"], "v0.35.0": _sha(987)},
+        "release_branches": {
+            **parsed["release_branches"],
+            "releases/v0.35.0": _sha(988),
+        },
+    }
+    d_closed_v035 = post_merge.route_three_gears(
+        ls_remote_data=closed_v035,
+        verified_pin=VERIFIED_PIN,
+        release_baseline_tag=RELEASE_TAG,
+        requested_gear="auto",
+    )
+    assert d_closed_v035["selected_gear"] == "probe"
+    assert d_closed_v035["target_sha"] == sha_main
+
+
+def test_rc_release_branch_priority_same_sha_dedup_cherrypick_bisect_and_cursor_isolation(
+    tmp_path,
+):
+    sha_main = _sha(990)
+    sha_main_green = _sha(991)
+    sha_rc0 = _sha(992)
+    sha_cp1 = _sha(993)
+    sha_cp2_bad = _sha(994)
+    sha_cp3_bad = _sha(995)
+    sha_rc1 = _sha(996)
+    sha_cp4 = _sha(997)
+
+    # Seed main cursor with healthy probe history and patch fingerprints.
+    fp_key = "t_" + "a" * 24
+    fp_val = "b" * 64
+    base_cursor = post_merge.advance_cursor(
+        None,
+        verified_pin=VERIFIED_PIN,
+        selected_gear="probe",
+        target_sha=sha_main_green,
+        status="pass",
+        cpu_status="pass",
+        ppu_status="pass",
+        patch_fingerprints={fp_key: fp_val},
+    )
+
+    # 1. Both untested v0.35.0rc0 AND releases/v0.35.0 exist -> named v0.35.0rc0 tag wins priority!
+    ls_rc0 = {
+        "main_sha": sha_main,
+        "tags": {"v0.35.0rc0": sha_rc0},
+        "release_branches": {"releases/v0.35.0": sha_rc0},
+    }
+    d1 = post_merge.route_three_gears(
+        ls_remote_data=ls_rc0,
+        verified_pin=VERIFIED_PIN,
+        release_baseline_tag="v0.34.0",
+        requested_gear="auto",
+        cursor=base_cursor,
+    )
+    assert d1["selected_gear"] == "rc_qualify"
+    assert d1["rc_tag"] == "v0.35.0rc0"
+    assert d1["target_sha"] == sha_rc0
+    assert d1["last_green_sha"] == sha_main_green
+
+    # If v0.35.0rc0 fails first, non-force poll with releases/v0.35.0 still at sha_rc0 must NOT re-run sha_rc0!
+    cur_rc0_fail = post_merge.advance_cursor(
+        base_cursor,
+        verified_pin=VERIFIED_PIN,
+        selected_gear="rc_qualify",
+        target_sha=sha_rc0,
+        rc_tag="v0.35.0rc0",
+        status="fail",
+        cpu_status="pass",
+        ppu_status="fail",
+    )
+    d_after_rc0_fail = post_merge.route_three_gears(
+        ls_remote_data=ls_rc0,
+        verified_pin=VERIFIED_PIN,
+        release_baseline_tag="v0.34.0",
+        requested_gear="auto",
+        cursor=cur_rc0_fail,
+    )
+    assert d_after_rc0_fail["selected_gear"] == "probe"
+    assert d_after_rc0_fail["target_sha"] == sha_main
+
+    # Now v0.35.0rc0 passes: same-SHA releases/v0.35.0 MUST deduplicate (noop on rc_qualify, probe on auto)!
+    cur_rc0_pass = post_merge.advance_cursor(
+        base_cursor,
+        verified_pin=VERIFIED_PIN,
+        selected_gear="rc_qualify",
+        target_sha=sha_rc0,
+        rc_tag="v0.35.0rc0",
+        status="pass",
+        cpu_status="pass",
+        ppu_status="pass",
+    )
+    d_same_sha_auto = post_merge.route_three_gears(
+        ls_remote_data=ls_rc0,
+        verified_pin=VERIFIED_PIN,
+        release_baseline_tag="v0.34.0",
+        requested_gear="auto",
+        cursor=cur_rc0_pass,
+    )
+    assert d_same_sha_auto["selected_gear"] == "probe"
+    assert d_same_sha_auto["target_sha"] == sha_main
+
+    d_same_sha_rc = post_merge.route_three_gears(
+        ls_remote_data=ls_rc0,
+        verified_pin=VERIFIED_PIN,
+        release_baseline_tag="v0.34.0",
+        requested_gear="rc_qualify",
+        cursor=cur_rc0_pass,
+    )
+    assert d_same_sha_rc["target_sha"] == ""
+    assert d_same_sha_rc["rc_tag"] == ""
+    assert d_same_sha_rc["run_cpu"] is False and d_same_sha_rc["run_ppu"] is False
+
+    # 2. Cherry-pick sha_cp1 lands on releases/v0.35.0 -> triggers rc_qualify with last_green_sha == sha_rc0!
+    ls_cp1 = {
+        "main_sha": sha_main,
+        "tags": {"v0.35.0rc0": sha_rc0},
+        "release_branches": {"releases/v0.35.0": sha_cp1},
+    }
+    d_cp1 = post_merge.route_three_gears(
+        ls_remote_data=ls_cp1,
+        verified_pin=VERIFIED_PIN,
+        release_baseline_tag="v0.34.0",
+        requested_gear="auto",
+        cursor=cur_rc0_pass,
+    )
+    assert d_cp1["selected_gear"] == "rc_qualify"
+    assert d_cp1["rc_tag"] == "releases/v0.35.0"
+    assert d_cp1["target_sha"] == sha_cp1
+    assert d_cp1["last_green_sha"] == sha_rc0
+    assert d_cp1["run_cpu"] is True and d_cp1["run_ppu"] is True
+
+    # sha_cp1 passes via full publish CLI -> public-summary.json, Step Summary, and cursor.json record releases/v0.35.0.
+    cursor_in = tmp_path / "cursor-in.json"
+    cursor_in.write_text(json.dumps(cur_rc0_pass, indent=2) + "\n", encoding="utf-8")
+    pub_cp1 = tmp_path / "pub-cp1"
+    summary_cp1 = tmp_path / "summary-cp1.md"
+    assert (
+        post_merge.main(
+            [
+                "publish",
+                "--gear",
+                "rc_qualify",
+                "--status",
+                "pass",
+                "--sail-sha",
+                _sha(998),
+                "--upstream-sha",
+                sha_cp1,
+                "--rc-tag",
+                "releases/v0.35.0",
+                "--cpu-status",
+                "pass",
+                "--ppu-status",
+                "pass",
+                "--cursor-in",
+                str(cursor_in),
+                "--public-dir",
+                str(pub_cp1),
+                "--step-summary",
+                str(summary_cp1),
+            ]
+        )
+        == 0
+    )
+    pub_sum = json.loads((pub_cp1 / "public-summary.json").read_text(encoding="utf-8"))
+    assert pub_sum["rc_tag"] == "releases/v0.35.0"
+    assert "(`releases/v0.35.0`)" in summary_cp1.read_text(encoding="utf-8")
+    cur_cp1_pass = json.loads((pub_cp1 / "cursor.json").read_text(encoding="utf-8"))
+    assert cur_cp1_pass["schema"] == 1
+    assert cur_cp1_pass["rc_branch_states"]["releases/v0.35.0"] == {
+        "sha": sha_cp1,
+        "status": "pass",
+        "last_green_sha": sha_cp1,
+    }
+
+    # Re-polling sha_cp1 now deduplicates cleanly!
+    assert (
+        post_merge.route_three_gears(
+            ls_remote_data=ls_cp1,
+            verified_pin=VERIFIED_PIN,
+            release_baseline_tag="v0.34.0",
+            requested_gear="rc_qualify",
+            cursor=cur_cp1_pass,
+        )["target_sha"]
+        == ""
+    )
+
+    # 3. Two consecutive cherry-pick failures (sha_cp2_bad, sha_cp3_bad) preserve last_green_sha == sha_cp1
+    #    and NEVER mutate main-branch cursors, patch_fingerprints, or probe_history!
+    ls_cp2 = {**ls_cp1, "release_branches": {"releases/v0.35.0": sha_cp2_bad}}
+    d_cp2 = post_merge.route_three_gears(
+        ls_remote_data=ls_cp2,
+        verified_pin=VERIFIED_PIN,
+        release_baseline_tag="v0.34.0",
+        requested_gear="auto",
+        cursor=cur_cp1_pass,
+    )
+    assert d_cp2["selected_gear"] == "rc_qualify"
+    assert d_cp2["last_green_sha"] == sha_cp1
+
+    cur_cp2_fail = post_merge.advance_cursor(
+        cur_cp1_pass,
+        verified_pin=VERIFIED_PIN,
+        selected_gear="rc_qualify",
+        target_sha=sha_cp2_bad,
+        rc_tag="releases/v0.35.0",
+        status="fail",
+        cpu_status="pass",
+        ppu_status="fail",
+    )
+    assert cur_cp2_fail["rc_branch_states"]["releases/v0.35.0"] == {
+        "sha": sha_cp2_bad,
+        "status": "fail",
+        "last_green_sha": sha_cp1,
+    }
+
+    ls_cp3 = {**ls_cp1, "release_branches": {"releases/v0.35.0": sha_cp3_bad}}
+    d_cp3 = post_merge.route_three_gears(
+        ls_remote_data=ls_cp3,
+        verified_pin=VERIFIED_PIN,
+        release_baseline_tag="v0.34.0",
+        requested_gear="auto",
+        cursor=cur_cp2_fail,
+    )
+    assert d_cp3["selected_gear"] == "rc_qualify"
+    assert d_cp3["last_green_sha"] == sha_cp1
+
+    cur_cp3_fail = post_merge.advance_cursor(
+        cur_cp2_fail,
+        verified_pin=VERIFIED_PIN,
+        selected_gear="rc_qualify",
+        target_sha=sha_cp3_bad,
+        rc_tag="refs/heads/releases/v0.35.0",
+        status="infra_error",
+        cpu_status="not_run",
+        ppu_status="not_run",
+    )
+    assert cur_cp3_fail["rc_branch_states"]["releases/v0.35.0"] == {
+        "sha": sha_cp3_bad,
+        "status": "infra_error",
+        "last_green_sha": sha_cp1,
+    }
+    for main_key in (
+        "last_cpu_checked_sha",
+        "last_cpu_green_sha",
+        "last_cpu_status",
+        "last_ppu_tested_sha",
+        "last_ppu_green_sha",
+        "last_ppu_status",
+        "patch_fingerprints",
+        "probe_history",
+        "last_probe_record",
+    ):
+        assert cur_cp3_fail[main_key] == base_cursor[main_key]
+
+    # 4. Newer v0.35.0rc1 tag passes -> advances branch last_green_sha to sha_rc1;
+    #    manual re-run of older v0.35.0rc0 does NOT regress branch last_green_sha!
+    cur_rc1_pass = post_merge.advance_cursor(
+        cur_cp3_fail,
+        verified_pin=VERIFIED_PIN,
+        selected_gear="rc_qualify",
+        target_sha=sha_rc1,
+        rc_tag="v0.35.0rc1",
+        status="pass",
+        cpu_status="pass",
+        ppu_status="pass",
+    )
+    assert (
+        cur_rc1_pass["rc_branch_states"]["releases/v0.35.0"]["last_green_sha"]
+        == sha_rc1
+    )
+    cur_manual_rc0 = post_merge.advance_cursor(
+        cur_rc1_pass,
+        verified_pin=VERIFIED_PIN,
+        selected_gear="rc_qualify",
+        target_sha=sha_rc0,
+        rc_tag="v0.35.0rc0",
+        status="pass",
+        cpu_status="pass",
+        ppu_status="pass",
+    )
+    assert (
+        cur_manual_rc0["rc_branch_states"]["releases/v0.35.0"]["last_green_sha"]
+        == sha_rc1
+    )
+    ls_cp4 = {
+        "main_sha": sha_main,
+        "tags": {"v0.35.0rc0": sha_rc0, "v0.35.0rc1": sha_rc1},
+        "release_branches": {"releases/v0.35.0": sha_cp4},
+    }
+    d_cp4 = post_merge.route_three_gears(
+        ls_remote_data=ls_cp4,
+        verified_pin=VERIFIED_PIN,
+        release_baseline_tag="v0.34.0",
+        requested_gear="auto",
+        cursor=cur_manual_rc0,
+    )
+    assert d_cp4["selected_gear"] == "rc_qualify"
+    assert d_cp4["rc_tag"] == "releases/v0.35.0"
+    assert d_cp4["last_green_sha"] == sha_rc1
+
+
+def test_rc_legacy_cursor_upgrade_and_manual_override_variants(tmp_path):
+    sha_main = _sha(1001)
+    sha_rc0 = _sha(1002)
+    sha_cp1 = _sha(1003)
+    sha_custom_green = _sha(1004)
+
+    # 1. Legacy schema-1 cursor without `rc_branch_states` (and even without `rc_tag_states` entry) upgrades cleanly.
+    legacy_cursor = {
+        "schema": 1,
+        "last_cpu_checked_sha": VERIFIED_PIN,
+        "last_cpu_green_sha": VERIFIED_PIN,
+        "last_cpu_status": "pass",
+        "last_ppu_tested_sha": VERIFIED_PIN,
+        "last_ppu_green_sha": VERIFIED_PIN,
+        "last_ppu_status": "pass",
+        "tested_rc_tags": ["v0.35.0rc0"],
+        "rc_tag_states": {},
+        "patch_fingerprints": {},
+        "probe_history": [],
+    }
+    sanitized = post_merge._sanitize_cursor(legacy_cursor, verified_pin=VERIFIED_PIN)
+    assert sanitized["schema"] == 1
+    assert sanitized["rc_branch_states"] == {}
+
+    # Legacy tested_rc_tags still deduplicates releases/v0.35.0 when tip_sha == tags["v0.35.0rc0"]!
+    ls_same = {
+        "main_sha": sha_main,
+        "tags": {"v0.35.0rc0": sha_rc0},
+        "release_branches": {"releases/v0.35.0": sha_rc0},
+    }
+    d_legacy_dedup = post_merge.route_three_gears(
+        ls_remote_data=ls_same,
+        verified_pin=VERIFIED_PIN,
+        release_baseline_tag="v0.34.0",
+        requested_gear="auto",
+        cursor=legacy_cursor,
+    )
+    assert d_legacy_dedup["selected_gear"] == "probe"
+
+    # And when releases/v0.35.0 advances to sha_cp1, legacy tested_rc_tags resolves sha_rc0 as last_green_sha!
+    ls_next = {
+        "main_sha": sha_main,
+        "tags": {"v0.35.0rc0": sha_rc0},
+        "release_branches": {"releases/v0.35.0": sha_cp1},
+    }
+    d_legacy_next = post_merge.route_three_gears(
+        ls_remote_data=ls_next,
+        verified_pin=VERIFIED_PIN,
+        release_baseline_tag="v0.34.0",
+        requested_gear="auto",
+        cursor=legacy_cursor,
+    )
+    assert d_legacy_next["selected_gear"] == "rc_qualify"
+    assert d_legacy_next["rc_tag"] == "releases/v0.35.0"
+    assert d_legacy_next["last_green_sha"] == sha_rc0
+
+    # 2. Manual overrides via `route` CLI: `releases/v0.35.0`, `refs/heads/releases/v0.35.0`, `v0.35.0rc0`, 40-char SHA,
+    #    plus `--last-green-sha` override.
+    ls_file = tmp_path / "ls-remote.txt"
+    ls_file.write_text(
+        f"{sha_main}\trefs/heads/main\n"
+        f"{sha_cp1}\trefs/heads/releases/v0.35.0\n"
+        f"{sha_rc0}\trefs/tags/v0.35.0rc0\n",
+        encoding="utf-8",
+    )
+    cur_file = tmp_path / "cursor.json"
+    cur_file.write_text(json.dumps(legacy_cursor), encoding="utf-8")
+    rel_file = tmp_path / "release-tag.txt"
+    rel_file.write_text("v0.34.0\n", encoding="utf-8")
+
+    for ref_arg in ("releases/v0.35.0", "refs/heads/releases/v0.35.0"):
+        gh_out = tmp_path / f"gh-{ref_arg.replace('/', '_')}.env"
+        assert (
+            post_merge.main(
+                [
+                    "route",
+                    "--ls-remote-file",
+                    str(ls_file),
+                    "--release-tag-file",
+                    str(rel_file),
+                    "--gear",
+                    "auto",
+                    "--upstream-ref",
+                    ref_arg,
+                    "--last-green-sha",
+                    sha_custom_green,
+                    "--cursor-file",
+                    str(cur_file),
+                    "--github-output",
+                    str(gh_out),
+                ]
+            )
+            == 0
+        )
+        kv = dict(
+            line.split("=", 1)
+            for line in gh_out.read_text(encoding="utf-8").strip().splitlines()
+        )
+        assert kv["selected_gear"] == "rc_qualify"
+        assert kv["rc_tag"] == "releases/v0.35.0"
+        assert kv["target_sha"] == sha_cp1
+        assert kv["last_green_sha"] == sha_custom_green
+
+    # Non-existent release branch override fails closed.
+    with pytest.raises(ValueError, match="RC release branch"):
+        post_merge.route_three_gears(
+            ls_remote_data=ls_next,
+            verified_pin=VERIFIED_PIN,
+            release_baseline_tag="v0.34.0",
+            requested_gear="rc_qualify",
+            upstream_ref_override="releases/v0.99.0",
+        )
+
+    # Malformed rc_branch_states keys/statuses fail closed.
+    for bad_branch_states in (
+        {"releases/v0.20.1-python-from-source": {"sha": sha_cp1, "status": "pass"}},
+        {"releases/v0.35.0": {"sha": sha_cp1, "status": "unknown"}},
+        {
+            "releases/v0.35.0": {
+                "sha": sha_cp1,
+                "status": "fail",
+                "last_green_sha": "bad",
+            }
+        },
+    ):
+        with pytest.raises(ValueError):
+            post_merge._sanitize_cursor(
+                {**legacy_cursor, "rc_branch_states": bad_branch_states},
+                verified_pin=VERIFIED_PIN,
+            )
