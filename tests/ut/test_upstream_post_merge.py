@@ -473,9 +473,11 @@ def test_gate4_bisection_control_first_and_dual_track_triage(tmp_path):
     assert ctrl_fail["steps_executed"] == 1
     assert ctrl_fail["probe_steps_on_range"] == 0
 
-    # 3. Dual-track classification: plugin_interface_break vs sail_internal_patch_drift.
-    pub_plugin_dir = tmp_path / "pub-plugin"
-    plugin_pub = post_merge.publish_sanitized_channels(
+    # 3. Dual-track classification with non-PPU hard gate:
+    #    (a) WITHOUT verified non-PPU repro evidence, even a public plugin registration
+    #        failure MUST downgrade to sail_internal_patch_drift!
+    pub_unverified_dir = tmp_path / "pub-plugin-unverified"
+    unverified_pub = post_merge.publish_sanitized_channels(
         gear="probe",
         status="fail",
         sail_sha=_sha(99),
@@ -494,17 +496,75 @@ def test_gate4_bisection_control_first_and_dual_track_triage(tmp_path):
             is_public_plugin_interface=True,
         ),
         run_url="https://github.com/vllm-project/vllm-sail/actions/runs/12345",
+        public_dir=pub_unverified_dir,
+    )
+    assert (
+        unverified_pub["public_summary"]["triage"]["classification"]
+        == "sail_internal_patch_drift"
+    )
+    assert unverified_pub["public_summary"]["triage"]["non_ppu_repro_verified"] is False
+    assert unverified_pub["issue_payload"]["should_file_sail_issue"] is True
+    assert unverified_pub["issue_payload"]["should_file_upstream_issue"] is False
+    assert unverified_pub["issue_payload"]["upstream_reproducer_markdown"] == ""
+
+    #    (b) WITH verified non-PPU repro evidence (last_good exit 0, first_failing exit != 0),
+    #        classifies as plugin_interface_break and renders fenced draft with inline stub plugin.
+    verified_repro = post_merge.NonPpuReproEvidence(
+        mode="stub_plugin_cpu",
+        repro_kind="load_general_plugins",
+        last_good_sha=window_commits[culprit_idx - 1],
+        first_failing_sha=culprit_sha,
+        last_good_exit_code=0,
+        first_failing_exit_code=1,
+        verified=True,
+    )
+    pub_plugin_dir = tmp_path / "pub-plugin"
+    plugin_pub = post_merge.publish_sanitized_channels(
+        gear="probe",
+        status="fail",
+        sail_sha=_sha(99),
+        upstream_sha=window_commits[-1],
+        verified_pin=VERIFIED_PIN,
+        cpu_status="fail",
+        ppu_status="skipped",
+        ppu_skip_reason="cpu_fast_check_failed",
+        first_failing_sha=culprit_sha,
+        last_good_sha=window_commits[culprit_idx - 1],
+        bisect_steps=bisect_data["steps_executed"],
+        outcome=post_merge.ProbeOutcome(
+            status="fail",
+            stage="plugin_registration",
+            target_signature="vllm.plugins.load_general_plugins",
+            is_public_plugin_interface=True,
+            non_ppu_repro=verified_repro,
+        ),
+        first_failing_author="vllm-maintainer",
+        run_url="https://github.com/vllm-project/vllm-sail/actions/runs/12345",
         public_dir=pub_plugin_dir,
     )
     assert (
         plugin_pub["public_summary"]["triage"]["classification"]
         == "plugin_interface_break"
     )
+    assert plugin_pub["public_summary"]["triage"]["non_ppu_repro_verified"] is True
+    assert (
+        plugin_pub["public_summary"]["triage"]["repro_kind"] == "load_general_plugins"
+    )
+    assert (
+        plugin_pub["public_summary"]["bisect"]["first_failing_author"]
+        == "vllm-maintainer"
+    )
     assert plugin_pub["issue_payload"]["should_file_sail_issue"] is False
+    assert plugin_pub["issue_payload"]["should_file_upstream_issue"] is False
     repro = plugin_pub["issue_payload"]["upstream_reproducer_markdown"]
+    assert "````markdown\n" in repro
     assert "VLLM_TARGET_DEVICE=empty" in repro
+    assert "vllm_stub_plugin" in repro
     assert culprit_sha in repro
     assert window_commits[culprit_idx - 1] in repro
+    assert "(cc @vllm-maintainer)" in repro
+    outside_fence = repro.split("````markdown\n", 1)[0]
+    assert "@vllm-maintainer" not in outside_fence
 
     pub_drift_dir = tmp_path / "pub-drift"
     drift_pub = post_merge.publish_sanitized_channels(
@@ -1945,4 +2005,899 @@ def test_review_r2_sub1_no_pin_downgrade_fail_closed_manifest_and_rc_ops_digest(
             tested_sha=sail_sha,
             expected_vllm_commit=vllm_sha,
             build_image=wrong_image,
+        )
+
+
+# ---------------------------------------------------------------------------
+# 2026-11-24 Maintainer Refinement: Non-PPU Repro Gate, Stub Plugins & @author
+# ---------------------------------------------------------------------------
+
+
+def _make_mock_vllm_git_repo(repo_dir: Path) -> dict[str, str]:
+    """Create a real multi-commit git repo with a minimal stdlib vLLM plugin surface."""
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "-C", str(repo_dir), "init", "-q"], check=True)
+    git_env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "Upstream Maintainer",
+        "GIT_COMMITTER_NAME": "Upstream Maintainer",
+        "GIT_AUTHOR_EMAIL": "12345+upstream-dev@users.noreply.github.com",
+        "GIT_COMMITTER_EMAIL": "12345+upstream-dev@users.noreply.github.com",
+    }
+
+    def _write_healthy_tree() -> None:
+        files = {
+            "vllm/__init__.py": (
+                '__version__ = "0.34.0.dev0"\n'
+                "from vllm.model_executor.models.registry import ModelRegistry\n"
+                '__all__ = ["ModelRegistry", "__version__"]\n'
+            ),
+            "vllm/plugins/__init__.py": (
+                "import importlib.metadata\n"
+                "import os\n\n"
+                "def load_plugins_by_group(group: str) -> dict:\n"
+                '    raw = os.environ.get("VLLM_PLUGINS")\n'
+                '    allowed = None if raw is None else {p.strip() for p in raw.split(",") if p.strip()}\n'
+                "    out = {}\n"
+                "    for ep in importlib.metadata.entry_points(group=group):\n"
+                "        if allowed is not None and ep.name not in allowed:\n"
+                "            continue\n"
+                "        out[ep.name] = ep.load()\n"
+                "    return out\n\n"
+                "def load_general_plugins() -> None:\n"
+                '    for fn in load_plugins_by_group("vllm.general_plugins").values():\n'
+                "        fn()\n"
+            ),
+            "vllm/platforms/__init__.py": (
+                "import importlib\n"
+                "from vllm.platforms.interface import Platform\n"
+                "from vllm.plugins import load_plugins_by_group\n\n"
+                "def _resolve_platform() -> Platform:\n"
+                '    plugins = load_plugins_by_group("vllm.platform_plugins")\n'
+                "    for fn in plugins.values():\n"
+                "        qual = fn()\n"
+                '        mod_name, attr_name = qual.rsplit(".", 1)\n'
+                "        cls = getattr(importlib.import_module(mod_name), attr_name)\n"
+                "        return cls()\n"
+                "    return Platform()\n\n"
+                "current_platform = _resolve_platform()\n"
+            ),
+            "vllm/platforms/interface.py": (
+                "from enum import Enum\n\n"
+                "class PlatformEnum(Enum):\n"
+                '    CUDA = "cuda"\n'
+                '    OOT = "oot"\n\n'
+                "class Platform:\n"
+                "    _enum = PlatformEnum.OOT\n"
+                '    device_name = "unspecified"\n'
+                '    device_type = "cpu"\n\n'
+                "    def is_out_of_tree(self) -> bool:\n"
+                "        return self._enum == PlatformEnum.OOT\n"
+            ),
+            "vllm/model_executor/__init__.py": "",
+            "vllm/model_executor/custom_op.py": (
+                "class CustomOp:\n"
+                "    op_registry = {}\n"
+                "    op_registry_oot = {}\n\n"
+                "    @classmethod\n"
+                "    def register(cls, name: str):\n"
+                "        def _dec(sub):\n"
+                "            cls.op_registry[name] = sub\n"
+                "            return sub\n"
+                "        return _dec\n\n"
+                "    @classmethod\n"
+                "    def register_oot(cls, _decorated_op_cls=None, name: str | None = None):\n"
+                "        def _dec(sub):\n"
+                "            key = name or sub.__name__\n"
+                "            cls.op_registry_oot[key] = sub\n"
+                "            return sub\n"
+                "        return _dec if _decorated_op_cls is None else _dec(_decorated_op_cls)\n"
+            ),
+            "vllm/model_executor/models/__init__.py": "",
+            "vllm/model_executor/models/registry.py": (
+                "class _Registry:\n"
+                "    def __init__(self) -> None:\n"
+                "        self.models = {}\n\n"
+                "    def register_model(self, arch: str, target: str) -> None:\n"
+                "        self.models[arch] = target\n\n"
+                "    def get_supported_archs(self) -> set[str]:\n"
+                "        return set(self.models)\n\n"
+                "ModelRegistry = _Registry()\n"
+            ),
+        }
+        for rel, content in files.items():
+            p = repo_dir / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content, encoding="utf-8")
+
+    def _commit(msg: str) -> str:
+        subprocess.run(["git", "-C", str(repo_dir), "add", "-A"], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo_dir), "commit", "-qm", msg],
+            check=True,
+            env=git_env,
+        )
+        return subprocess.check_output(
+            ["git", "-C", str(repo_dir), "rev-parse", "HEAD"], text=True
+        ).strip()
+
+    _write_healthy_tree()
+    good_sha = _commit("healthy baseline")
+    shas = {"good": good_sha}
+
+    # Second healthy commit (negative control: must NOT verify as a regression).
+    (repo_dir / "README.md").write_text("docs touch\n", encoding="utf-8")
+    shas["good_2"] = _commit("docs only change")
+
+    # Create independent regression commits branching off `good_sha` for each of the 5 kinds.
+    mutations = {
+        "cpu_empty_build": (
+            "vllm/__init__.py",
+            'raise RuntimeError("VLLM_TARGET_DEVICE=empty build broken")\n',
+        ),
+        "platform_plugin": (
+            "vllm/platforms/interface.py",
+            "from enum import Enum\n"
+            "class PlatformEnum(Enum):\n"
+            '    CUDA = "cuda"\n'
+            "class Platform:\n"
+            "    pass\n",
+        ),
+        "register_oot": (
+            "vllm/model_executor/custom_op.py",
+            "class CustomOp:\n"
+            "    op_registry = {}\n"
+            "    op_registry_oot = {}\n"
+            "    @classmethod\n"
+            "    def register(cls, name: str):\n"
+            "        def _dec(sub):\n"
+            "            cls.op_registry[name] = sub\n"
+            "            return sub\n"
+            "        return _dec\n",
+        ),
+        "model_registry": (
+            "vllm/model_executor/models/registry.py",
+            "class _Registry:\n"
+            "    def __init__(self) -> None:\n"
+            "        self.models = {}\n"
+            "    def get_supported_archs(self) -> set[str]:\n"
+            "        return set(self.models)\n"
+            "ModelRegistry = _Registry()\n",
+        ),
+        "load_general_plugins": (
+            "vllm/plugins/__init__.py",
+            "def load_plugins_by_group(group: str) -> dict:\n"
+            "    return {}\n"
+            "def load_general_plugins() -> None:\n"
+            "    return None\n",
+        ),
+    }
+    for kind, (rel_path, broken_body) in mutations.items():
+        subprocess.run(
+            ["git", "-C", str(repo_dir), "checkout", "-q", "--detach", good_sha],
+            check=True,
+        )
+        (repo_dir / rel_path).write_text(broken_body, encoding="utf-8")
+        shas[kind] = _commit(f"break {kind}")
+
+    return shas
+
+
+@pytest.mark.parametrize(
+    ("stage", "target_signature", "expected_kind", "expected_mode"),
+    [
+        (
+            "wheel_build",
+            "VLLM_TARGET_DEVICE=empty",
+            "cpu_empty_build",
+            "cpu_empty_build",
+        ),
+        (
+            "plugin_registration",
+            "vllm.platforms.Platform",
+            "platform_plugin",
+            "stub_plugin_cpu",
+        ),
+        (
+            "plugin_registration",
+            "CustomOp.register_oot",
+            "register_oot",
+            "stub_plugin_cpu",
+        ),
+        (
+            "plugin_registration",
+            "ModelRegistry.register_model",
+            "model_registry",
+            "stub_plugin_cpu",
+        ),
+        (
+            "plugin_registration",
+            "vllm.plugins.load_general_plugins",
+            "load_general_plugins",
+            "stub_plugin_cpu",
+        ),
+    ],
+)
+def test_non_ppu_repro_hard_gate_real_stub_plugins_all_five_kinds(
+    tmp_path, stage, target_signature, expected_kind, expected_mode
+):
+    """Execute real inline stub plugin / CPU checks on a 2-commit git repo for all 5 kinds."""
+    repo = tmp_path / "mock-vllm"
+    shas = _make_mock_vllm_git_repo(repo)
+    repro_out = tmp_path / f"repro-{expected_kind}.json"
+
+    # Real subprocess probe checking out $CANDIDATE_SHA and executing materialized
+    # $STUB_SITE_DIR + $STUB_CHECK_SCRIPT with zero vllm-sail and zero PPU hardware.
+    probe_cmd = (
+        "set -euo pipefail\n"
+        'wt="$(mktemp -d)"\n'
+        'trap \'git -C "$VLLM_REPO" worktree remove --force "$wt" >/dev/null 2>&1 || rm -rf "$wt"\' EXIT\n'
+        'git -C "$VLLM_REPO" worktree add --quiet --detach "$wt" "$CANDIDATE_SHA"\n'
+        f'PYTHONPATH="$STUB_SITE_DIR:$wt" "{sys.executable}" "$STUB_CHECK_SCRIPT"\n'
+    )
+    rc = post_merge.main(
+        [
+            "verify-non-ppu-repro",
+            "--vllm-repo",
+            str(repo),
+            "--last-good-sha",
+            shas["good"],
+            "--first-failing-sha",
+            shas[expected_kind],
+            "--stage",
+            stage,
+            "--target-signature",
+            target_signature,
+            "--probe-cmd",
+            probe_cmd,
+            "--output-json",
+            str(repro_out),
+        ]
+    )
+    assert rc == 0
+    repro_data = json.loads(repro_out.read_text(encoding="utf-8"))
+    post_merge.assert_zero_sensitive_leaks(repro_out.read_text(encoding="utf-8"))
+    assert repro_data == {
+        "first_failing_exit_code": 1,
+        "first_failing_sha": shas[expected_kind],
+        "last_good_exit_code": 0,
+        "last_good_sha": shas["good"],
+        "mode": expected_mode,
+        "repro_kind": expected_kind,
+        "verified": True,
+    }
+
+    # Feed verified receipt + commit author metadata into `publish` CLI end-to-end.
+    commit_json = tmp_path / f"commit-{expected_kind}.json"
+    commit_json.write_text(
+        json.dumps(
+            {
+                "sha": shas[expected_kind],
+                "author": {"login": "kevin-luu", "type": "User"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    pub_dir = tmp_path / f"pub-{expected_kind}"
+    summary_path = tmp_path / f"summary-{expected_kind}.md"
+    pub_rc = post_merge.main(
+        [
+            "publish",
+            "--gear",
+            "probe",
+            "--status",
+            "fail",
+            "--sail-sha",
+            _sha(901),
+            "--upstream-sha",
+            shas[expected_kind],
+            "--cpu-status",
+            "fail",
+            "--ppu-status",
+            "skipped",
+            "--ppu-skip-reason",
+            "cpu_fast_check_failed",
+            "--first-failing-sha",
+            shas[expected_kind],
+            "--last-good-sha",
+            shas["good"],
+            "--failure-stage",
+            stage,
+            "--target-signature",
+            target_signature,
+            "--public-plugin-break",
+            "--non-ppu-repro-json",
+            str(repro_out),
+            "--upstream-commit-json",
+            str(commit_json),
+            "--public-dir",
+            str(pub_dir),
+            "--step-summary",
+            str(summary_path),
+        ]
+    )
+    assert pub_rc == 0
+    summary_json = json.loads(
+        (pub_dir / "public-summary.json").read_text(encoding="utf-8")
+    )
+    issue_json = json.loads(
+        (pub_dir / "issue-payload.json").read_text(encoding="utf-8")
+    )
+    assert summary_json["triage"]["classification"] == "plugin_interface_break"
+    assert summary_json["triage"]["non_ppu_repro_verified"] is True
+    assert summary_json["triage"]["non_ppu_repro_mode"] == expected_mode
+    assert summary_json["triage"]["repro_kind"] == expected_kind
+    assert summary_json["bisect"]["first_failing_author"] == "kevin-luu"
+    assert issue_json["should_file_sail_issue"] is False
+    assert issue_json["should_file_upstream_issue"] is False
+    assert issue_json["first_failing_author"] == "kevin-luu"
+
+    repro_md = issue_json["upstream_reproducer_markdown"]
+    assert "````markdown\n" in repro_md
+    assert "(cc @kevin-luu)" in repro_md
+    assert f"(`{expected_kind}`)" in repro_md
+    # Extract the embedded bash script and verify syntax with `bash -n`.
+    bash_block = repro_md.split("```bash\n", 1)[1].split("\n```", 1)[0]
+    script_file = tmp_path / f"repro-{expected_kind}.sh"
+    script_file.write_text(bash_block + "\n", encoding="utf-8")
+    syntax = subprocess.run(
+        ["bash", "-n", str(script_file)], capture_output=True, text=True
+    )
+    assert syntax.returncode == 0, syntax.stderr
+    post_merge.assert_zero_sensitive_leaks(repro_md)
+    post_merge.assert_zero_sensitive_leaks(summary_path.read_text(encoding="utf-8"))
+
+
+def test_non_ppu_repro_hard_gate_negative_controls_ppu_only_and_tampered_evidence(
+    tmp_path,
+):
+    repo = tmp_path / "mock-vllm-neg"
+    shas = _make_mock_vllm_git_repo(repo)
+    probe_cmd = (
+        "set -euo pipefail\n"
+        'wt="$(mktemp -d)"\n'
+        'trap \'git -C "$VLLM_REPO" worktree remove --force "$wt" >/dev/null 2>&1 || rm -rf "$wt"\' EXIT\n'
+        'git -C "$VLLM_REPO" worktree add --quiet --detach "$wt" "$CANDIDATE_SHA"\n'
+        f'PYTHONPATH="$STUB_SITE_DIR:$wt" "{sys.executable}" "$STUB_CHECK_SCRIPT"\n'
+    )
+
+    # 1. Real negative control A: both last_good and candidate exit 0 -> verified=False!
+    no_repro = post_merge.verify_non_ppu_reproducer(
+        vllm_repo=repo,
+        last_good_sha=shas["good"],
+        first_failing_sha=shas["good_2"],
+        stage="plugin_registration",
+        target_signature="vllm.plugins.load_general_plugins",
+        probe_cmd=probe_cmd,
+    )
+    assert no_repro.last_good_exit_code == 0
+    assert no_repro.first_failing_exit_code == 0
+    assert no_repro.verified is False
+
+    # 2. Real negative control B: last_good itself fails (control broken) -> verified=False!
+    broken_ctrl = post_merge.verify_non_ppu_reproducer(
+        vllm_repo=repo,
+        last_good_sha=shas["register_oot"],
+        first_failing_sha=shas["model_registry"],
+        stage="plugin_registration",
+        target_signature="CustomOp.register_oot",
+        probe_cmd=probe_cmd,
+    )
+    assert broken_ctrl.last_good_exit_code != 0
+    assert broken_ctrl.verified is False
+
+    # 3. Every PPU hardware stage (ppu_probe_smoke / rc_*) WITHOUT CPU/stub repro MUST
+    #    route to vllm-sail internal tracking with zero upstream payload!
+    for ppu_stage in sorted(post_merge.PPU_HARDWARE_STAGES):
+        out_dir = tmp_path / f"ppu-only-{ppu_stage}"
+        res = post_merge.publish_sanitized_channels(
+            gear="probe" if ppu_stage == "ppu_probe_smoke" else "rc_qualify",
+            status="fail",
+            sail_sha=_sha(910),
+            upstream_sha=shas["register_oot"],
+            verified_pin=VERIFIED_PIN,
+            cpu_status="pass",
+            ppu_status="fail",
+            first_failing_sha=shas["register_oot"],
+            last_good_sha=shas["good"],
+            outcome=post_merge.ProbeOutcome(
+                status="fail",
+                stage=ppu_stage,
+                target_signature="vllm.plugins.load_general_plugins",
+                is_public_plugin_interface=True,
+                non_ppu_repro=None,
+            ),
+            first_failing_author="kevin-luu",
+            public_dir=out_dir,
+        )
+        assert (
+            res["public_summary"]["triage"]["classification"]
+            == "sail_internal_patch_drift"
+        )
+        assert res["public_summary"]["triage"]["non_ppu_repro_verified"] is False
+        assert res["public_summary"]["bisect"]["first_failing_author"] is None
+        assert res["issue_payload"]["should_file_sail_issue"] is True
+        assert res["issue_payload"]["should_file_upstream_issue"] is False
+        assert res["issue_payload"]["upstream_reproducer_markdown"] == ""
+        assert "@kevin-luu" not in res["markdown"]
+
+    # 4. Every SAIL-internal stage blocks plugin_interface_break EVEN WITH valid repro evidence!
+    valid_stub = post_merge.NonPpuReproEvidence(
+        mode="stub_plugin_cpu",
+        repro_kind="load_general_plugins",
+        last_good_sha=shas["good"],
+        first_failing_sha=shas["load_general_plugins"],
+        last_good_exit_code=0,
+        first_failing_exit_code=1,
+        verified=True,
+    )
+    for internal_stage in sorted(post_merge.SAIL_INTERNAL_ONLY_STAGES):
+        triage = post_merge.classify_failure(
+            post_merge.ProbeOutcome(
+                status="fail",
+                stage=internal_stage,
+                target_signature="vllm.plugins.load_general_plugins",
+                is_public_plugin_interface=True,
+                non_ppu_repro=valid_stub,
+            ),
+            last_good_sha=shas["good"],
+            first_failing_sha=shas["load_general_plugins"],
+            require_shas=True,
+        )
+        assert triage["classification"] == "sail_internal_patch_drift"
+        assert triage["non_ppu_repro_verified"] is False
+
+    # 5. Tampered / bool-trapped / stale / mismatched-stage evidence MUST fail closed!
+    bad_evidences = [
+        post_merge.NonPpuReproEvidence(
+            "stub_plugin_cpu",
+            "load_general_plugins",
+            shas["good"],
+            shas["load_general_plugins"],
+            1,
+            1,
+            True,
+        ),
+        post_merge.NonPpuReproEvidence(
+            "stub_plugin_cpu",
+            "load_general_plugins",
+            shas["good"],
+            shas["load_general_plugins"],
+            0,
+            0,
+            True,
+        ),
+        post_merge.NonPpuReproEvidence(
+            "stub_plugin_cpu",
+            "load_general_plugins",
+            shas["good"],
+            shas["load_general_plugins"],
+            False,  # type: ignore[arg-type]
+            True,  # type: ignore[arg-type]
+            True,
+        ),
+        post_merge.NonPpuReproEvidence(
+            "stub_plugin_cpu",
+            "load_general_plugins",
+            shas["good"],
+            shas["good"],
+            0,
+            1,
+            True,
+        ),
+        post_merge.NonPpuReproEvidence(
+            "stub_plugin_cpu",
+            "load_general_plugins",
+            shas["good"],
+            shas["register_oot"],
+            0,
+            1,
+            True,
+        ),  # mismatched first_failing_sha
+        post_merge.NonPpuReproEvidence(
+            "cpu_empty_build",
+            "cpu_empty_build",
+            shas["good"],
+            shas["load_general_plugins"],
+            0,
+            1,
+            True,
+        ),  # wrong mode for plugin_registration
+        post_merge.NonPpuReproEvidence(
+            "stub_plugin_cpu",
+            "load_general_plugins",
+            shas["good"],
+            shas["load_general_plugins"],
+            0,
+            1,
+            False,
+        ),
+    ]
+    for idx, ev in enumerate(bad_evidences):
+        triage = post_merge.classify_failure(
+            post_merge.ProbeOutcome(
+                status="fail",
+                stage="plugin_registration",
+                target_signature="vllm.plugins.load_general_plugins",
+                is_public_plugin_interface=True,
+                non_ppu_repro=ev,
+            ),
+            last_good_sha=shas["good"],
+            first_failing_sha=shas["load_general_plugins"],
+            require_shas=True,
+        )
+        assert triage["classification"] == "sail_internal_patch_drift", (
+            f"case {idx} leaked"
+        )
+        assert triage["non_ppu_repro_verified"] is False
+
+    # 6. Forged JSON (`verified: true` with `first_failing_exit_code: 0`) & corrupted JSON on `publish` CLI
+    forged_json = tmp_path / "forged-repro.json"
+    forged_json.write_text(
+        json.dumps(
+            {
+                "mode": "stub_plugin_cpu",
+                "repro_kind": "load_general_plugins",
+                "last_good_sha": shas["good"],
+                "first_failing_sha": shas["load_general_plugins"],
+                "last_good_exit_code": 0,
+                "first_failing_exit_code": 0,
+                "verified": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    corrupt_json = tmp_path / "corrupt-repro.json"
+    corrupt_json.write_text("{not valid json", encoding="utf-8")
+    for label, path in (("forged", forged_json), ("corrupt", corrupt_json)):
+        pub_dir = tmp_path / f"pub-{label}"
+        assert (
+            post_merge.main(
+                [
+                    "publish",
+                    "--gear",
+                    "probe",
+                    "--status",
+                    "fail",
+                    "--sail-sha",
+                    _sha(911),
+                    "--upstream-sha",
+                    shas["load_general_plugins"],
+                    "--first-failing-sha",
+                    shas["load_general_plugins"],
+                    "--last-good-sha",
+                    shas["good"],
+                    "--failure-stage",
+                    "plugin_registration",
+                    "--target-signature",
+                    "vllm.plugins.load_general_plugins",
+                    "--public-plugin-break",
+                    "--non-ppu-repro-json",
+                    str(path),
+                    "--public-dir",
+                    str(pub_dir),
+                ]
+            )
+            == 0
+        )
+        pub_sum = json.loads(
+            (pub_dir / "public-summary.json").read_text(encoding="utf-8")
+        )
+        pub_iss = json.loads(
+            (pub_dir / "issue-payload.json").read_text(encoding="utf-8")
+        )
+        assert pub_sum["triage"]["classification"] == "sail_internal_patch_drift"
+        assert pub_iss["should_file_sail_issue"] is True
+        assert pub_iss["upstream_reproducer_markdown"] == ""
+
+
+def test_upstream_reproducer_author_resolution_fenced_template_and_zero_bare_ping(
+    tmp_path, monkeypatch
+):
+    bad_sha = _sha(920)
+    good_sha = _sha(919)
+    sail_sha = _sha(921)
+
+    # 1. Handle sanitization & commit metadata parsing matrix.
+    assert post_merge.sanitize_github_login("youkaichao") == "youkaichao"
+    assert post_merge.sanitize_github_login("kevin-luu") == "kevin-luu"
+    assert post_merge.sanitize_github_login("A1") == "A1"
+    for invalid in (
+        "",
+        None,
+        "@alice",
+        "-leading",
+        "trailing-",
+        "double--hyphen",
+        "dependabot[bot]",
+        "vllm-project/maintainers",
+        "alice\ncc @bob",
+        "a" * 40,
+        "wb-998877",
+        "step-5-preview",
+    ):
+        assert post_merge.sanitize_github_login(invalid) == "", f"accepted {invalid!r}"
+
+    # Valid user commit metadata
+    assert (
+        post_merge.parse_commit_author_login(
+            {"sha": bad_sha, "author": {"login": "youkaichao", "type": "User"}},
+            expected_sha=bad_sha,
+        )
+        == "youkaichao"
+    )
+    # Bot user (even with noreply email) degrades to ""
+    assert (
+        post_merge.parse_commit_author_login(
+            {
+                "sha": bad_sha,
+                "author": {"login": "dependabot", "type": "Bot"},
+                "commit": {
+                    "author": {"email": "49699333+dependabot@users.noreply.github.com"}
+                },
+            },
+            expected_sha=bad_sha,
+        )
+        == ""
+    )
+    # Null author + GitHub noreply email resolves login cleanly
+    assert (
+        post_merge.parse_commit_author_login(
+            {
+                "sha": bad_sha,
+                "author": None,
+                "commit": {
+                    "author": {"email": "987654+kevin-luu@users.noreply.github.com"}
+                },
+            },
+            expected_sha=bad_sha,
+        )
+        == "kevin-luu"
+    )
+    # Null author + corporate/private email degrades to "" (zero email leak)
+    assert (
+        post_merge.parse_commit_author_login(
+            {
+                "sha": bad_sha,
+                "author": None,
+                "commit": {"author": {"email": "dev@alibaba-inc.com"}},
+            },
+            expected_sha=bad_sha,
+        )
+        == ""
+    )
+    # Mismatched commit SHA degrades to ""
+    assert (
+        post_merge.parse_commit_author_login(
+            {"sha": good_sha, "author": {"login": "youkaichao", "type": "User"}},
+            expected_sha=bad_sha,
+        )
+        == ""
+    )
+
+    # 2. Remote lookup helper (mocked urlopen): valid 200 vs network failure + repo allowlist.
+    class _FakeResp:
+        def __init__(self, body: bytes) -> None:
+            self._body = body
+
+        def read(self, _n: int = -1) -> bytes:
+            return self._body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(
+        post_merge.urllib.request,
+        "urlopen",
+        lambda req, timeout=10: _FakeResp(
+            json.dumps(
+                {"sha": bad_sha, "author": {"login": "youkaichao", "type": "User"}}
+            ).encode("utf-8")
+        ),
+    )
+    assert (
+        post_merge.resolve_upstream_commit_author(bad_sha, fetch_remote=True)
+        == "youkaichao"
+    )
+    # Non-allowlisted repo is rejected fail-closed.
+    assert (
+        post_merge.resolve_upstream_commit_author(
+            bad_sha, repo="internal/repo", fetch_remote=True
+        )
+        == ""
+    )
+
+    def _net_fail(*args, **kwargs):
+        raise OSError("network unavailable")
+
+    monkeypatch.setattr(post_merge.urllib.request, "urlopen", _net_fail)
+    assert post_merge.resolve_upstream_commit_author(bad_sha, fetch_remote=True) == ""
+
+    # 3. Fenced markdown template invariant: `@author` ONLY inside ````markdown fence, ZERO bare pings!
+    repro_ev = post_merge.NonPpuReproEvidence(
+        mode="stub_plugin_cpu",
+        repro_kind="platform_plugin",
+        last_good_sha=good_sha,
+        first_failing_sha=bad_sha,
+        last_good_exit_code=0,
+        first_failing_exit_code=1,
+        verified=True,
+    )
+    with_author = post_merge.render_upstream_reproducer(
+        first_failing_sha=bad_sha,
+        last_good_sha=good_sha,
+        sail_sha=sail_sha,
+        stage="plugin_registration",
+        target_signature="vllm.platforms.Platform",
+        repro_kind="platform_plugin",
+        first_failing_author="youkaichao",
+        non_ppu_repro=repro_ev,
+        run_url="https://github.com/vllm-project/vllm-sail/actions/runs/55555",
+    )
+    parts = with_author.split("````markdown\n", 1)
+    assert len(parts) == 2
+    before_fence = parts[0]
+    inside_and_after = parts[1].split("\n````", 1)
+    assert len(inside_and_after) == 2
+    inside_fence, after_fence = inside_and_after
+    assert "@" not in before_fence
+    assert "@" not in after_fence
+    assert f"`{bad_sha}` (cc @youkaichao)" in inside_fence
+    assert "vllm.platform_plugins" in inside_fence
+    assert "StubPlatform" in inside_fence
+    assert f"`{good_sha}` -> `0`; `{bad_sha}` -> `1`" in inside_fence
+
+    # Missing/sensitive author degrades cleanly to SHA-only with zero `@` mentions.
+    without_author = post_merge.render_upstream_reproducer(
+        first_failing_sha=bad_sha,
+        last_good_sha=good_sha,
+        sail_sha=sail_sha,
+        stage="plugin_registration",
+        target_signature="ModelRegistry.register_model",
+        repro_kind="model_registry",
+        first_failing_author="wb-998877",
+        non_ppu_repro=None,
+    )
+    assert "@" not in without_author
+    assert bad_sha in without_author
+    assert "StubOOTForCausalLM" in without_author
+    post_merge.assert_zero_sensitive_leaks(without_author)
+
+    # Verify full GITHUB_STEP_SUMMARY output also has zero bare pings outside fenced block!
+    summary_file = tmp_path / "step_summary.md"
+    post_merge.publish_sanitized_channels(
+        gear="probe",
+        status="fail",
+        sail_sha=sail_sha,
+        upstream_sha=bad_sha,
+        verified_pin=VERIFIED_PIN,
+        cpu_status="fail",
+        ppu_status="skipped",
+        ppu_skip_reason="cpu_fast_check_failed",
+        first_failing_sha=bad_sha,
+        last_good_sha=good_sha,
+        outcome=post_merge.ProbeOutcome(
+            status="fail",
+            stage="plugin_registration",
+            target_signature="vllm.platforms.Platform",
+            is_public_plugin_interface=True,
+            non_ppu_repro=repro_ev,
+        ),
+        first_failing_author="youkaichao",
+        public_dir=tmp_path / "pub-fenced",
+        step_summary_path=summary_file,
+    )
+    full_md = summary_file.read_text(encoding="utf-8")
+    md_before, md_rest = full_md.split("````markdown\n", 1)
+    md_inside, md_after = md_rest.split("\n````", 1)
+    assert "@" not in md_before
+    assert "@" not in md_after
+    assert "@youkaichao" in md_inside
+
+
+def test_verify_non_ppu_reproducer_builtin_runner_workflow_and_fingerprint_compat(
+    tmp_path, monkeypatch
+):
+    # 1. Built-in runner path (`probe_cmd=""`) uses git worktree, VLLM_TARGET_DEVICE=empty,
+    #    VLLM_PLUGINS=stub, cleans up worktrees, and fails closed on TimeoutExpired.
+    good_sha = _sha(930)
+    bad_sha = _sha(931)
+    calls: list[tuple[list[str], dict[str, str]]] = []
+    removed_worktrees: list[str] = []
+
+    def _fake_run(cmd, **kwargs):
+        cmd_list = [str(c) for c in cmd]
+        calls.append((cmd_list, dict(kwargs.get("env") or {})))
+        if (
+            cmd_list[:4] == ["git", "-C", str(tmp_path), "worktree"]
+            and cmd_list[4] == "add"
+        ):
+            wt_path = Path(cmd_list[7])
+            wt_path.mkdir(parents=True, exist_ok=True)
+            (wt_path / "tools").mkdir(exist_ok=True)
+            (wt_path / "tools" / "use_existing_torch.py").write_text(
+                "", encoding="utf-8"
+            )
+            return subprocess.CompletedProcess(cmd_list, 0, "", "")
+        if (
+            cmd_list[:4] == ["git", "-C", str(tmp_path), "worktree"]
+            and cmd_list[4] == "remove"
+        ):
+            removed_worktrees.append(cmd_list[6])
+            return subprocess.CompletedProcess(cmd_list, 0, "", "")
+        if "repro_check.py" in " ".join(cmd_list):
+            sha = (kwargs.get("env") or {}).get("CANDIDATE_SHA")
+            return subprocess.CompletedProcess(
+                cmd_list, 0 if sha == good_sha else 1, "", ""
+            )
+        return subprocess.CompletedProcess(cmd_list, 0, "", "")
+
+    monkeypatch.setattr(post_merge.subprocess, "run", _fake_run)
+    ev = post_merge.verify_non_ppu_reproducer(
+        vllm_repo=tmp_path,
+        last_good_sha=good_sha,
+        first_failing_sha=bad_sha,
+        stage="plugin_registration",
+        target_signature="CustomOp.register_oot",
+    )
+    assert ev.verified is True
+    assert ev.mode == "stub_plugin_cpu"
+    assert ev.repro_kind == "register_oot"
+    assert ev.last_good_exit_code == 0
+    assert ev.first_failing_exit_code == 1
+    assert len(removed_worktrees) == 2
+    pip_calls = [c for c in calls if "pip" in c[0] and "install" in c[0]]
+    assert len(pip_calls) == 2
+    for _, env_used in pip_calls:
+        assert env_used["VLLM_TARGET_DEVICE"] == "empty"
+        assert env_used["CUDA_VISIBLE_DEVICES"] == ""
+        assert env_used["VLLM_PLUGINS"] == "stub"
+
+    # Timeout during first_failing_sha -> verified=False (never false-positive regression!)
+    def _timeout_on_bad(cmd, **kwargs):
+        cmd_list = [str(c) for c in cmd]
+        if (
+            "repro_check.py" in " ".join(cmd_list)
+            and (kwargs.get("env") or {}).get("CANDIDATE_SHA") == bad_sha
+        ):
+            raise subprocess.TimeoutExpired(cmd_list, 10)
+        return _fake_run(cmd, **kwargs)
+
+    monkeypatch.setattr(post_merge.subprocess, "run", _timeout_on_bad)
+    ev_to = post_merge.verify_non_ppu_reproducer(
+        vllm_repo=tmp_path,
+        last_good_sha=good_sha,
+        first_failing_sha=bad_sha,
+        stage="plugin_registration",
+        target_signature="CustomOp.register_oot",
+    )
+    assert ev_to.verified is False
+    assert ev_to.first_failing_exit_code == 124
+
+    # 2. Verify upstream-canary.yaml wires verify-non-ppu-repro, --non-ppu-repro-json,
+    #    --fetch-upstream-author, and explicitly forbids cross-repo upstream issue creation.
+    wf_raw = (REPO_ROOT / ".github/workflows/upstream-canary.yaml").read_text(
+        encoding="utf-8"
+    )
+    assert "verify-non-ppu-repro" in wf_raw
+    assert "/tmp/post-merge-cpu/non-ppu-repro.json" in wf_raw
+    assert "--non-ppu-repro-json /tmp/post-merge-meta/non-ppu-repro.json" in wf_raw
+    assert "--fetch-upstream-author" in wf_raw
+    assert "payload.should_file_upstream_issue" in wf_raw
+
+    # 3. Verify ppu_native_fingerprint_compat.json matches current _ppu-build.yaml /
+    #    build_ppu_wheels.sh / ppu_wheel_manifest.py after merging main.
+    compat = json.loads(
+        (REPO_ROOT / "scripts/ci/ppu_native_fingerprint_compat.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert set(compat) == set(wheel_manifest.FINGERPRINT_COMPAT_PATHS)
+    for rel_path, entry in compat.items():
+        actual_sha = hashlib.sha256((REPO_ROOT / rel_path).read_bytes()).hexdigest()
+        assert entry["current"] == actual_sha, (
+            f"ppu_native_fingerprint_compat.json stale for {rel_path}"
         )

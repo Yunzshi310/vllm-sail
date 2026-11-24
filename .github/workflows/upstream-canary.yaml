@@ -312,6 +312,7 @@ jobs:
           if [[ "$rc" -ne 0 && -n "${LAST_GREEN_SHA}" && "${LAST_GREEN_SHA}" != "${TARGET_SHA}" ]]; then
             SAIL_ROOT="$PWD"
             export SAIL_ROOT
+            # shellcheck disable=SC2016
             probe_cmd='
               set -euo pipefail
               git -C /tmp/vllm-src checkout --quiet --detach "${CANDIDATE_SHA}"
@@ -342,6 +343,43 @@ jobs:
               --initial-red-json /tmp/post-merge-cpu/cpu-result.json \
               --default-stage plugin_registration \
               --output-json /tmp/post-merge-cpu/bisect-result.json >/dev/null
+
+            if [[ -f /tmp/post-merge-cpu/bisect-result.json ]]; then
+              python3 - <<'PY' || true
+          import json, subprocess, sys
+          from pathlib import Path
+          data = json.loads(Path("/tmp/post-merge-cpu/bisect-result.json").read_text(encoding="utf-8"))
+          if (
+              data.get("bisect_status") == "converged"
+              and data.get("last_good_sha")
+              and data.get("first_failing_sha")
+              and (
+                  data.get("is_public_plugin_interface")
+                  or data.get("stage") in ("wheel_build", "plugin_registration")
+              )
+          ):
+              subprocess.run(
+                  [
+                      sys.executable,
+                      "scripts/ci/ppu_upstream_post_merge.py",
+                      "verify-non-ppu-repro",
+                      "--vllm-repo",
+                      "/tmp/vllm-src",
+                      "--last-good-sha",
+                      str(data["last_good_sha"]),
+                      "--first-failing-sha",
+                      str(data["first_failing_sha"]),
+                      "--stage",
+                      str(data.get("stage") or "plugin_registration"),
+                      "--target-signature",
+                      str(data.get("target_signature") or ""),
+                      "--output-json",
+                      "/tmp/post-merge-cpu/non-ppu-repro.json",
+                  ],
+                  check=False,
+              )
+          PY
+            fi
           fi
           exit "$rc"
 
@@ -353,6 +391,7 @@ jobs:
           path: |
             /tmp/post-merge-cpu/cpu-result.json
             /tmp/post-merge-cpu/bisect-result.json
+            /tmp/post-merge-cpu/non-ppu-repro.json
           if-no-files-found: ignore
           retention-days: 7
 
@@ -449,6 +488,7 @@ jobs:
             git -C "${BISECT_DIR}/vllm-src" fetch --quiet --depth=250 origin "${TARGET_SHA}" || true
             git -C "${BISECT_DIR}/vllm-src" fetch --quiet --depth=1 origin "${LAST_GREEN_SHA}" || true
 
+            # shellcheck disable=SC2016
             probe_cmd='
               set -euo pipefail
               cand_wheels="$(mktemp -d "${BISECT_DIR}/wheels.XXXXXX")"
@@ -886,6 +926,7 @@ jobs:
           RC_OPS_RESULT: ${{ needs.rc-ops-tests.result }}
           BUMP_RESULT: ${{ needs.daily-pin-bump.result }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           mkdir -p /tmp/post-merge-public
@@ -923,6 +964,9 @@ jobs:
           if [[ -f /tmp/post-merge-meta/bisect-result.json ]]; then
             extra_args+=(--bisect-result-json /tmp/post-merge-meta/bisect-result.json)
           fi
+          if [[ -f /tmp/post-merge-meta/non-ppu-repro.json ]]; then
+            extra_args+=(--non-ppu-repro-json /tmp/post-merge-meta/non-ppu-repro.json)
+          fi
 
           python3 scripts/ci/ppu_upstream_post_merge.py publish \
             --gear "${SELECTED_GEAR}" \
@@ -935,6 +979,7 @@ jobs:
             --ppu-status "${ppu_status}" \
             --ppu-skip-reason "${ppu_skip_reason}" \
             --failure-stage "${failure_stage}" \
+            --fetch-upstream-author \
             --run-url "${RUN_URL}" \
             --public-dir /tmp/post-merge-public \
             --step-summary "${GITHUB_STEP_SUMMARY}" \
@@ -974,6 +1019,9 @@ jobs:
             const payloadPath = "/tmp/post-merge-public/issue-payload.json";
             if (!fs.existsSync(payloadPath)) return;
             const payload = JSON.parse(fs.readFileSync(payloadPath, "utf8"));
+            if (payload.should_file_upstream_issue) {
+              throw new Error("CI must never auto-file cross-repo upstream issues");
+            }
             if (!payload.should_file_sail_issue || !payload.title || !payload.body) return;
 
             const { owner, repo } = context.repo;

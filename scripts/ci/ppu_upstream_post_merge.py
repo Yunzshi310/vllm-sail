@@ -26,6 +26,9 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
+import urllib.error
+import urllib.request
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
@@ -33,6 +36,7 @@ from pathlib import Path
 from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_UPSTREAM_REPO = "vllm-project/vllm"
 DEFAULT_UPSTREAM_URL = "https://github.com/vllm-project/vllm.git"
 DEFAULT_VERIFIED_PIN_FILE = REPO_ROOT / ".github" / "vllm-main-verified.commit"
 DEFAULT_RELEASE_TAG_FILE = REPO_ROOT / ".github" / "vllm-release-tag.commit"
@@ -48,6 +52,11 @@ RELEASE_LINE_RE = re.compile(r"^v?(\d+)\.(\d+)(?:\.(\d+))?")
 SAFE_SYMBOL_RE = re.compile(r"^[A-Za-z0-9_./:<>\[\]()!?,* -]{1,160}$")
 PUBLIC_GITHUB_URL_RE = re.compile(
     r"^https://github\.com/vllm-project/(?:vllm-sail|vllm)(?:/[A-Za-z0-9_./#?=&-]*)?$"
+)
+GITHUB_LOGIN_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}$")
+GITHUB_NOREPLY_EMAIL_RE = re.compile(
+    r"^(?:\d+\+)?([A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38})@users\.noreply\.github\.com$",
+    re.IGNORECASE,
 )
 
 VALID_GEARS = ("auto", "probe", "daily_pin_bump", "rc_qualify")
@@ -74,6 +83,39 @@ VALID_STAGES = (
     "rc_model_sanity",
     "rc_ops_tests",
     "baseline_control",
+)
+PPU_HARDWARE_STAGES = frozenset(
+    {
+        "ppu_probe_smoke",
+        "rc_pin_ut",
+        "rc_fast_sanity",
+        "rc_model_sanity",
+        "rc_ops_tests",
+    }
+)
+SAIL_INTERNAL_ONLY_STAGES = frozenset(
+    {
+        "compat_check",
+        "patch_contracts",
+        "patch_drift",
+        "kernel_port_check",
+    }
+)
+VALID_NON_PPU_REPRO_MODES = ("cpu_empty_build", "stub_plugin_cpu")
+VALID_REPRO_KINDS = (
+    "cpu_empty_build",
+    "platform_plugin",
+    "register_oot",
+    "model_registry",
+    "load_general_plugins",
+)
+STUB_PLUGIN_REPRO_KINDS = frozenset(
+    {
+        "platform_plugin",
+        "register_oot",
+        "model_registry",
+        "load_general_plugins",
+    }
 )
 VALID_PPU_SKIP_REASONS = (
     "none",
@@ -124,13 +166,18 @@ SAFE_PPU_SKIP_PATTERNS: tuple[str, ...] = (
 )
 
 PUBLIC_PLUGIN_SYMBOLS: tuple[str, ...] = (
-    "vllm.plugins",
-    "vllm.platforms.interface",
-    "vllm.platforms.Platform",
-    "vllm.model_executor.models.registry",
-    "ModelRegistry.register_model",
     "CustomOp.register_oot",
+    "vllm.model_executor.custom_op",
     "register_oot",
+    "ModelRegistry.register_model",
+    "vllm.model_executor.models.registry",
+    "ModelRegistry",
+    "vllm.platforms.Platform",
+    "vllm.platforms.interface",
+    "vllm.platform_plugins",
+    "vllm.plugins.load_general_plugins",
+    "load_general_plugins",
+    "vllm.plugins",
     "AttentionBackend",
     "ServeSubcommand",
     "VLLM_TARGET_DEVICE=empty",
@@ -198,12 +245,37 @@ class RedactionViolationError(ValueError):
 
 
 @dataclass(frozen=True)
+class NonPpuReproEvidence:
+    """Verified hardware-free (CPU / inline stub plugin) reproduction receipt."""
+
+    mode: str  # "cpu_empty_build" | "stub_plugin_cpu"
+    repro_kind: str  # one of VALID_REPRO_KINDS
+    last_good_sha: str
+    first_failing_sha: str
+    last_good_exit_code: int
+    first_failing_exit_code: int
+    verified: bool = False
+
+    def to_public_dict(self) -> dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "repro_kind": self.repro_kind,
+            "last_good_sha": self.last_good_sha,
+            "first_failing_sha": self.first_failing_sha,
+            "last_good_exit_code": self.last_good_exit_code,
+            "first_failing_exit_code": self.first_failing_exit_code,
+            "verified": bool(self.verified),
+        }
+
+
+@dataclass(frozen=True)
 class ProbeOutcome:
     status: str  # "pass" | "fail" | "infra_error"
     stage: str = "none"
     target_signature: str = ""
     is_public_plugin_interface: bool = False
     detail_code: str = ""
+    non_ppu_repro: NonPpuReproEvidence | None = None
 
 
 def _load_toml(path: Path) -> dict[str, Any]:
@@ -1266,12 +1338,630 @@ def bisect_first_failing_sha(
 
 
 # ---------------------------------------------------------------------------
-# 4. Dual-Track Root-Cause Routing & Sanitized Templates
+# 4. Dual-Track Root-Cause Routing, Non-PPU Repro Gate & Sanitized Templates
 # ---------------------------------------------------------------------------
 
 
-def classify_failure(outcome: ProbeOutcome) -> dict[str, str]:
-    """Classify a failure into infra_error, plugin_interface_break, or sail_internal_patch_drift."""
+def sanitize_github_login(value: str | None) -> str:
+    """Validate a public GitHub user login; return ``""`` if invalid, bot, or sensitive."""
+    if not isinstance(value, str):
+        return ""
+    cleaned = value.strip()
+    if not cleaned or not GITHUB_LOGIN_RE.fullmatch(cleaned):
+        return ""
+    try:
+        assert_zero_sensitive_leaks(cleaned)
+    except RedactionViolationError:
+        return ""
+    return cleaned
+
+
+def parse_commit_author_login(payload: Any, *, expected_sha: str = "") -> str:
+    """Extract a validated GitHub login from public ``vllm-project/vllm`` commit JSON."""
+    if not isinstance(payload, dict):
+        return ""
+    if expected_sha:
+        sha_in_payload = payload.get("sha")
+        if (
+            isinstance(sha_in_payload, str)
+            and sha_in_payload.strip()
+            and sha_in_payload.strip() != expected_sha
+        ):
+            return ""
+
+    author = payload.get("author")
+    if isinstance(author, dict):
+        author_type = str(author.get("type", "User"))
+        if author_type != "User":
+            return ""
+        login = sanitize_github_login(author.get("login"))
+        if login:
+            return login
+
+    commit_obj = payload.get("commit")
+    if isinstance(commit_obj, dict):
+        commit_author = commit_obj.get("author")
+        if isinstance(commit_author, dict):
+            email = commit_author.get("email")
+            if isinstance(email, str):
+                match = GITHUB_NOREPLY_EMAIL_RE.fullmatch(email.strip())
+                if match:
+                    return sanitize_github_login(match.group(1))
+    return ""
+
+
+def resolve_upstream_commit_author(
+    first_failing_sha: str,
+    *,
+    repo: str = DEFAULT_UPSTREAM_REPO,
+    commit_metadata_path: Path | None = None,
+    fetch_remote: bool = False,
+    github_token: str = "",
+    timeout_sec: int = 10,
+) -> str:
+    """Resolve ``first_failing_sha`` author GitHub login from public metadata.
+
+    Degrades gracefully to ``""`` (SHA-only) when metadata is missing, invalid,
+    belongs to a bot, fails redaction, or cannot be fetched.
+    """
+    sha = _require_sha1(first_failing_sha, "first_failing_sha")
+    if repo != DEFAULT_UPSTREAM_REPO:
+        return ""
+
+    if commit_metadata_path is not None and commit_metadata_path.is_file():
+        try:
+            payload = json.loads(commit_metadata_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return ""
+        return parse_commit_author_login(payload, expected_sha=sha)
+
+    if not fetch_remote:
+        return ""
+
+    url = f"https://api.github.com/repos/{DEFAULT_UPSTREAM_REPO}/commits/{sha}"
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "vllm-sail-post-merge-ci",
+    }
+    token = github_token.strip() or os.environ.get("GITHUB_TOKEN", "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+            raw = resp.read(256 * 1024).decode("utf-8", errors="replace")
+        payload = json.loads(raw)
+    except (OSError, ValueError, urllib.error.URLError):
+        return ""
+    return parse_commit_author_login(payload, expected_sha=sha)
+
+
+def select_repro_kind(stage: str, target_signature: str = "") -> str:
+    """Map ``(stage, target_signature)`` to a hardware-free reproducer kind."""
+    sig = target_signature.strip()
+    sig_lower = sig.lower()
+    if stage == "wheel_build" or sig in {
+        "VLLM_TARGET_DEVICE=empty",
+        "vllm_empty_device_build",
+        "rust_frontend_build",
+    }:
+        return "cpu_empty_build"
+    if (
+        "register_oot" in sig_lower
+        or "customop" in sig_lower
+        or "custom_op" in sig_lower
+    ):
+        return "register_oot"
+    if (
+        "modelregistry" in sig_lower
+        or "register_model" in sig_lower
+        or "models.registry" in sig_lower
+    ):
+        return "model_registry"
+    if (
+        "platform" in sig_lower
+        or "attentionbackend" in sig_lower
+        or "vllm.platforms" in sig_lower
+    ):
+        return "platform_plugin"
+    return "load_general_plugins"
+
+
+def build_stub_plugin_spec(repro_kind: str) -> dict[str, str]:
+    """Return the single-source inline stub plugin files and check script."""
+    if repro_kind not in VALID_REPRO_KINDS:
+        raise ValueError(f"unsupported repro_kind: {repro_kind!r}")
+
+    if repro_kind == "cpu_empty_build":
+        return {
+            "mode": "cpu_empty_build",
+            "repro_kind": "cpu_empty_build",
+            "entry_points": "",
+            "plugin_module": "",
+            "check_script": (
+                "import sys\n"
+                "import vllm\n\n"
+                'assert "vllm_sail" not in sys.modules\n'
+                'print("cpu_empty_build_ok", vllm.__version__)\n'
+            ),
+        }
+
+    if repro_kind == "platform_plugin":
+        return {
+            "mode": "stub_plugin_cpu",
+            "repro_kind": "platform_plugin",
+            "entry_points": (
+                "[vllm.platform_plugins]\nstub = vllm_stub_plugin:register_platform\n"
+            ),
+            "plugin_module": (
+                "from vllm.platforms.interface import Platform, PlatformEnum\n\n\n"
+                "class StubPlatform(Platform):\n"
+                "    _enum = PlatformEnum.OOT\n"
+                '    device_name = "stub"\n'
+                '    device_type = "cpu"\n\n\n'
+                "def register_platform() -> str:\n"
+                '    return "vllm_stub_plugin.StubPlatform"\n'
+            ),
+            "check_script": (
+                "import importlib\n"
+                "import sys\n"
+                "import vllm.platforms as vp\n"
+                "from vllm.platforms.interface import Platform\n"
+                "from vllm.plugins import load_plugins_by_group\n\n"
+                'assert "vllm_sail" not in sys.modules\n'
+                'plugins = load_plugins_by_group("vllm.platform_plugins")\n'
+                'assert "stub" in plugins, f"stub platform plugin missing: {sorted(plugins)}"\n'
+                'qualname = plugins["stub"]()\n'
+                'mod_name, attr_name = qualname.rsplit(".", 1)\n'
+                "plat_cls = getattr(importlib.import_module(mod_name), attr_name)\n"
+                "assert issubclass(plat_cls, Platform)\n"
+                "plat = plat_cls()\n"
+                "assert plat.is_out_of_tree()\n"
+                'resolved = getattr(vp, "current_platform", None)\n'
+                "if resolved is not None:\n"
+                "    assert isinstance(resolved, Platform)\n"
+                'print("platform_plugin_ok", plat.device_name)\n'
+            ),
+        }
+
+    if repro_kind == "register_oot":
+        return {
+            "mode": "stub_plugin_cpu",
+            "repro_kind": "register_oot",
+            "entry_points": (
+                "[vllm.general_plugins]\nstub = vllm_stub_plugin:register_general\n"
+            ),
+            "plugin_module": (
+                "_REGISTERED = False\n\n\n"
+                "def register_general() -> None:\n"
+                "    global _REGISTERED\n"
+                "    if _REGISTERED:\n"
+                "        return\n"
+                "    from vllm.model_executor.custom_op import CustomOp\n\n"
+                '    @CustomOp.register("stub_oot_op")\n'
+                "    class _StubBaseOp(CustomOp):\n"
+                "        def forward_native(self, x):\n"
+                "            return x\n\n"
+                '    @CustomOp.register_oot(name="stub_oot_op")\n'
+                "    class _StubOOTOp(_StubBaseOp):\n"
+                "        def forward_oot(self, x):\n"
+                "            return x\n\n"
+                "    _REGISTERED = True\n"
+            ),
+            "check_script": (
+                "import sys\n"
+                "from vllm.model_executor.custom_op import CustomOp\n"
+                "from vllm.plugins import load_general_plugins\n\n"
+                'assert "vllm_sail" not in sys.modules\n'
+                "load_general_plugins()\n"
+                'assert "stub_oot_op" in CustomOp.op_registry_oot, (\n'
+                '    f"stub_oot_op missing from CustomOp.op_registry_oot: {sorted(CustomOp.op_registry_oot)}"\n'
+                ")\n"
+                'print("register_oot_ok")\n'
+            ),
+        }
+
+    if repro_kind == "model_registry":
+        return {
+            "mode": "stub_plugin_cpu",
+            "repro_kind": "model_registry",
+            "entry_points": (
+                "[vllm.general_plugins]\nstub = vllm_stub_plugin:register_general\n"
+            ),
+            "plugin_module": (
+                "_REGISTERED = False\n\n\n"
+                "class StubOOTForCausalLM:\n"
+                "    pass\n\n\n"
+                "def register_general() -> None:\n"
+                "    global _REGISTERED\n"
+                "    if _REGISTERED:\n"
+                "        return\n"
+                "    from vllm import ModelRegistry\n\n"
+                "    ModelRegistry.register_model(\n"
+                '        "StubOOTForCausalLM",\n'
+                '        "vllm_stub_plugin:StubOOTForCausalLM",\n'
+                "    )\n"
+                "    _REGISTERED = True\n"
+            ),
+            "check_script": (
+                "import sys\n"
+                "from vllm import ModelRegistry\n"
+                "from vllm.plugins import load_general_plugins\n\n"
+                'assert "vllm_sail" not in sys.modules\n'
+                "load_general_plugins()\n"
+                "archs = ModelRegistry.get_supported_archs()\n"
+                'assert "StubOOTForCausalLM" in archs, "StubOOTForCausalLM not registered in ModelRegistry"\n'
+                'print("model_registry_ok")\n'
+            ),
+        }
+
+    return {
+        "mode": "stub_plugin_cpu",
+        "repro_kind": "load_general_plugins",
+        "entry_points": (
+            "[vllm.general_plugins]\nstub = vllm_stub_plugin:register_general\n"
+        ),
+        "plugin_module": (
+            "LOADED = False\n\n\n"
+            "def register_general() -> None:\n"
+            "    global LOADED\n"
+            "    LOADED = True\n"
+        ),
+        "check_script": (
+            "import sys\n"
+            "import vllm\n"
+            "import vllm_stub_plugin\n"
+            "from vllm.plugins import load_general_plugins\n\n"
+            'assert "vllm_sail" not in sys.modules\n'
+            "load_general_plugins()\n"
+            'assert vllm_stub_plugin.LOADED is True, "vllm.general_plugins stub hook was not invoked"\n'
+            'print("load_general_plugins_ok", vllm.__version__)\n'
+        ),
+    }
+
+
+def materialize_stub_plugin(repro_kind: str, workdir: Path) -> tuple[Path, Path]:
+    """Write the inline stub plugin package and check script into ``workdir``."""
+    spec = build_stub_plugin_spec(repro_kind)
+    stub_site = workdir / "stub_site"
+    stub_site.mkdir(parents=True, exist_ok=True)
+    if spec["entry_points"] and spec["plugin_module"]:
+        pkg_dir = stub_site / "vllm_stub_plugin"
+        dist_dir = stub_site / "vllm_stub_plugin-0.0.1.dist-info"
+        pkg_dir.mkdir(parents=True, exist_ok=True)
+        dist_dir.mkdir(parents=True, exist_ok=True)
+        (pkg_dir / "__init__.py").write_text(spec["plugin_module"], encoding="utf-8")
+        (dist_dir / "METADATA").write_text(
+            "Metadata-Version: 2.1\nName: vllm-stub-plugin\nVersion: 0.0.1\n",
+            encoding="utf-8",
+        )
+        (dist_dir / "entry_points.txt").write_text(
+            spec["entry_points"], encoding="utf-8"
+        )
+    check_script = workdir / "repro_check.py"
+    check_script.write_text(spec["check_script"], encoding="utf-8")
+    return stub_site, check_script
+
+
+def is_valid_non_ppu_repro(
+    evidence: NonPpuReproEvidence | None,
+    *,
+    stage: str | None = None,
+    last_good_sha: str = "",
+    first_failing_sha: str = "",
+    require_shas: bool = False,
+) -> bool:
+    """Fail-closed hard gate for hardware-free (CPU / stub plugin) reproduction."""
+    if not isinstance(evidence, NonPpuReproEvidence):
+        return False
+    if evidence.verified is not True:
+        return False
+    if evidence.mode not in VALID_NON_PPU_REPRO_MODES:
+        return False
+    if evidence.repro_kind not in VALID_REPRO_KINDS:
+        return False
+    if evidence.mode == "cpu_empty_build" and evidence.repro_kind != "cpu_empty_build":
+        return False
+    if (
+        evidence.mode == "stub_plugin_cpu"
+        and evidence.repro_kind not in STUB_PLUGIN_REPRO_KINDS
+    ):
+        return False
+    if not isinstance(evidence.last_good_sha, str) or not SHA1_RE.fullmatch(
+        evidence.last_good_sha
+    ):
+        return False
+    if not isinstance(evidence.first_failing_sha, str) or not SHA1_RE.fullmatch(
+        evidence.first_failing_sha
+    ):
+        return False
+    if evidence.last_good_sha == evidence.first_failing_sha:
+        return False
+    if type(evidence.last_good_exit_code) is not int or (
+        evidence.last_good_exit_code != 0
+    ):
+        return False
+    if type(evidence.first_failing_exit_code) is not int or (
+        evidence.first_failing_exit_code == 0
+    ):
+        return False
+
+    if require_shas:
+        if not SHA1_RE.fullmatch(last_good_sha) or not SHA1_RE.fullmatch(
+            first_failing_sha
+        ):
+            return False
+        if (
+            evidence.last_good_sha != last_good_sha
+            or evidence.first_failing_sha != first_failing_sha
+        ):
+            return False
+    else:
+        if last_good_sha and evidence.last_good_sha != last_good_sha:
+            return False
+        if first_failing_sha and evidence.first_failing_sha != first_failing_sha:
+            return False
+
+    if stage is not None:
+        if stage in SAIL_INTERNAL_ONLY_STAGES:
+            return False
+        if stage == "wheel_build" and evidence.mode != "cpu_empty_build":
+            return False
+        if stage == "plugin_registration" and evidence.mode != "stub_plugin_cpu":
+            return False
+    return True
+
+
+def parse_non_ppu_repro_evidence(data: Any) -> NonPpuReproEvidence | None:
+    """Strictly parse and re-validate serialized ``NonPpuReproEvidence`` JSON."""
+    if not isinstance(data, dict):
+        return None
+    mode = data.get("mode")
+    repro_kind = data.get("repro_kind")
+    last_good = data.get("last_good_sha")
+    first_bad = data.get("first_failing_sha")
+    good_rc = data.get("last_good_exit_code")
+    bad_rc = data.get("first_failing_exit_code")
+    raw_verified = data.get("verified")
+    if (
+        not isinstance(mode, str)
+        or not isinstance(repro_kind, str)
+        or not isinstance(last_good, str)
+        or not isinstance(first_bad, str)
+        or type(good_rc) is not int
+        or type(bad_rc) is not int
+        or type(raw_verified) is not bool
+    ):
+        return None
+    candidate = NonPpuReproEvidence(
+        mode=mode,
+        repro_kind=repro_kind,
+        last_good_sha=last_good.strip(),
+        first_failing_sha=first_bad.strip(),
+        last_good_exit_code=good_rc,
+        first_failing_exit_code=bad_rc,
+        verified=raw_verified,
+    )
+    return NonPpuReproEvidence(
+        mode=candidate.mode,
+        repro_kind=candidate.repro_kind,
+        last_good_sha=candidate.last_good_sha,
+        first_failing_sha=candidate.first_failing_sha,
+        last_good_exit_code=candidate.last_good_exit_code,
+        first_failing_exit_code=candidate.first_failing_exit_code,
+        verified=is_valid_non_ppu_repro(candidate),
+    )
+
+
+def verify_non_ppu_reproducer(
+    *,
+    vllm_repo: Path,
+    last_good_sha: str,
+    first_failing_sha: str,
+    stage: str,
+    target_signature: str = "",
+    repro_kind: str = "",
+    probe_cmd: str = "",
+    python_exe: str = sys.executable,
+    timeout_sec: int = 900,
+) -> NonPpuReproEvidence:
+    """Run the hardware-free CPU/stub reproducer against ``last_good_sha`` and ``first_failing_sha``."""
+    good = _require_sha1(last_good_sha, "last_good_sha")
+    bad = _require_sha1(first_failing_sha, "first_failing_sha")
+    safe_stage = stage if stage in VALID_STAGES else "plugin_registration"
+    kind = repro_kind.strip() or select_repro_kind(safe_stage, target_signature)
+    spec = build_stub_plugin_spec(kind)
+    mode = spec["mode"]
+
+    if good == bad or safe_stage in SAIL_INTERNAL_ONLY_STAGES:
+        return NonPpuReproEvidence(
+            mode=mode,
+            repro_kind=kind,
+            last_good_sha=good,
+            first_failing_sha=bad,
+            last_good_exit_code=-1,
+            first_failing_exit_code=-1,
+            verified=False,
+        )
+
+    def _run_one(
+        sha: str, workdir: Path, stub_site: Path, check_script: Path
+    ) -> tuple[int, bool]:
+        base_env = {
+            k: v
+            for k, v in os.environ.items()
+            if k
+            not in (
+                "PYTHONPATH",
+                "VLLM_SAIL_CANDIDATE_UPSTREAM_COMMIT",
+                "VLLM_PPU_CANDIDATE_UPSTREAM_COMMIT",
+            )
+        }
+        base_env["VLLM_TARGET_DEVICE"] = "empty"
+        base_env["CUDA_VISIBLE_DEVICES"] = ""
+        base_env["VLLM_PLUGINS"] = "stub" if mode == "stub_plugin_cpu" else ""
+        base_env["CANDIDATE_SHA"] = sha
+        base_env["VLLM_REPO"] = str(vllm_repo)
+        base_env["REPRO_KIND"] = kind
+        base_env["STUB_SITE_DIR"] = str(stub_site)
+        base_env["STUB_CHECK_SCRIPT"] = str(check_script)
+
+        if probe_cmd.strip():
+            try:
+                proc = subprocess.run(
+                    ["bash", "-c", probe_cmd],
+                    env=base_env,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout_sec,
+                )
+                return proc.returncode, False
+            except subprocess.TimeoutExpired:
+                return 124, True
+
+        wt_dir = workdir / f"vllm-{sha[:12]}"
+        site_dir = workdir / f"site-{sha[:12]}"
+        site_dir.mkdir(parents=True, exist_ok=True)
+        wt_added = False
+        try:
+            add_proc = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(vllm_repo),
+                    "worktree",
+                    "add",
+                    "--quiet",
+                    "--detach",
+                    str(wt_dir),
+                    sha,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            if add_proc.returncode != 0:
+                return add_proc.returncode, True
+            wt_added = True
+
+            use_torch = wt_dir / "tools" / "use_existing_torch.py"
+            if use_torch.is_file():
+                subprocess.run(
+                    [python_exe, str(use_torch)],
+                    cwd=str(wt_dir),
+                    env=base_env,
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+
+            install_proc = subprocess.run(
+                [
+                    python_exe,
+                    "-m",
+                    "pip",
+                    "install",
+                    "-q",
+                    "--no-build-isolation",
+                    "--no-deps",
+                    "--upgrade",
+                    "--target",
+                    str(site_dir),
+                    str(wt_dir),
+                ],
+                cwd=str(wt_dir),
+                env=base_env,
+                capture_output=True,
+                text=True,
+                timeout=timeout_sec,
+            )
+            if install_proc.returncode != 0:
+                return install_proc.returncode, False
+
+            check_env = dict(base_env)
+            py_entries = [str(site_dir)]
+            if mode == "stub_plugin_cpu":
+                py_entries.insert(0, str(stub_site))
+            check_env["PYTHONPATH"] = os.pathsep.join(py_entries)
+            check_proc = subprocess.run(
+                [python_exe, str(check_script)],
+                cwd=str(workdir),
+                env=check_env,
+                capture_output=True,
+                text=True,
+                timeout=timeout_sec,
+            )
+            return check_proc.returncode, False
+        except subprocess.TimeoutExpired:
+            return 124, True
+        finally:
+            if wt_added:
+                subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(vllm_repo),
+                        "worktree",
+                        "remove",
+                        "--force",
+                        str(wt_dir),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+
+    with tempfile.TemporaryDirectory(prefix="non-ppu-repro-") as td:
+        workdir = Path(td)
+        stub_site, check_script = materialize_stub_plugin(kind, workdir)
+        good_rc, good_infra = _run_one(good, workdir, stub_site, check_script)
+        if good_infra or good_rc != 0:
+            return NonPpuReproEvidence(
+                mode=mode,
+                repro_kind=kind,
+                last_good_sha=good,
+                first_failing_sha=bad,
+                last_good_exit_code=good_rc,
+                first_failing_exit_code=-1,
+                verified=False,
+            )
+        bad_rc, bad_infra = _run_one(bad, workdir, stub_site, check_script)
+
+    raw_evidence = NonPpuReproEvidence(
+        mode=mode,
+        repro_kind=kind,
+        last_good_sha=good,
+        first_failing_sha=bad,
+        last_good_exit_code=good_rc,
+        first_failing_exit_code=bad_rc,
+        verified=(not bad_infra and good_rc == 0 and bad_rc != 0),
+    )
+    return NonPpuReproEvidence(
+        mode=raw_evidence.mode,
+        repro_kind=raw_evidence.repro_kind,
+        last_good_sha=raw_evidence.last_good_sha,
+        first_failing_sha=raw_evidence.first_failing_sha,
+        last_good_exit_code=raw_evidence.last_good_exit_code,
+        first_failing_exit_code=raw_evidence.first_failing_exit_code,
+        verified=is_valid_non_ppu_repro(
+            raw_evidence,
+            stage=safe_stage,
+            last_good_sha=good,
+            first_failing_sha=bad,
+            require_shas=True,
+        ),
+    )
+
+
+def classify_failure(
+    outcome: ProbeOutcome,
+    *,
+    non_ppu_repro: NonPpuReproEvidence | None = None,
+    last_good_sha: str = "",
+    first_failing_sha: str = "",
+    require_shas: bool = False,
+) -> dict[str, Any]:
+    """Classify a failure with the non-PPU hardware reproducer hard gate."""
     stage = outcome.stage if outcome.stage in VALID_STAGES else "none"
     sig = _sanitize_symbol(outcome.target_signature, "unspecified")
 
@@ -1281,6 +1971,9 @@ def classify_failure(outcome: ProbeOutcome) -> dict[str, str]:
             "stage": "none",
             "target_signature": "none",
             "bucket_key": "",
+            "non_ppu_repro_verified": False,
+            "non_ppu_repro_mode": "",
+            "repro_kind": "",
         }
 
     if outcome.status == "infra_error" or stage == "baseline_control":
@@ -1289,31 +1982,67 @@ def classify_failure(outcome: ProbeOutcome) -> dict[str, str]:
             "stage": stage,
             "target_signature": sig,
             "bucket_key": "",
+            "non_ppu_repro_verified": False,
+            "non_ppu_repro_mode": "",
+            "repro_kind": "",
         }
 
-    is_public = outcome.is_public_plugin_interface
-    if not is_public:
+    if stage in SAIL_INTERNAL_ONLY_STAGES:
+        return {
+            "classification": "sail_internal_patch_drift",
+            "stage": stage,
+            "target_signature": sig,
+            "bucket_key": f"{stage}:{sig}",
+            "non_ppu_repro_verified": False,
+            "non_ppu_repro_mode": "",
+            "repro_kind": "",
+        }
+
+    is_public_candidate = outcome.is_public_plugin_interface
+    if not is_public_candidate:
         if stage == "wheel_build" and sig.startswith("vllm."):
-            is_public = True
+            is_public_candidate = True
         elif stage == "wheel_build" and sig in {
             "VLLM_TARGET_DEVICE=empty",
             "vllm_empty_device_build",
             "rust_frontend_build",
         }:
-            is_public = True
+            is_public_candidate = True
         elif (
             stage == "plugin_registration"
             and any(sig.startswith(pub) for pub in PUBLIC_PLUGIN_SYMBOLS)
             and "vllm_sail.patch" not in sig
         ):
-            is_public = True
+            is_public_candidate = True
 
-    if is_public:
+    if (
+        non_ppu_repro is not None
+        and outcome.non_ppu_repro is not None
+        and non_ppu_repro != outcome.non_ppu_repro
+    ):
+        effective_repro: NonPpuReproEvidence | None = None
+    else:
+        effective_repro = (
+            non_ppu_repro if non_ppu_repro is not None else outcome.non_ppu_repro
+        )
+
+    repro_verified = is_valid_non_ppu_repro(
+        effective_repro,
+        stage=stage,
+        last_good_sha=last_good_sha,
+        first_failing_sha=first_failing_sha,
+        require_shas=require_shas,
+    )
+
+    if is_public_candidate and repro_verified and effective_repro is not None:
         return {
             "classification": "plugin_interface_break",
             "stage": stage,
             "target_signature": sig,
             "bucket_key": f"upstream_plugin_api:{stage}:{sig}",
+            "non_ppu_repro_verified": True,
+            "non_ppu_repro_mode": effective_repro.mode,
+            "repro_kind": effective_repro.repro_kind,
         }
 
     bucket_key = f"{stage}:{sig}"
@@ -1322,7 +2051,69 @@ def classify_failure(outcome: ProbeOutcome) -> dict[str, str]:
         "stage": stage,
         "target_signature": sig,
         "bucket_key": bucket_key,
+        "non_ppu_repro_verified": False,
+        "non_ppu_repro_mode": "",
+        "repro_kind": "",
     }
+
+
+def _render_standalone_repro_script(
+    *,
+    first_failing_sha: str,
+    last_good_sha: str,
+    repro_kind: str,
+) -> str:
+    """Render a standalone, hardware-free bash reproducer script for ``repro_kind``."""
+    spec = build_stub_plugin_spec(repro_kind)
+    lines = [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        f"# Control (expected exit 0): bash repro.sh {last_good_sha}",
+        f"# Regression (expected non-zero): bash repro.sh {first_failing_sha}",
+        f'TARGET_REF="${{1:-{first_failing_sha}}}"',
+        'WORKDIR="$(mktemp -d)"',
+        "trap 'rm -rf \"$WORKDIR\"' EXIT",
+        "",
+        'git clone --filter=blob:none https://github.com/vllm-project/vllm.git "$WORKDIR/vllm"',
+        'cd "$WORKDIR/vllm"',
+        'git checkout --quiet --detach "$TARGET_REF"',
+        "python3 tools/use_existing_torch.py",
+        'mkdir -p "$WORKDIR/vllm_site"',
+        'VLLM_TARGET_DEVICE=empty python3 -m pip install --no-build-isolation --no-deps --upgrade --target "$WORKDIR/vllm_site" .',
+    ]
+    if spec["mode"] == "stub_plugin_cpu":
+        lines.extend(
+            [
+                "",
+                'mkdir -p "$WORKDIR/stub_site/vllm_stub_plugin" "$WORKDIR/stub_site/vllm_stub_plugin-0.0.1.dist-info"',
+                "cat <<'EOF' > \"$WORKDIR/stub_site/vllm_stub_plugin-0.0.1.dist-info/METADATA\"",
+                "Metadata-Version: 2.1",
+                "Name: vllm-stub-plugin",
+                "Version: 0.0.1",
+                "EOF",
+                "cat <<'EOF' > \"$WORKDIR/stub_site/vllm_stub_plugin-0.0.1.dist-info/entry_points.txt\"",
+                spec["entry_points"].rstrip("\n"),
+                "EOF",
+                "cat <<'PY' > \"$WORKDIR/stub_site/vllm_stub_plugin/__init__.py\"",
+                spec["plugin_module"].rstrip("\n"),
+                "PY",
+                "cat <<'PY' > \"$WORKDIR/repro_check.py\"",
+                spec["check_script"].rstrip("\n"),
+                "PY",
+                'PYTHONPATH="$WORKDIR/stub_site:$WORKDIR/vllm_site" VLLM_TARGET_DEVICE=empty VLLM_PLUGINS=stub CUDA_VISIBLE_DEVICES="" python3 "$WORKDIR/repro_check.py"',
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "",
+                "cat <<'PY' > \"$WORKDIR/repro_check.py\"",
+                spec["check_script"].rstrip("\n"),
+                "PY",
+                'PYTHONPATH="$WORKDIR/vllm_site" VLLM_TARGET_DEVICE=empty VLLM_PLUGINS="" CUDA_VISIBLE_DEVICES="" python3 "$WORKDIR/repro_check.py"',
+            ]
+        )
+    return "\n".join(lines)
 
 
 def render_upstream_reproducer(
@@ -1332,43 +2123,96 @@ def render_upstream_reproducer(
     sail_sha: str,
     stage: str,
     target_signature: str,
+    repro_kind: str = "",
+    first_failing_author: str = "",
+    non_ppu_repro: NonPpuReproEvidence | None = None,
     run_url: str = "",
 ) -> str:
-    """Render a sanitized, hardware-free minimal reproducer for vllm-project/vllm."""
+    """Render a sanitized, fenced-markdown issue draft for human filing in ``vllm-project/vllm``.
+
+    ``@<author>`` appears strictly inside the outer 4-backtick fenced markdown
+    block so CI never emits bare live pings or auto-files cross-repo issues.
+    """
     bad = _require_sha1(first_failing_sha, "first_failing_sha")
     good = _require_sha1(last_good_sha, "last_good_sha")
     sail = _require_sha1(sail_sha, "sail_sha")
     safe_stage = stage if stage in VALID_STAGES else "plugin_registration"
     safe_sig = _sanitize_symbol(target_signature, "vllm.plugins")
     safe_url = run_url if PUBLIC_GITHUB_URL_RE.fullmatch(run_url or "") else ""
+    safe_author = sanitize_github_login(first_failing_author)
 
-    lines = [
-        "### Out-of-tree plugin compatibility regression report",
+    if repro_kind.strip():
+        kind = repro_kind.strip()
+        if kind not in VALID_REPRO_KINDS:
+            raise ValueError(f"unsupported repro_kind: {kind!r}")
+    elif non_ppu_repro is not None and non_ppu_repro.repro_kind in VALID_REPRO_KINDS:
+        kind = non_ppu_repro.repro_kind
+    else:
+        kind = select_repro_kind(safe_stage, safe_sig)
+
+    spec = build_stub_plugin_spec(kind)
+    script_text = _render_standalone_repro_script(
+        first_failing_sha=bad,
+        last_good_sha=good,
+        repro_kind=kind,
+    )
+
+    commit_line = f"- **First failing vLLM commit:** `{bad}`"
+    if safe_author:
+        commit_line += f" (cc @{safe_author})"
+
+    draft_lines = [
+        f"### Out-of-tree plugin compatibility regression (`{safe_stage}` / `{safe_sig}`)",
         "",
-        f"- **First failing vLLM commit:** `{bad}`",
+        commit_line,
         f"- **Last passing vLLM commit (control-verified):** `{good}`",
-        f"- **Out-of-tree plugin (`vllm-project/vllm-sail`) commit:** `{sail}`",
-        f"- **Failing stage:** `{safe_stage}`",
-        f"- **Affected public interface:** `{safe_sig}`",
+        f"- **Hardware-free reproducer mode:** `{spec['mode']}` (`{kind}`)",
     ]
-    if safe_url:
-        lines.append(f"- **Public CI run:** {safe_url}")
-    lines.extend(
+    if non_ppu_repro is not None and is_valid_non_ppu_repro(
+        non_ppu_repro,
+        stage=safe_stage,
+        last_good_sha=good,
+        first_failing_sha=bad,
+        require_shas=True,
+    ):
+        draft_lines.append(
+            f"- **Verified non-PPU exit codes:** `{good}` -> `{non_ppu_repro.last_good_exit_code}`; "
+            f"`{bad}` -> `{non_ppu_repro.first_failing_exit_code}`"
+        )
+    draft_lines.extend(
         [
-            "",
-            "#### Minimal CPU-only reproducer (`VLLM_TARGET_DEVICE=empty`)",
-            "",
-            "```bash",
-            "git clone https://github.com/vllm-project/vllm.git",
-            "cd vllm",
-            f"git checkout {bad}",
-            "python3 tools/use_existing_torch.py",
-            "VLLM_TARGET_DEVICE=empty python3 -m pip install --no-build-isolation --no-deps .",
-            "python3 -c \"import vllm; from vllm.plugins import load_general_plugins; load_general_plugins(); print('loaded', vllm.__version__)\"",
-            "```",
-            "",
+            f"- **Reference out-of-tree plugin (`vllm-project/vllm-sail`) commit:** `{sail}`",
+            f"- **Failing stage:** `{safe_stage}`",
+            f"- **Affected public interface:** `{safe_sig}`",
         ]
     )
+    if safe_url:
+        draft_lines.append(f"- **Public CI run:** {safe_url}")
+    draft_lines.extend(
+        [
+            "",
+            f"#### Minimal hardware-free reproducer (`VLLM_TARGET_DEVICE=empty`, `{kind}`)",
+            "",
+            "```bash",
+            script_text,
+            "```",
+        ]
+    )
+
+    lines = [
+        "### Manual upstream issue draft for `vllm-project/vllm`",
+        "",
+        "- **Action required:** Review and file manually in `vllm-project/vllm` (CI never auto-files cross-repo issues or emits live mentions).",
+        f"- **Reproducer kind:** `{kind}` (`{spec['mode']}`, no PPU hardware required)",
+        f"- **First failing vLLM commit:** `{bad}`",
+        f"- **Last passing vLLM commit (control-verified):** `{good}`",
+        f"- **Affected public interface:** `{safe_sig}`",
+        "",
+        "````markdown",
+        *draft_lines,
+        "````",
+        "",
+    ]
     text = "\n".join(lines)
     assert_zero_sensitive_leaks(text)
     return text
@@ -1403,6 +2247,7 @@ def render_sail_bucket_issue(
         "",
         f"- **Bucket ID:** `{digest_id}`",
         "- **Classification:** `sail_internal_patch_drift` (track and fix in `vllm-sail`; do not file in `vllm-project/vllm`)",
+        "- **Non-PPU reproducer gate:** `not_verified` (PPU-only or internal SAIL failure; no upstream report generated)",
         f"- **Failure stage:** `{safe_stage}`",
         f"- **Target signature:** `{safe_sig}`",
         f"- **First failing upstream vLLM SHA:** `{bad}`",
@@ -1440,6 +2285,8 @@ def publish_sanitized_channels(
     last_good_sha: str = "",
     bisect_steps: int = 0,
     outcome: ProbeOutcome | None = None,
+    non_ppu_repro: NonPpuReproEvidence | None = None,
+    first_failing_author: str = "",
     known_soft_drift_count: int = 0,
     run_url: str = "",
     public_dir: Path,
@@ -1459,30 +2306,49 @@ def publish_sanitized_channels(
     build_digest = extract_image_digest(build_image)
     runtime_digest = extract_image_digest(runtime_image)
 
+    safe_first_bad = first_failing_sha if SHA1_RE.fullmatch(first_failing_sha) else ""
+    safe_last_good = last_good_sha if SHA1_RE.fullmatch(last_good_sha) else pin
+
     triage = (
-        classify_failure(outcome)
+        classify_failure(
+            outcome,
+            non_ppu_repro=non_ppu_repro,
+            last_good_sha=safe_last_good,
+            first_failing_sha=safe_first_bad,
+            require_shas=True,
+        )
         if outcome is not None and status in ("fail", "infra_error")
         else {
             "classification": "infra_error" if status == "infra_error" else "none",
             "stage": "none",
             "target_signature": "none",
             "bucket_key": "",
+            "non_ppu_repro_verified": False,
+            "non_ppu_repro_mode": "",
+            "repro_kind": "",
         }
     )
 
-    safe_first_bad = first_failing_sha if SHA1_RE.fullmatch(first_failing_sha) else ""
-    safe_last_good = last_good_sha if SHA1_RE.fullmatch(last_good_sha) else pin
-
+    effective_repro = (
+        non_ppu_repro
+        if non_ppu_repro is not None
+        else (outcome.non_ppu_repro if outcome is not None else None)
+    )
+    safe_author = ""
     reproducer_md = ""
     issue_title = ""
     issue_body = ""
     if triage["classification"] == "plugin_interface_break" and safe_first_bad:
+        safe_author = sanitize_github_login(first_failing_author)
         reproducer_md = render_upstream_reproducer(
             first_failing_sha=safe_first_bad,
             last_good_sha=safe_last_good,
             sail_sha=sail,
             stage=triage["stage"],
             target_signature=triage["target_signature"],
+            repro_kind=triage["repro_kind"],
+            first_failing_author=safe_author,
+            non_ppu_repro=effective_repro,
             run_url=safe_url,
         )
     elif triage["classification"] == "sail_internal_patch_drift":
@@ -1527,12 +2393,16 @@ def publish_sanitized_channels(
             "first_failing_sha": (safe_first_bad or None) if status == "fail" else None,
             "last_good_sha": safe_last_good if status == "fail" else None,
             "steps": max(0, min(int(bisect_steps), 64)),
+            "first_failing_author": safe_author or None,
         },
         "triage": {
             "classification": triage["classification"],
             "stage": triage["stage"],
             "target_signature": triage["target_signature"],
             "bucket_key": triage["bucket_key"] or None,
+            "non_ppu_repro_verified": bool(triage["non_ppu_repro_verified"]),
+            "non_ppu_repro_mode": triage["non_ppu_repro_mode"] or None,
+            "repro_kind": triage["repro_kind"] or None,
         },
         "run_url": safe_url or None,
     }
@@ -1555,6 +2425,8 @@ def publish_sanitized_channels(
             [
                 f"- **Triage classification:** `{triage['classification']}` "
                 f"(`{triage['stage']}` / `{triage['target_signature']}`)",
+                f"- **Non-PPU reproducer verified:** `{str(bool(triage['non_ppu_repro_verified'])).lower()}`"
+                + (f" (`{triage['repro_kind']}`)" if triage["repro_kind"] else ""),
                 f"- **First failing SHA:** `{safe_first_bad or 'n/a'}` "
                 f"(bisect steps: `{public_summary['bisect']['steps']}`)",
             ]
@@ -1566,7 +2438,8 @@ def publish_sanitized_channels(
     console_text = (
         f"post_merge_gear={gear} status={status} vllm_sha={up_sha or 'none'} "
         f"sail_sha={sail} classification={triage['classification']} "
-        f"stage={triage['stage']} ppu_skip={safe_skip}"
+        f"stage={triage['stage']} non_ppu_repro={str(bool(triage['non_ppu_repro_verified'])).lower()} "
+        f"ppu_skip={safe_skip}"
     )
 
     public_dir.mkdir(parents=True, exist_ok=True)
@@ -1583,6 +2456,9 @@ def publish_sanitized_channels(
         "should_file_sail_issue": bool(
             triage["classification"] == "sail_internal_patch_drift" and issue_title
         ),
+        "should_file_upstream_issue": False,
+        "non_ppu_repro_verified": bool(triage["non_ppu_repro_verified"]),
+        "first_failing_author": safe_author,
         "title": issue_title,
         "body": issue_body,
         "upstream_reproducer_markdown": reproducer_md,
@@ -1944,13 +2820,16 @@ def run_sdk_cpu_fast_check(
     )
     if reg.returncode != 0:
         combined = reg.stderr + "\n" + reg.stdout
-        is_public = "vllm_sail/patch/" not in combined and any(
-            sym in combined for sym in PUBLIC_PLUGIN_SYMBOLS
+        matched_public = next(
+            (sym for sym in PUBLIC_PLUGIN_SYMBOLS if sym in combined),
+            "",
         )
-        sig = "vllm.plugins" if is_public else "vllm_sail.register_out_of_tree"
-        m = re.search(r"(vllm(?:\.[A-Za-z0-9_]+)+)", combined)
-        if m:
-            sig = m.group(1)
+        is_public = "vllm_sail/patch/" not in combined and bool(matched_public)
+        sig = matched_public if is_public else "vllm_sail.register_out_of_tree"
+        if not is_public:
+            m = re.search(r"(vllm(?:\.[A-Za-z0-9_]+)+)", combined)
+            if m:
+                sig = m.group(1)
         stage = (
             "compat_check"
             if "candidate mode requires" in combined
@@ -2184,6 +3063,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     p_resolve.add_argument("--bump-result", default="skipped")
     p_resolve.add_argument("--github-output", type=Path, default=None)
 
+    p_repro = sub.add_parser("verify-non-ppu-repro")
+    p_repro.add_argument("--vllm-repo", type=Path, required=True)
+    p_repro.add_argument("--last-good-sha", required=True)
+    p_repro.add_argument("--first-failing-sha", required=True)
+    p_repro.add_argument("--stage", default="plugin_registration")
+    p_repro.add_argument("--target-signature", default="")
+    p_repro.add_argument("--repro-kind", default="")
+    p_repro.add_argument("--probe-cmd", default="")
+    p_repro.add_argument("--timeout-sec", type=int, default=900)
+    p_repro.add_argument("--output-json", type=Path, required=True)
+    p_repro.add_argument("--github-output", type=Path, default=None)
+
     p_pub = sub.add_parser("publish")
     p_pub.add_argument("--gear", choices=SELECTED_GEARS, required=True)
     p_pub.add_argument("--status", choices=VALID_STATUSES, required=True)
@@ -2207,6 +3098,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     p_pub.add_argument("--known-soft-drift-count", type=int, default=0)
     p_pub.add_argument("--cpu-result-json", type=Path, default=None)
     p_pub.add_argument("--bisect-result-json", type=Path, default=None)
+    p_pub.add_argument("--non-ppu-repro-json", type=Path, default=None)
+    p_pub.add_argument("--first-failing-author", default="")
+    p_pub.add_argument("--upstream-commit-json", type=Path, default=None)
+    p_pub.add_argument("--fetch-upstream-author", action="store_true")
     p_pub.add_argument("--run-url", default="")
     p_pub.add_argument("--cursor-in", type=Path, default=None)
     p_pub.add_argument("--public-dir", type=Path, required=True)
@@ -2491,6 +3386,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(resolved_text)
         return 0
 
+    if args.command == "verify-non-ppu-repro":
+        evidence = verify_non_ppu_reproducer(
+            vllm_repo=args.vllm_repo,
+            last_good_sha=args.last_good_sha,
+            first_failing_sha=args.first_failing_sha,
+            stage=args.stage,
+            target_signature=args.target_signature,
+            repro_kind=args.repro_kind,
+            probe_cmd=args.probe_cmd,
+            timeout_sec=args.timeout_sec,
+        )
+        payload = evidence.to_public_dict()
+        text = json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n"
+        args.output_json.parent.mkdir(parents=True, exist_ok=True)
+        assert_zero_sensitive_leaks(text, staging_paths=[args.output_json])
+        args.output_json.write_text(text, encoding="utf-8")
+        _write_github_outputs(args.github_output, payload)
+        print(text, end="")
+        return 0
+
     if args.command == "publish":
         verified_pin = args.verified_pin_file.read_text(encoding="utf-8").strip()
         cpu_meta = (
@@ -2503,6 +3418,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.bisect_result_json and args.bisect_result_json.is_file()
             else {}
         )
+        non_ppu_repro: NonPpuReproEvidence | None = None
+        if args.non_ppu_repro_json and args.non_ppu_repro_json.is_file():
+            try:
+                raw_repro = json.loads(
+                    args.non_ppu_repro_json.read_text(encoding="utf-8")
+                )
+                non_ppu_repro = parse_non_ppu_repro_evidence(raw_repro)
+            except (OSError, ValueError):
+                non_ppu_repro = None
+
         effective_status = args.status
         if bisect_meta.get("bisect_status") in (
             "baseline_control_failed",
@@ -2547,7 +3472,31 @@ def main(argv: Sequence[str] | None = None) -> int:
                 stage=failure_stage,
                 target_signature=target_sig,
                 is_public_plugin_interface=public_break,
+                non_ppu_repro=non_ppu_repro,
             )
+
+        resolved_author = sanitize_github_login(args.first_failing_author)
+        if (
+            not resolved_author
+            and outcome is not None
+            and effective_status == "fail"
+            and SHA1_RE.fullmatch(first_bad)
+        ):
+            eff_good = last_good if SHA1_RE.fullmatch(last_good) else verified_pin
+            pre_triage = classify_failure(
+                outcome,
+                non_ppu_repro=non_ppu_repro,
+                last_good_sha=eff_good,
+                first_failing_sha=first_bad,
+                require_shas=True,
+            )
+            if pre_triage["classification"] == "plugin_interface_break":
+                resolved_author = resolve_upstream_commit_author(
+                    first_bad,
+                    commit_metadata_path=args.upstream_commit_json,
+                    fetch_remote=args.fetch_upstream_author,
+                )
+
         published = publish_sanitized_channels(
             gear=args.gear,
             status=effective_status,
@@ -2564,6 +3513,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             last_good_sha=last_good,
             bisect_steps=bisect_steps,
             outcome=outcome,
+            non_ppu_repro=non_ppu_repro,
+            first_failing_author=resolved_author,
             known_soft_drift_count=soft_drift,
             run_url=args.run_url,
             public_dir=args.public_dir,
