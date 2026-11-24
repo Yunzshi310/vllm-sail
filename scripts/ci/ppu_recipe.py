@@ -32,10 +32,22 @@ DATASET_SCHEMA = "ppu-dataset/v1"
 POLICY_SCHEMA = "ppu-test-policy/v1"
 POLICY_TIERS = frozenset({"fast_sanity", "model_sanity", "nightly", "release"})
 SUPPORTED_HARDWARE = frozenset({"zhenwu_m890", "zhenwu_810e"})
+LEGACY_BF16_SMOKE_MODEL_IDS = frozenset({"Qwen/Qwen3.8-27B"})
 _M890_PRECISION_RE = re.compile(
     r"^(?:(?:mx)?fp4(?:_fp8)?|fp8(?:_[a-z0-9]+)?|w4a4_mxfp4|w8a8_fp8)$"
 )
 _810E_PRECISION_RE = re.compile(r"^(?:int8|w[48]a8_int8(?:_[a-z0-9]+)?)$")
+MULTI_NODE_LAUNCH_FLAGS = frozenset(
+    {
+        "--data-parallel-address",
+        "--data-parallel-start-rank",
+        "--headless",
+        "--master-addr",
+        "--master-port",
+        "--nnodes",
+        "--node-rank",
+    }
+)
 _UNSET: Any = object()
 
 ALLOWED_ENV_PREFIXES = (
@@ -1070,11 +1082,33 @@ def _normalize_precision(precision: Any, *, context: str) -> str:
 
 
 def _is_legacy_bf16_smoke_recipe(recipe: Mapping[str, Any]) -> bool:
+    model_blk = recipe.get("model")
+    ppu_blk = recipe.get("ppu")
+    if not isinstance(model_blk, Mapping) or not isinstance(ppu_blk, Mapping):
+        return False
+    model_id = model_blk.get("model_id")
+    if model_id not in LEGACY_BF16_SMOKE_MODEL_IDS:
+        return False
+    hf_model_id = ppu_blk.get("hf_model_id", model_id)
+    if hf_model_id not in LEGACY_BF16_SMOKE_MODEL_IDS:
+        return False
+    topo = ppu_blk.get("topology")
+    if (
+        not isinstance(topo, Mapping)
+        or topo.get("kind") != "single_node"
+        or topo.get("nodes") != 1
+    ):
+        return False
     variants = recipe.get("variants")
     if not isinstance(variants, Mapping) or set(variants) != {"default"}:
         return False
     default_var = variants["default"]
     if not isinstance(default_var, Mapping) or "hardware" in default_var:
+        return False
+    if (
+        "hf_model_id" in default_var
+        and default_var.get("hf_model_id") not in LEGACY_BF16_SMOKE_MODEL_IDS
+    ):
         return False
     prec = default_var.get("precision")
     if not isinstance(prec, str) or prec.strip().lower() != "bf16":
@@ -1273,7 +1307,19 @@ def _validate_resolved_topology_and_placeholders(
     server_env = dict(resolved["server_env"])
     topo = resolved["topology"]
     topo_kind = topo["kind"]
+    topo_nodes = int(topo["nodes"])
+    topo_capacity = topo_nodes * int(topo["devices_per_node"])
+    ppu_count = int(resolved["ppu_count"])
     preset_name = resolved.get("preset")
+
+    entries = _parse_flag_entries(flags)
+    flag_names = {name for name, _, _ in entries}
+
+    if ppu_count > topo_capacity:
+        raise ValidationError(
+            f"{context}: resolved parallelism requires {ppu_count} devices, "
+            f"exceeding declared topology capacity ({topo_nodes}x{topo['devices_per_node']}={topo_capacity})"
+        )
 
     placeholders = _extract_placeholders_from_flags_and_env(flags, server_env)
     unknown = sorted(placeholders - set(TOPOLOGY_PLACEHOLDERS))
@@ -1282,24 +1328,12 @@ def _validate_resolved_topology_and_placeholders(
             f"{context}: unknown topology placeholder(s): {', '.join(unknown)}"
         )
 
-    if topo_kind == "single_node":
-        if placeholders:
-            raise ValidationError(
-                f"{context}: single_node topology must not contain placeholders: "
-                f"{', '.join(sorted(placeholders))}"
-            )
-    elif topo_kind == "multi_node_ep":
-        missing = sorted(MULTI_NODE_REQUIRED_PLACEHOLDERS - placeholders)
-        if missing:
-            raise ValidationError(
-                f"{context}: multi_node_ep topology missing required placeholder(s): "
-                f"{', '.join(missing)}"
-            )
-        entries = _parse_flag_entries(flags)
+    def _require_matching_nnodes() -> None:
         nnodes_raw = _flag_value(entries, "--nnodes")
         if nnodes_raw is None:
             raise ValidationError(
-                f"{context}: multi_node_ep topology requires --nnodes matching topology.nodes ({topo['nodes']})"
+                f"{context}: {topo_kind} topology (nodes={topo_nodes}) requires "
+                f"--nnodes matching topology.nodes ({topo_nodes})"
             )
         try:
             nnodes_val = int(nnodes_raw)
@@ -1307,9 +1341,45 @@ def _validate_resolved_topology_and_placeholders(
             raise ValidationError(
                 f"{context}: --nnodes must be an integer, got {nnodes_raw!r}"
             ) from exc
-        if nnodes_val != int(topo["nodes"]):
+        if nnodes_val != topo_nodes:
             raise ValidationError(
-                f"{context}: --nnodes ({nnodes_val}) must match topology.nodes ({topo['nodes']})"
+                f"{context}: --nnodes ({nnodes_val}) must match topology.nodes ({topo_nodes})"
+            )
+
+    if topo_kind == "single_node":
+        if placeholders:
+            raise ValidationError(
+                f"{context}: single_node topology must not contain placeholders: "
+                f"{', '.join(sorted(placeholders))}"
+            )
+        bad_mn = sorted(flag_names & MULTI_NODE_LAUNCH_FLAGS)
+        if bad_mn:
+            raise ValidationError(
+                f"{context}: single_node topology must not set multi-node flag(s): "
+                f"{', '.join(bad_mn)}"
+            )
+        if "--kv-transfer-config" in flag_names:
+            raise ValidationError(
+                f"{context}: single_node topology must not set --kv-transfer-config; "
+                f"declare paired pd_disagg presets instead"
+            )
+    elif topo_kind == "multi_node_ep":
+        if "--kv-transfer-config" in flag_names:
+            raise ValidationError(
+                f"{context}: multi_node_ep topology must not set --kv-transfer-config; "
+                f"use paired pd_disagg presets instead"
+            )
+        missing = sorted(MULTI_NODE_REQUIRED_PLACEHOLDERS - placeholders)
+        if missing:
+            raise ValidationError(
+                f"{context}: multi_node_ep topology missing required placeholder(s): "
+                f"{', '.join(missing)}"
+            )
+        _require_matching_nnodes()
+        if ppu_count != topo_capacity:
+            raise ValidationError(
+                f"{context}: multi_node_ep parallelism ({ppu_count}) must match "
+                f"declared topology capacity ({topo_nodes}x{topo['devices_per_node']}={topo_capacity})"
             )
     elif topo_kind == "pd_disagg":
         missing = sorted(PD_DISAGG_REQUIRED_PLACEHOLDERS - placeholders)
@@ -1318,7 +1388,6 @@ def _validate_resolved_topology_and_placeholders(
                 f"{context}: pd_disagg topology missing required placeholder(s): "
                 f"{', '.join(missing)}"
             )
-        entries = _parse_flag_entries(flags)
         kv_raw = _flag_value(entries, "--kv-transfer-config")
         if kv_raw is None:
             raise ValidationError(
@@ -1348,6 +1417,21 @@ def _validate_resolved_topology_and_placeholders(
                 f"{context}: pd_disagg role {role!r} requires "
                 f"kv_role={expected_kv_role!r}, got {kv_obj.get('kv_role')!r}"
             )
+        if topo_nodes == 1:
+            bad_mn = sorted(flag_names & MULTI_NODE_LAUNCH_FLAGS)
+            if bad_mn:
+                raise ValidationError(
+                    f"{context}: single-node pd_disagg topology must not set multi-node flag(s): "
+                    f"{', '.join(bad_mn)}"
+                )
+        else:
+            missing_mn = sorted(MULTI_NODE_REQUIRED_PLACEHOLDERS - placeholders)
+            if missing_mn:
+                raise ValidationError(
+                    f"{context}: multi-node pd_disagg topology missing required placeholder(s): "
+                    f"{', '.join(missing_mn)}"
+                )
+            _require_matching_nnodes()
 
     sub_flags, sub_env = substitute_validation_placeholders(flags, server_env)
     _validate_flag_list(sub_flags, context=context, allow_policy_flags=True)
@@ -1358,10 +1442,12 @@ def _validate_resolved_topology_and_placeholders(
     return sub_flags, sub_env
 
 
-def resolve_recipe(
-    recipe_path: Path,
+def _resolve_recipe_from_doc(
+    recipe: Mapping[str, Any],
     *,
-    policy_path: Path | None = None,
+    recipe_label: str,
+    policy: Mapping[str, Any] | None = None,
+    policy_label: str = "",
     tier: str | None = None,
     variant: str | None = None,
     hardware: str | None = None,
@@ -1375,20 +1461,12 @@ def resolve_recipe(
     port: int = 9985,
     served_model_name: str | None = None,
 ) -> dict[str, Any]:
-    """Resolve recipe + optional policy tier into effective vLLM argv, env, and digest."""
-    recipe = _load_yaml(recipe_path)
-    validate_serving_recipe_structure(recipe, context=str(recipe_path))
-
+    """Resolve an already structurally validated recipe dict (+ optional policy dict)."""
     ppu_blk = recipe["ppu"]
     if ppu_blk["framework"] != "vllm":
         raise ValidationError(
-            f"{recipe_path}: vllm-sail executor only resolves framework='vllm', got {ppu_blk['framework']!r}"
+            f"{recipe_label}: vllm-sail executor only resolves framework='vllm', got {ppu_blk['framework']!r}"
         )
-
-    policy: dict[str, Any] | None = None
-    if policy_path is not None:
-        policy = _load_yaml(policy_path)
-        validate_policy_structure(policy, context=str(policy_path), base_dir=REPO_ROOT)
 
     eff_cache = cache
     eff_dummy = dummy_weights
@@ -1406,7 +1484,7 @@ def resolve_recipe(
             raise ValidationError("--tier is required when --policy is supplied")
         tiers = policy.get("tiers", {})
         if tier not in tiers:
-            raise ValidationError(f"{policy_path}: tier {tier!r} not found")
+            raise ValidationError(f"{policy_label}: tier {tier!r} not found")
         tier_cfg = tiers[tier]
         if tier == "fast_sanity":
             if eff_cache is None:
@@ -1430,23 +1508,23 @@ def resolve_recipe(
 
     variants_blk = recipe.get("variants", {})
     if eff_variant not in variants_blk:
-        raise ValidationError(f"{recipe_path}: unknown variant {eff_variant!r}")
+        raise ValidationError(f"{recipe_label}: unknown variant {eff_variant!r}")
     var_blk = variants_blk[eff_variant]
 
     presets_blk = recipe.get("presets", {})
-    preset_blk: dict[str, Any] = {}
+    preset_blk: Mapping[str, Any] = {}
     if eff_preset is not None:
         if eff_preset not in presets_blk:
-            raise ValidationError(f"{recipe_path}: unknown preset {eff_preset!r}")
+            raise ValidationError(f"{recipe_label}: unknown preset {eff_preset!r}")
         preset_blk = presets_blk[eff_preset]
         allowed_vars = preset_blk.get("variants")
         if allowed_vars is not None and eff_variant not in allowed_vars:
             raise ValidationError(
-                f"{recipe_path}: preset {eff_preset!r} does not support variant {eff_variant!r}"
+                f"{recipe_label}: preset {eff_preset!r} does not support variant {eff_variant!r}"
             )
 
     var_hw = _infer_variant_hardware(
-        var_blk, context=f"{recipe_path}.variants.{eff_variant}"
+        var_blk, context=f"{recipe_label}.variants.{eff_variant}"
     )
     preset_hw = preset_blk.get("hardware")
     policy_hw = policy.get("hardware") if policy is not None else None
@@ -1454,7 +1532,7 @@ def resolve_recipe(
         eff_hardware = hardware
         if policy_hw is not None and policy_hw != eff_hardware:
             raise ValidationError(
-                f"{recipe_path}: requested hardware {eff_hardware!r} conflicts with policy hardware {policy_hw!r}"
+                f"{recipe_label}: requested hardware {eff_hardware!r} conflicts with policy hardware {policy_hw!r}"
             )
     elif policy_hw is not None:
         eff_hardware = str(policy_hw)
@@ -1465,23 +1543,24 @@ def resolve_recipe(
 
     if var_blk.get("hardware") is not None and var_blk["hardware"] != eff_hardware:
         raise ValidationError(
-            f"{recipe_path}: variant {eff_variant!r} targets hardware "
+            f"{recipe_label}: variant {eff_variant!r} targets hardware "
             f"{var_blk['hardware']!r}, incompatible with {eff_hardware!r}"
         )
     if preset_hw is not None and preset_hw != eff_hardware:
         raise ValidationError(
-            f"{recipe_path}: preset {eff_preset!r} targets hardware "
+            f"{recipe_label}: preset {eff_preset!r} targets hardware "
             f"{preset_hw!r}, incompatible with {eff_hardware!r}"
         )
     allow_bf16 = (
         _is_legacy_bf16_smoke_recipe(recipe)
         and eff_preset is None
         and tier in (None, "fast_sanity")
+        and (policy is None or policy.get("model_id") in LEGACY_BF16_SMOKE_MODEL_IDS)
     )
     _validate_hardware_precision(
         hardware=eff_hardware,
         precision=var_blk["precision"],
-        context=f"{recipe_path}.variants.{eff_variant}",
+        context=f"{recipe_label}.variants.{eff_variant}",
         allow_legacy_bf16_smoke=allow_bf16,
     )
 
@@ -1514,7 +1593,7 @@ def resolve_recipe(
         if not is_enabled:
             continue
         if feat_name not in features_blk:
-            raise ValidationError(f"{recipe_path}: unknown feature {feat_name!r}")
+            raise ValidationError(f"{recipe_label}: unknown feature {feat_name!r}")
         active_features.append(feat_name)
         feat = features_blk[feat_name]
         if "modes" in feat:
@@ -1607,12 +1686,32 @@ def resolve_recipe(
         *flags_only,
     ]
 
-    dp_raw = _flag_value(ordered, "--data-parallel-size")
-    tp_raw = _flag_value(ordered, "--tensor-parallel-size")
-    if dp_raw is not None:
-        ppu_count = int(dp_raw) * (int(tp_raw) if tp_raw is not None else 1)
-    elif tp_raw is not None:
-        ppu_count = int(tp_raw)
+    def _parse_pos_int_flag(flag_name: str, raw: str | None) -> int | None:
+        if raw is None:
+            return None
+        try:
+            val = int(raw)
+        except ValueError as exc:
+            raise ValidationError(
+                f"{recipe_label}: {flag_name} must be a positive int, got {raw!r}"
+            ) from exc
+        if val <= 0:
+            raise ValidationError(
+                f"{recipe_label}: {flag_name} must be a positive int, got {raw!r}"
+            )
+        return val
+
+    dp_val = _parse_pos_int_flag(
+        "--data-parallel-size", _flag_value(ordered, "--data-parallel-size")
+    )
+    tp_val = _parse_pos_int_flag(
+        "--tensor-parallel-size", _flag_value(ordered, "--tensor-parallel-size")
+    )
+    pp_val = _parse_pos_int_flag(
+        "--pipeline-parallel-size", _flag_value(ordered, "--pipeline-parallel-size")
+    )
+    if dp_val is not None or tp_val is not None or pp_val is not None:
+        ppu_count = (dp_val or 1) * (tp_val or 1) * (pp_val or 1)
     else:
         ppu_count = int(eff_topology["nodes"]) * int(eff_topology["devices_per_node"])
 
@@ -1640,7 +1739,7 @@ def resolve_recipe(
         )
     ).hexdigest()
 
-    return {
+    result = {
         "argv": argv,
         "flags": flags_only,
         "server_env": server_env,
@@ -1656,7 +1755,7 @@ def resolve_recipe(
         "preset": eff_preset,
         "variant": eff_variant,
         "precision": _normalize_precision(
-            var_blk["precision"], context=f"{recipe_path}.variants.{eff_variant}"
+            var_blk["precision"], context=f"{recipe_label}.variants.{eff_variant}"
         ),
         "hardware": eff_hardware,
         "topology": eff_topology,
@@ -1664,6 +1763,58 @@ def resolve_recipe(
         "layer_override": eff_layers,
         "dummy_weights": eff_dummy,
     }
+    _validate_resolved_topology_and_placeholders(
+        result, context=f"{recipe_label}:{eff_variant}:{eff_preset or 'baseline'}"
+    )
+    return result
+
+
+def resolve_recipe(
+    recipe_path: Path,
+    *,
+    policy_path: Path | None = None,
+    tier: str | None = None,
+    variant: str | None = None,
+    hardware: str | None = None,
+    preset: str | None = None,
+    cache: str | None = None,
+    dummy_weights: bool = False,
+    layer_override: Any = _UNSET,
+    assets_map_path: Path | None = None,
+    model_dir: Path | None = None,
+    host: str = "127.0.0.1",
+    port: int = 9985,
+    served_model_name: str | None = None,
+) -> dict[str, Any]:
+    """Resolve recipe + optional policy tier into effective vLLM argv, env, and digest."""
+    recipe = _load_yaml(recipe_path)
+    validate_serving_recipe_structure(
+        recipe, context=str(recipe_path), validate_expansions=False
+    )
+
+    policy: dict[str, Any] | None = None
+    if policy_path is not None:
+        policy = _load_yaml(policy_path)
+        validate_policy_structure(policy, context=str(policy_path), base_dir=REPO_ROOT)
+
+    return _resolve_recipe_from_doc(
+        recipe,
+        recipe_label=str(recipe_path),
+        policy=policy,
+        policy_label=str(policy_path) if policy_path is not None else "",
+        tier=tier,
+        variant=variant,
+        hardware=hardware,
+        preset=preset,
+        cache=cache,
+        dummy_weights=dummy_weights,
+        layer_override=layer_override,
+        assets_map_path=assets_map_path,
+        model_dir=model_dir,
+        host=host,
+        port=port,
+        served_model_name=served_model_name,
+    )
 
 
 def _scan_text(text: str, *, context: str, allow_loopback: bool = False) -> list[str]:
@@ -1819,6 +1970,7 @@ def validate_serving_recipe_structure(
     *,
     context: str,
     allow_internal_visibility: bool = False,
+    validate_expansions: bool = True,
 ) -> None:
     """Validate structure, env allowlist, JSON flags, and redaction for ``ppu-serving/v1``."""
     _check_keys(
@@ -2165,6 +2317,30 @@ def validate_serving_recipe_structure(
         if findings:
             raise ValidationError("; ".join(findings))
 
+    if validate_expansions and ppu["framework"] == "vllm":
+        for vname, var_hw in variant_hw_map.items():
+            _resolve_recipe_from_doc(
+                recipe,
+                recipe_label=context,
+                variant=vname,
+                hardware=var_hw,
+                preset=None,
+                cache=None,
+            )
+            for pname, pcfg in presets_blk.items():
+                if pcfg.get("variants") is not None and vname not in pcfg["variants"]:
+                    continue
+                if pcfg.get("hardware") is not None and pcfg["hardware"] != var_hw:
+                    continue
+                _resolve_recipe_from_doc(
+                    recipe,
+                    recipe_label=context,
+                    variant=vname,
+                    hardware=var_hw,
+                    preset=pname,
+                    cache=None,
+                )
+
 
 def validate_dataset_structure(dataset: dict[str, Any], *, context: str) -> None:
     """Validate structure and redaction for ``ppu-dataset/v1``."""
@@ -2296,9 +2472,11 @@ def validate_policy_structure(
                 f"{context}: unknown variant {policy_variant!r} in {policy['recipe']}"
             )
         tiers_preview = policy.get("tiers", {})
-        allow_bf16_pol = _is_legacy_bf16_smoke_recipe(rec_doc) and set(
-            tiers_preview
-        ) <= {"fast_sanity"}
+        allow_bf16_pol = (
+            _is_legacy_bf16_smoke_recipe(rec_doc)
+            and policy.get("model_id") in LEGACY_BF16_SMOKE_MODEL_IDS
+            and set(tiers_preview) <= {"fast_sanity"}
+        )
         _validate_hardware_precision(
             hardware=policy["hardware"],
             precision=variants_blk[policy_variant].get("precision"),
@@ -2559,10 +2737,19 @@ def validate_flags_with_parser(
 
 
 def iter_recipe_catalog_entries(
-    recipe_path: Path, recipe: dict[str, Any] | None = None
+    recipe_path: Path,
+    recipe: dict[str, Any] | None = None,
+    *,
+    allow_internal_visibility: bool = False,
 ) -> list[dict[str, Any]]:
     """Expand every compatible ``variant x preset`` entry (including each variant baseline)."""
     rdoc = recipe if recipe is not None else _load_yaml(recipe_path)
+    validate_serving_recipe_structure(
+        rdoc,
+        context=str(recipe_path),
+        allow_internal_visibility=allow_internal_visibility,
+        validate_expansions=False,
+    )
     variants_blk = rdoc.get("variants", {})
     presets_blk = rdoc.get("presets", {})
     entries: list[dict[str, Any]] = []
@@ -2570,8 +2757,13 @@ def iter_recipe_catalog_entries(
         var_hw = _infer_variant_hardware(
             vcfg, context=f"{recipe_path}.variants.{vname}"
         )
-        baseline = resolve_recipe(
-            recipe_path, variant=vname, hardware=var_hw, preset=None, cache=None
+        baseline = _resolve_recipe_from_doc(
+            rdoc,
+            recipe_label=str(recipe_path),
+            variant=vname,
+            hardware=var_hw,
+            preset=None,
+            cache=None,
         )
         entries.append(
             {
@@ -2587,8 +2779,13 @@ def iter_recipe_catalog_entries(
                 continue
             if pcfg.get("hardware") is not None and pcfg["hardware"] != var_hw:
                 continue
-            resolved = resolve_recipe(
-                recipe_path, variant=vname, hardware=var_hw, preset=pname, cache=None
+            resolved = _resolve_recipe_from_doc(
+                rdoc,
+                recipe_label=str(recipe_path),
+                variant=vname,
+                hardware=var_hw,
+                preset=pname,
+                cache=None,
             )
             entries.append(
                 {
@@ -2631,8 +2828,9 @@ def _collect_all_recipe_flag_sets(
             and vname == "default"
             and item["resolved"]["topology"]["kind"] == "single_node"
         ):
-            fs_res = resolve_recipe(
-                recipe_path,
+            fs_res = _resolve_recipe_from_doc(
+                recipe,
+                recipe_label=str(recipe_path),
                 variant=vname,
                 hardware=item["hardware"],
                 cache="enabled",
@@ -2683,6 +2881,7 @@ def validate_paths(
                 doc,
                 context=str(path),
                 allow_internal_visibility=allow_internal_visibility,
+                validate_expansions=False,
             )
             recipe_items.append((path, doc))
         elif schema == DATASET_SCHEMA:
@@ -2698,7 +2897,9 @@ def validate_paths(
     for rpath, rdoc in recipe_items:
         if rdoc["ppu"]["framework"] != "vllm":
             continue
-        entries = iter_recipe_catalog_entries(rpath, rdoc)
+        entries = iter_recipe_catalog_entries(
+            rpath, rdoc, allow_internal_visibility=allow_internal_visibility
+        )
         checked_combinations += len(entries)
         expanded_flag_sets.extend(
             _collect_all_recipe_flag_sets(rpath, rdoc, catalog_entries=entries)

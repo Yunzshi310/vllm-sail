@@ -3164,3 +3164,187 @@ def test_model_sanity_rejects_mismatched_stage_presets() -> None:
         match="all shared-server stages must agree on preset",
     ):
         ppu_recipe.validate_policy_structure(pol, context="mismatched_stage_preset")
+
+
+def test_bf16_legacy_exception_bound_to_qwen38_27b_fixture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    qwen_doc = yaml.safe_load((RECIPES_DIR / "Qwen" / "Qwen3.8-27B.yaml").read_text())
+    qwen_pol = yaml.safe_load((POLICY_DIR / "models" / "qwen3.8-27b.yaml").read_text())
+
+    # 1. Counterexample (R1 P1-01): cloning Qwen's preset-less single-variant BF16 shape
+    #    for another model (zai-org/GLM-5.3) must be rejected everywhere (structure, paths,
+    #    resolve, policy, and single-node CI selector).
+    glm_bf16 = copy.deepcopy(qwen_doc)
+    glm_bf16["model"]["model_id"] = "zai-org/GLM-5.3"
+    glm_bf16["ppu"]["hf_model_id"] = "zai-org/GLM-5.3"
+    glm_bf16["ppu"]["assets"] = {"model": "glm-5.3-bf16", "tokenizer": "glm-5.3-bf16"}
+    glm_bf16["ppu"]["served_name"] = "glm-5.3-bf16"
+    with pytest.raises(
+        ppu_recipe.ValidationError, match="precision 'bf16' is forbidden"
+    ):
+        ppu_recipe.validate_serving_recipe_structure(glm_bf16, context="glm_bf16")
+
+    shutil.copytree(ROOT / "tests/ppu", tmp_path / "tests/ppu")
+    monkeypatch.setattr(ppu_e2e_select, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(ppu_recipe, "REPO_ROOT", tmp_path)
+    rec_path = tmp_path / "tests/ppu/recipes/zai-org/GLM-5.3-BF16.yaml"
+    rec_path.write_text(yaml.safe_dump(glm_bf16), encoding="utf-8")
+    pol_doc = copy.deepcopy(qwen_pol)
+    pol_doc["model_id"] = "zai-org/GLM-5.3"
+    pol_doc["recipe"] = "tests/ppu/recipes/zai-org/GLM-5.3-BF16.yaml"
+    pol_path = tmp_path / "tests/ppu/policy/models/glm-5.3-bf16.yaml"
+    pol_path.write_text(yaml.safe_dump(pol_doc), encoding="utf-8")
+
+    with pytest.raises(
+        ppu_recipe.ValidationError, match="precision 'bf16' is forbidden"
+    ):
+        ppu_recipe.validate_paths(
+            [rec_path], vllm_parser_mode="required", parser=_sample_vllm_parser()
+        )
+    with pytest.raises(
+        ppu_recipe.ValidationError, match="precision 'bf16' is forbidden"
+    ):
+        ppu_recipe.resolve_recipe(rec_path, policy_path=pol_path, tier="fast_sanity")
+    with pytest.raises(
+        ppu_recipe.ValidationError, match="precision 'bf16' is forbidden"
+    ):
+        ppu_e2e_select.build_recipe_matrix("", "fast_sanity")
+
+    # 2. Spoofing model.model_id while changing hf_model_id (at ppu or variant level) fails
+    for spoof in (
+        lambda d: d["ppu"].update({"hf_model_id": "zai-org/GLM-5.3"}),
+        lambda d: d["variants"]["default"].update({"hf_model_id": "zai-org/GLM-5.3"}),
+    ):
+        bad = copy.deepcopy(qwen_doc)
+        spoof(bad)
+        with pytest.raises(
+            ppu_recipe.ValidationError, match="precision 'bf16' is forbidden"
+        ):
+            ppu_recipe.validate_serving_recipe_structure(bad, context="spoof_bf16")
+
+    # 3. Non-Qwen policy pointing to Qwen3.8-27B.yaml fails closed
+    bad_pol = copy.deepcopy(qwen_pol)
+    bad_pol["model_id"] = "zai-org/GLM-5.3"
+    with pytest.raises(
+        ppu_recipe.ValidationError, match="precision 'bf16' is forbidden"
+    ):
+        ppu_recipe.validate_policy_structure(
+            bad_pol, context="bad_bf16_pol", base_dir=tmp_path
+        )
+
+    # 4. Positive control: removing the rogue BF16 files restores green validation & selector
+    rec_path.unlink()
+    pol_path.unlink()
+    qwen_entry = next(
+        item
+        for item in ppu_e2e_select.build_recipe_matrix("", "fast_sanity")["include"]
+        if item["key"] == "qwen3.8-27b"
+    )
+    assert qwen_entry["model_id"] == "Qwen/Qwen3.8-27B"
+
+
+def test_topology_flag_invariant_blocks_multinode_and_disagg_bypass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    glm_doc = yaml.safe_load((RECIPES_DIR / "zai-org" / "GLM-5.3.yaml").read_text())
+
+    # 1. Counterexample (R1 P1-02): single_node preset smuggling multi-node launch flags
+    #    (--nnodes 4 --node-rank 0 --master-addr localhost) must fail closed across
+    #    structure validation, validate_paths, resolve_recipe, and CI selector.
+    bypass_doc = copy.deepcopy(glm_doc)
+    bypass_doc["presets"]["decode"]["args"] = [
+        "--nnodes",
+        "4",
+        "--node-rank",
+        "0",
+        "--master-addr",
+        "localhost",
+    ]
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match="single_node topology must not set multi-node flag",
+    ):
+        ppu_recipe.validate_serving_recipe_structure(bypass_doc, context="bypass_mn")
+
+    shutil.copytree(ROOT / "tests/ppu", tmp_path / "tests/ppu")
+    monkeypatch.setattr(ppu_e2e_select, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(ppu_recipe, "REPO_ROOT", tmp_path)
+    glm_copy = tmp_path / "tests/ppu/recipes/zai-org/GLM-5.3.yaml"
+    glm_copy.write_text(yaml.safe_dump(bypass_doc), encoding="utf-8")
+
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match="single_node topology must not set multi-node flag",
+    ):
+        ppu_recipe.validate_paths(
+            [glm_copy], vllm_parser_mode="required", parser=_sample_vllm_parser()
+        )
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match="single_node topology must not set multi-node flag",
+    ):
+        ppu_recipe.resolve_recipe(
+            glm_copy,
+            policy_path=tmp_path / "tests/ppu/policy/models/glm-5.3-decode.yaml",
+            tier="fast_sanity",
+        )
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match="single_node topology must not set multi-node flag",
+    ):
+        ppu_e2e_select.build_recipe_matrix("", "fast_sanity")
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match="single_node topology must not set multi-node flag",
+    ):
+        ppu_e2e_select.build_recipe_matrix("glm-5.3-decode", "fast_sanity")
+
+    # 2. single_node preset injecting --kv-transfer-config or exceeding declared devices
+    bad_kv_single = copy.deepcopy(glm_doc)
+    bad_kv_single["presets"]["decode"]["args"] = [
+        "--kv-transfer-config",
+        '{"kv_connector":"MooncakeConnector","kv_role":"kv_producer"}',
+    ]
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match="single_node topology must not set --kv-transfer-config",
+    ):
+        ppu_recipe.validate_serving_recipe_structure(bad_kv_single, context="kv_single")
+
+    bad_cap_single = copy.deepcopy(glm_doc)
+    bad_cap_single["presets"]["decode"]["remove_args"] = ["--tensor-parallel-size"]
+    bad_cap_single["presets"]["decode"].pop("tp", None)
+    bad_cap_single["presets"]["decode"]["args"] = ["--data-parallel-size", "32"]
+    with pytest.raises(
+        ppu_recipe.ValidationError, match="exceeding declared topology capacity"
+    ):
+        ppu_recipe.validate_serving_recipe_structure(
+            bad_cap_single, context="cap_single"
+        )
+
+    # 3. single-node pd_disagg preset smuggling --nnodes 4 fails closed
+    bad_pd_mn = copy.deepcopy(glm_doc)
+    bad_pd_mn["presets"]["pd_prefill"]["args"].extend(["--nnodes", "4"])
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match="single-node pd_disagg topology must not set multi-node flag",
+    ):
+        ppu_recipe.validate_serving_recipe_structure(bad_pd_mn, context="pd_mn")
+
+    # 4. Positive control: restoring clean GLM-5.3.yaml passes full validation and selector
+    glm_copy.write_text(yaml.safe_dump(glm_doc), encoding="utf-8")
+    report = ppu_recipe.validate_paths(
+        [glm_copy], vllm_parser_mode="required", parser=_sample_vllm_parser()
+    )
+    assert report["checked_combinations"] == 14
+    assert report["parser_checked"] is True
+    decode_entry = next(
+        item
+        for item in ppu_e2e_select.build_recipe_matrix("glm-5.3-decode", "fast_sanity")[
+            "include"
+        ]
+        if item["key"] == "glm-5.3-decode"
+    )
+    assert decode_entry["ppu_count"] == 8
+    assert decode_entry["preset"] == "decode"
