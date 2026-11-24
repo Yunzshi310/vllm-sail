@@ -113,7 +113,9 @@ def build_accuracy_matrix(catalog: list[dict], models: str) -> dict:
     return {"include": include}
 
 
-def _recipe_entries(models: str, tier: str) -> Iterator[tuple[dict, list[str], dict]]:
+def _recipe_entries(
+    models: str, tier: str, *, hardware: str | None = "zhenwu_m890"
+) -> Iterator[tuple[dict, list[str], dict]]:
     if str(CI_DIR) not in sys.path:
         sys.path.insert(0, str(CI_DIR))
     import ppu_recipe
@@ -144,6 +146,21 @@ def _recipe_entries(models: str, tier: str) -> Iterator[tuple[dict, list[str], d
         rec_rel = Path(pol_doc["recipe"])
         rec_path = rec_rel if rec_rel.is_absolute() else (REPO_ROOT / rec_rel)
         resolved = ppu_recipe.resolve_recipe(rec_path, policy_path=pol_path, tier=tier)
+        topo = resolved["topology"]
+        if topo["nodes"] > 1 or topo["kind"] == "pd_disagg":
+            if requested:
+                raise ValueError(
+                    f"recipe policy {slug!r} requires topology {topo['kind']!r} "
+                    f"(nodes={topo['nodes']}), which is not runnable on single-node CI"
+                )
+            continue
+        if hardware is not None and resolved["hardware"] != hardware:
+            if requested:
+                raise ValueError(
+                    f"recipe policy {slug!r} targets hardware {resolved['hardware']!r}, "
+                    f"which is not runnable on single-node {hardware!r} CI"
+                )
+            continue
         yield (
             {
                 "key": slug,
@@ -156,7 +173,7 @@ def _recipe_entries(models: str, tier: str) -> Iterator[tuple[dict, list[str], d
                 "config_digest": resolved["config_digest"],
                 **(
                     {"preset": resolved["preset"]}
-                    if tier == "model_sanity" and resolved["preset"] is not None
+                    if resolved["preset"] is not None
                     else {}
                 ),
             },
@@ -165,9 +182,15 @@ def _recipe_entries(models: str, tier: str) -> Iterator[tuple[dict, list[str], d
         )
 
 
-def build_recipe_matrix(models: str, tier: str = "fast_sanity") -> dict:
+def build_recipe_matrix(
+    models: str, tier: str = "fast_sanity", *, hardware: str | None = "zhenwu_m890"
+) -> dict:
     """Select all policies defining the tier, or require it for each explicit key."""
-    return {"include": [entry for entry, _, _ in _recipe_entries(models, tier)]}
+    return {
+        "include": [
+            entry for entry, _, _ in _recipe_entries(models, tier, hardware=hardware)
+        ]
+    }
 
 
 def _parallelism(flags: list[str]) -> tuple[int, int, bool]:
