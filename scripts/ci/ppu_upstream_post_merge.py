@@ -188,19 +188,29 @@ _NON_UPSTREAM_PATH_PART_RE = re.compile(
     r")(?:/|$)"
 )
 _UPSTREAM_PY_FRAME_RE = re.compile(
-    r"(?:^|/)(?:setup\.py|(?:vllm|cmake|csrc)/[A-Za-z0-9_./-]+\.py)$"
+    r"(?:^|/)(?:setup\.py|(?:vllm|cmake|csrc|tools)/[A-Za-z0-9_./-]+\.py)$"
+)
+_SETUPTOOLS_RUN_SETUP_FILE_RE = re.compile(
+    r"(?i)(?:^|/)setuptools/(?:build_meta|sandbox)\.py$"
+)
+_SETUPTOOLS_PYPROJECT_FILE_RE = re.compile(
+    r"(?i)(?:^|/)setuptools/config/pyprojecttoml\.py$"
 )
 _STDLIB_PATHLIB_FRAME_RE = re.compile(r"(?:^|/)pathlib(?:/[A-Za-z0-9_.-]+)?\.py$")
 _STDLIB_SUBPROCESS_FRAME_RE = re.compile(r"(?:^|/)subprocess\.py$")
 _TRACEBACK_HEADER_RE = re.compile(r"^(\s*)Traceback \(most recent call last\):\s*$")
-_TRACEBACK_FILE_RE = re.compile(r'^(\s*)File "([^"]+)", line \d+(?:, in .*)?\s*$')
+_TRACEBACK_FILE_RE = re.compile(r'^(\s*)File "([^"]+)", line \d+(?:, in ([^\s]+))?\s*$')
 _PYTHON_EXC_LINE_RE = re.compile(
-    r"^(\s*)(?:[A-Za-z_][A-Za-z0-9_.]*\.)?([A-Z][A-Za-z0-9_]*(?:Error|Exception|Interrupt|Exit))(?::\s*(.*))?$"
+    r"^(\s*)(?:"
+    r"(?:[A-Za-z_][A-Za-z0-9_]*\.)+([A-Z][A-Za-z0-9_]*)"
+    r"|((?:[A-Z][A-Za-z0-9_]*)?(?:Error|Exception|ExceptionGroup|Warning|Interrupt|Exit)|Stop(?:Async)?Iteration)"
+    r")(?::\s*(.*))?$"
 )
 _ALLOWED_BUILD_EXC_NAMES = frozenset(
     {
         "SyntaxError",
         "IndentationError",
+        "TabError",
         "ImportError",
         "ModuleNotFoundError",
         "RuntimeError",
@@ -1818,6 +1828,13 @@ def _has_native_repo_compile_error(payload: str, lines: list[str]) -> bool:
     )
 
 
+def _extract_python_exc_info(m: re.Match[str]) -> tuple[int, str, str]:
+    indent = len(m.group(1))
+    exc_name = m.group(2) or m.group(3) or ""
+    exc_msg = m.group(4) or ""
+    return indent, exc_name, exc_msg
+
+
 def _has_upstream_build_source_evidence(payload: str) -> bool:
     """Require structural source-frame or native compiler attribution; never cross-match free text."""
     lines = payload.splitlines()
@@ -1839,27 +1856,40 @@ def _has_upstream_build_source_evidence(payload: str) -> bool:
             )
             consumed_lines.add(start_idx)
             real_frames: list[str] = []
-            exc_match = None
+            in_setuptools_run_setup = False
+            exc_info: tuple[int, str, str] | None = None
             for j in range(start_idx + 1, next_tb):
                 fm = _TRACEBACK_FILE_RE.match(lines[j])
                 if fm is not None:
                     consumed_lines.add(j)
-                    fpath = fm.group(2)
-                    if not fpath.startswith("<"):
-                        real_frames.append(fpath)
+                    norm_fpath = fm.group(2).replace("\\", "/").strip()
+                    func_name = fm.group(3) or ""
+                    if norm_fpath.startswith("<frozen "):
+                        continue
+                    if _SETUPTOOLS_RUN_SETUP_FILE_RE.search(
+                        norm_fpath
+                    ) is not None and func_name in ("run_setup", "_execfile"):
+                        in_setuptools_run_setup = True
+                        real_frames.append(norm_fpath)
+                        continue
+                    if norm_fpath == "<string>" and in_setuptools_run_setup:
+                        real_frames.append("setup.py")
+                        continue
+                    real_frames.append(norm_fpath)
                     continue
                 em = _PYTHON_EXC_LINE_RE.match(lines[j])
-                if em is not None and len(em.group(1)) <= tb_indent:
-                    exc_match = em
-                    consumed_lines.add(j)
-                    break
+                if em is not None:
+                    e_indent, e_name, e_msg = _extract_python_exc_info(em)
+                    if e_indent <= tb_indent:
+                        exc_info = (e_indent, e_name, e_msg)
+                        consumed_lines.add(j)
+                        break
                 consumed_lines.add(j)
 
-            if exc_match is None or not real_frames:
+            if exc_info is None or not real_frames:
                 return False
-            exc_name = exc_match.group(2)
-            exc_msg = exc_match.group(3) or ""
-            last_frame = real_frames[-1].replace("\\", "/")
+            _, exc_name, exc_msg = exc_info
+            last_frame = real_frames[-1]
             has_upstream_ancestor = any(_is_upstream_py_frame(f) for f in real_frames)
 
             if _is_upstream_py_frame(last_frame):
@@ -1883,6 +1913,12 @@ def _has_upstream_build_source_evidence(payload: str) -> bool:
                 and has_native_diag
             ):
                 pass
+            elif (
+                has_upstream_ancestor
+                and _SETUPTOOLS_PYPROJECT_FILE_RE.search(last_frame) is not None
+                and exc_name in ("ValueError", "InvalidConfigError", "TOMLDecodeError")
+            ):
+                pass
             else:
                 return False
 
@@ -1904,13 +1940,15 @@ def _has_upstream_build_source_evidence(payload: str) -> bool:
         syntax_exc_idx = -1
         for j in range(last_file_idx + 1, min(last_file_idx + 8, len(lines))):
             em = _PYTHON_EXC_LINE_RE.match(lines[j])
-            if (
-                em is not None
-                and len(em.group(1)) <= file_indent
-                and em.group(2) in ("SyntaxError", "IndentationError")
-            ):
-                syntax_exc_idx = j
-                break
+            if em is not None:
+                e_indent, e_name, _ = _extract_python_exc_info(em)
+                if e_indent <= file_indent and e_name in (
+                    "SyntaxError",
+                    "IndentationError",
+                    "TabError",
+                ):
+                    syntax_exc_idx = j
+                    break
         if syntax_exc_idx < 0:
             return False
         for idx, ln in enumerate(lines):
@@ -1933,7 +1971,7 @@ def _classify_install_failure(
         return "infra_error", "infra_or_unknown", True
     if mode != "cpu_empty_build":
         return "install", "infra_or_unknown", False
-    payload = _strip_pip_wrapper_lines(f"{stderr}\n{stdout}")
+    payload = _strip_pip_wrapper_lines(f"{stdout}\n{stderr}")
     if payload and _has_upstream_build_source_evidence(payload):
         return "build_install", "upstream_build_source", False
     return "infra_error", "infra_or_unknown", True

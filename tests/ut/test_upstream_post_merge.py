@@ -3172,6 +3172,26 @@ def test_review_r1_p1_install_infra_and_unexecuted_stub_cannot_verify_or_classif
             '    raise RuntimeError("wheel fetch failed")\n'
             "RuntimeError: wheel fetch failed",
         ),
+        (
+            1,
+            "Traceback (most recent call last):\n"
+            '  File "/tmp/vllm-bbbbbbbbbbbb/setup.py", line 1, in <module>\n'
+            "RuntimeError: VLLM_TARGET_DEVICE=empty unsupported\n"
+            "Exception: runner worker pool exhausted",
+        ),
+        (
+            1,
+            "Traceback (most recent call last):\n"
+            '  File "<string>", line 1, in <module>\n'
+            "RuntimeError: VLLM_TARGET_DEVICE=empty unsupported",
+        ),
+        (
+            1,
+            "Traceback (most recent call last):\n"
+            '  File "/opt/homebrew/lib/python3.11/site-packages/setuptools/build_meta.py", line 374, in prepare_metadata_for_build_wheel\n'
+            "    self.run_setup()\n"
+            "RuntimeError: corrupted setuptools installation",
+        ),
         (1, "ConnectionError: Temporary failure in name resolution"),
         (
             1,
@@ -3244,6 +3264,34 @@ def test_review_r1_p1_install_infra_and_unexecuted_stub_cannot_verify_or_classif
         '  File "/usr/lib/python3.11/subprocess.py", line 413, in check_call\n'
         "    raise CalledProcessError(retcode, cmd)\n"
         "subprocess.CalledProcessError: Command '['cmake', '..']' returned non-zero exit status 1.",
+        # Real setuptools 80.9.0 build_meta.run_setup -> exec(code, locals()) `<string>` frames:
+        "  error: subprocess-exited-with-error\n"
+        "  × Preparing metadata (pyproject.toml) did not run successfully.\n"
+        "  │ exit code: 1\n"
+        "  ╰─> [15 lines of output]\n"
+        "      Traceback (most recent call last):\n"
+        '        File "/opt/homebrew/lib/python3.11/site-packages/pip/_vendor/pyproject_hooks/_in_process/_in_process.py", line 389, in <module>\n'
+        "          main()\n"
+        '        File "/opt/homebrew/lib/python3.11/site-packages/setuptools/build_meta.py", line 374, in prepare_metadata_for_build_wheel\n'
+        "          self.run_setup()\n"
+        '        File "/opt/homebrew/lib/python3.11/site-packages/setuptools/build_meta.py", line 317, in run_setup\n'
+        "          exec(code, locals())\n"
+        '        File "<string>", line 1, in <module>\n'
+        "      RuntimeError: VLLM_TARGET_DEVICE=empty unsupported in setup.py\n"
+        "      [end of output]\n"
+        "error: metadata-generation-failed",
+        "      Traceback (most recent call last):\n"
+        '        File "/opt/homebrew/lib/python3.11/site-packages/setuptools/build_meta.py", line 317, in run_setup\n'
+        "          exec(code, locals())\n"
+        '        File "<string>", line 1, in <module>\n'
+        "      FileNotFoundError: [Errno 2] No such file or directory: 'requirements/common.txt'",
+        "      Traceback (most recent call last):\n"
+        '        File "/opt/homebrew/lib/python3.11/site-packages/setuptools/build_meta.py", line 317, in run_setup\n'
+        "          exec(code, locals())\n"
+        '        File "<string>", line 1\n'
+        "          def broken(:\n"
+        "                     ^\n"
+        "      SyntaxError: invalid syntax",
     ):
         fake_real_build_fail, _ = _make_fake_run(
             bad_pip_rc=1,
@@ -3430,6 +3478,17 @@ def test_review_r1_p1_install_infra_and_unexecuted_stub_cannot_verify_or_classif
             "RuntimeError: runner worker pool exhausted\n"
             "ERROR: Could not build wheels for vllm, which is required to install pyproject.toml-based projects"
         ),
+        (
+            "Traceback (most recent call last):\n"
+            '  File "/tmp/vllm-bbbbbbbbbbbb/setup.py", line 1, in <module>\n'
+            "RuntimeError: VLLM_TARGET_DEVICE=empty unsupported\n"
+            "Exception: runner worker pool exhausted"
+        ),
+        (
+            "Traceback (most recent call last):\n"
+            '  File "<string>", line 1, in <module>\n'
+            "RuntimeError: VLLM_TARGET_DEVICE=empty unsupported"
+        ),
     ]
     sail_sha = "c" * 40
     for idx, err_blob in enumerate(probe_infra_snippets):
@@ -3535,3 +3594,70 @@ def test_review_r1_p1_install_infra_and_unexecuted_stub_cannot_verify_or_classif
         == "plugin_interface_break"
     )
     assert pub_real["issue_payload"]["upstream_reproducer_markdown"] != ""
+
+    # Positive probe_cmd controls for real setuptools 80.9.0 `build_meta.run_setup` -> `<string>`
+    # (RuntimeError, missing requirements/common.txt FileNotFoundError, and SyntaxError)
+    for st_idx, st_stderr in enumerate(
+        (
+            "      Traceback (most recent call last):\n"
+            '        File "/opt/homebrew/lib/python3.11/site-packages/pip/_vendor/pyproject_hooks/_in_process/_in_process.py", line 389, in <module>\n'
+            '        File "/opt/homebrew/lib/python3.11/site-packages/setuptools/build_meta.py", line 317, in run_setup\n'
+            "          exec(code, locals())\n"
+            '        File "<string>", line 1, in <module>\n'
+            "      RuntimeError: VLLM_TARGET_DEVICE=empty unsupported in setup.py\n",
+            "      Traceback (most recent call last):\n"
+            '        File "/opt/homebrew/lib/python3.11/site-packages/setuptools/build_meta.py", line 317, in run_setup\n'
+            "          exec(code, locals())\n"
+            '        File "<string>", line 1, in <module>\n'
+            "      FileNotFoundError: [Errno 2] No such file or directory: 'requirements/common.txt'\n",
+            "      Traceback (most recent call last):\n"
+            '        File "/opt/homebrew/lib/python3.11/site-packages/setuptools/build_meta.py", line 317, in run_setup\n'
+            "          exec(code, locals())\n"
+            '        File "<string>", line 1\n'
+            "          def broken(:\n"
+            "                     ^\n"
+            "      SyntaxError: invalid syntax\n",
+        )
+    ):
+        st_file = tmp_path / f"probe_setuptools_{st_idx}.txt"
+        st_file.write_text(st_stderr, encoding="utf-8")
+        ev_st = post_merge.verify_non_ppu_reproducer(
+            vllm_repo=tmp_path,
+            last_good_sha=good_sha,
+            first_failing_sha=bad_sha,
+            stage="wheel_build",
+            target_signature="VLLM_TARGET_DEVICE=empty",
+            probe_cmd=(
+                f'if [ "$CANDIDATE_SHA" = "{good_sha}" ]; then '
+                f'PYTHONPATH="{good_vllm_dir}" python3 "$STUB_CHECK_SCRIPT"; '
+                f'else cat "{st_file}" >&2; exit 1; fi'
+            ),
+        )
+        assert ev_st.verified is True, f"setuptools case {st_idx} rejected"
+        assert ev_st.infra_error is False
+        assert ev_st.first_failing_phase == "build_install"
+        assert ev_st.failure_source == "upstream_build_source"
+        rt_st = post_merge.parse_non_ppu_repro_evidence(ev_st.to_public_dict())
+        assert rt_st is not None and rt_st.verified is True
+        pub_st = post_merge.publish_sanitized_channels(
+            gear="probe",
+            status="fail",
+            sail_sha=sail_sha,
+            upstream_sha=bad_sha,
+            verified_pin=good_sha,
+            first_failing_sha=bad_sha,
+            last_good_sha=good_sha,
+            outcome=post_merge.ProbeOutcome(
+                status="fail",
+                stage="wheel_build",
+                target_signature="VLLM_TARGET_DEVICE=empty",
+                is_public_plugin_interface=True,
+                non_ppu_repro=rt_st,
+            ),
+            public_dir=tmp_path / f"pub_setuptools_{st_idx}",
+        )
+        assert (
+            pub_st["public_summary"]["triage"]["classification"]
+            == "plugin_interface_break"
+        )
+        assert pub_st["issue_payload"]["upstream_reproducer_markdown"] != ""
