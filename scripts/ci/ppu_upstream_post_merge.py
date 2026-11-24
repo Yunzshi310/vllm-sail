@@ -137,6 +137,8 @@ _INFRA_EXIT_CODES = frozenset({124, 126, 127, 137})
 _INSTALL_INFRA_ERROR_RE = re.compile(
     r"(?i)(?:"
     r"could not install packages due to an oserror"
+    r"|\boserror\b|\bioerror\b|\bblockingioerror\b|\btimeouterror\b"
+    r"|\burllib\.error\b|\burlerror\b|\bhttperror\b"
     r"|\[errno\s+(?!2\b)\d+\]|\berrno\s+(?!2\b)\d+\b"
     r"|no space left on device|disk quota exceeded|input/output error|stale file handle"
     r"|cannot allocate memory|\bmemoryerror\b"
@@ -146,8 +148,8 @@ _INSTALL_INFRA_ERROR_RE = re.compile(
     r"|\[0 lines of output\]"
     r"|temporary failure in name resolution|name or service not known|nodename nor servname"
     r"|connectionerror|connectionreseterror|connectionrefusederror"
-    r"|readtimeouterror|connecttimeouterror|newconnectionerror|maxretryerror"
-    r"|sslerror|proxyerror|failed to establish a new connection"
+    r"|readtimeouterror|connecttimeouterror|newconnectionerror|maxretryerror|timed out"
+    r"|sslerror|proxyerror|failed to establish a new connection|urlopen error"
     r"|could not find a version that satisfies"
     r"|no module named ['\"]?pip['\"]?|command not found"
     r"|\bkilled\b|\bsigkill\b"
@@ -168,28 +170,66 @@ _PIP_WRAPPER_LINE_RE = re.compile(
     r"|exit code:|\[?\d+\s+lines? of output\]?|\[end of output\]"
     r"|see above for output\.?|vllm\s*$"
     r")"
-    r"|(?:(?:processing|obtaining|using cached|running command)\s+"
-    r"|(?:looking in indexes|created temporary directory|installing collected packages):"
+    r"|(?:(?:processing|obtaining|using cached|running command|failed to build)\s+"
+    r"|(?:looking in indexes|created temporary directory|installing collected packages|building wheels for collected packages):"
     r"|\[notice\]\s+)"
     r"|note:\s+this (?:error originates from a subprocess|is an issue with the package mentioned above)"
-    r"|error:\s+(?:metadata-generation-failed|subprocess-exited-with-error|failed building wheel|legacy-install-failure)"
+    r"|error:\s+(?:metadata-generation-failed|subprocess-exited-with-error|failed building wheel|legacy-install-failure|could not build wheels\b|failed to build\b|directory\b)"
     r"|hint:\s+"
     r")"
 )
-_UPSTREAM_BUILD_ANCHOR_RE = re.compile(
-    r"(?i)(?:"
-    r"\bsetup\.py\b|\bpyproject\.toml\b|\brust-toolchain\.toml\b|\bcargo\.toml\b|\bcmakelists\.txt\b"
-    r"|\brequirements[/\\][A-Za-z0-9_.-]+\b|\b(?:vllm|cmake|csrc)[/\\](?!\.?venv[/\\])[A-Za-z0-9_./-]+\b"
-    r"|\bvllm_rs\b|\bvllm_target_device\b|\bcmake error\b|\bcargo build\b|\brustc\b"
-    r")"
+_NON_UPSTREAM_PATH_PART_RE = re.compile(
+    r"(?i)(?:^|/)(?:"
+    r"site-packages|dist-packages|\.?venv|conda|envs"
+    r"|lib(?:64)?/(?:python|pypy)\d[\d.]*"
+    r"|usr/(?:local/)?lib|library/frameworks/python\.framework"
+    r"|pip|setuptools|pkg_resources|wheel|distutils"
+    r"|proc|sys|dev|etc"
+    r")(?:/|$)"
 )
-_UPSTREAM_BUILD_DIAGNOSTIC_RE = re.compile(
-    r"(?i)(?:"
-    r"\b(?:syntaxerror|indentationerror|importerror|modulenotfounderror|runtimeerror"
-    r"|valueerror|typeerror|attributeerror|keyerror|assertionerror|nameerror"
-    r"|filenotfounderror|tomldecodeerror|calledprocesserror|distutilserror|setuptoolserror)\b"
-    r"|\bcmake error\b|error\[e\d+\]|error:\s+(?:failed|could not) (?:to )?compile|fatal error:"
-    r")"
+_UPSTREAM_PY_FRAME_RE = re.compile(
+    r"(?:^|/)(?:setup\.py|(?:vllm|cmake|csrc)/[A-Za-z0-9_./-]+\.py)$"
+)
+_STDLIB_PATHLIB_FRAME_RE = re.compile(r"(?:^|/)pathlib(?:/[A-Za-z0-9_.-]+)?\.py$")
+_STDLIB_SUBPROCESS_FRAME_RE = re.compile(r"(?:^|/)subprocess\.py$")
+_TRACEBACK_HEADER_RE = re.compile(r"^(\s*)Traceback \(most recent call last\):\s*$")
+_TRACEBACK_FILE_RE = re.compile(r'^(\s*)File "([^"]+)", line \d+(?:, in .*)?\s*$')
+_PYTHON_EXC_LINE_RE = re.compile(
+    r"^(\s*)(?:[A-Za-z_][A-Za-z0-9_.]*\.)?([A-Z][A-Za-z0-9_]*(?:Error|Exception|Interrupt|Exit))(?::\s*(.*))?$"
+)
+_ALLOWED_BUILD_EXC_NAMES = frozenset(
+    {
+        "SyntaxError",
+        "IndentationError",
+        "ImportError",
+        "ModuleNotFoundError",
+        "RuntimeError",
+        "ValueError",
+        "TypeError",
+        "AttributeError",
+        "KeyError",
+        "AssertionError",
+        "NameError",
+        "NotImplementedError",
+        "FileNotFoundError",
+        "TOMLDecodeError",
+        "DistutilsError",
+        "SetuptoolsError",
+        "InvalidConfigError",
+    }
+)
+_REPO_FILENOENT_TARGET_RE = re.compile(
+    r"""['"]?/?(?:[A-Za-z0-9_.-]+/)*(?:requirements/[A-Za-z0-9_.-]+\.(?:txt|in)|setup\.py|pyproject\.toml|CMakeLists\.txt|README\.md|version\.txt|(?:vllm|cmake|csrc)/[A-Za-z0-9_./-]+)['"]?\s*$"""
+)
+_CMAKE_REPO_ERROR_RE = re.compile(
+    r"^\s*CMake Error at (?!/usr/|/opt/|/lib/)(?:[A-Za-z0-9_./-]+/)?(?:CMakeLists\.txt|(?:cmake|csrc|vllm)/[A-Za-z0-9_./-]+):\d+"
+)
+_NATIVE_COMPILE_REPO_ERROR_RE = re.compile(
+    r"^\s*(?!/usr/|/opt/|/lib/)(?:[A-Za-z0-9_./-]+/)?(?:csrc|vllm)/[A-Za-z0-9_./-]+\.(?:c|cc|cpp|cxx|h|hpp|cu):\d+(?::\d+)?:\s*(?:fatal )?error:"
+)
+_RUSTC_ERROR_CODE_RE = re.compile(r"(?m)^\s*error\[E\d+\]:")
+_RUSTC_REPO_SPAN_RE = re.compile(
+    r"(?m)^\s*-->\s+(?!/usr/|/opt/|/cargo/)(?:[A-Za-z0-9_./-]+/)?(?:src|csrc|vllm)/[A-Za-z0-9_./-]+\.rs:\d+:\d+"
 )
 VALID_PPU_SKIP_REASONS = (
     "none",
@@ -1750,6 +1790,141 @@ def _strip_pip_wrapper_lines(text: str) -> str:
     return "\n".join(kept)
 
 
+def _is_upstream_py_frame(raw_path: str) -> bool:
+    norm = raw_path.replace("\\", "/").strip()
+    if not norm or norm.startswith("<"):
+        return False
+    if _NON_UPSTREAM_PATH_PART_RE.search(norm) is not None:
+        return False
+    return _UPSTREAM_PY_FRAME_RE.search(norm) is not None
+
+
+def _is_valid_repo_filenoent(msg: str) -> bool:
+    norm = msg.replace("\\", "/").strip()
+    if _NON_UPSTREAM_PATH_PART_RE.search(norm) is not None:
+        return False
+    return _REPO_FILENOENT_TARGET_RE.search(norm) is not None
+
+
+def _has_native_repo_compile_error(payload: str, lines: list[str]) -> bool:
+    if any(
+        _CMAKE_REPO_ERROR_RE.match(ln) or _NATIVE_COMPILE_REPO_ERROR_RE.match(ln)
+        for ln in lines
+    ):
+        return True
+    return (
+        _RUSTC_ERROR_CODE_RE.search(payload) is not None
+        and _RUSTC_REPO_SPAN_RE.search(payload) is not None
+    )
+
+
+def _has_upstream_build_source_evidence(payload: str) -> bool:
+    """Require structural source-frame or native compiler attribution; never cross-match free text."""
+    lines = payload.splitlines()
+    if not lines:
+        return False
+
+    has_native_diag = _has_native_repo_compile_error(payload, lines)
+    tb_headers = [
+        (idx, len(m.group(1)))
+        for idx, ln in enumerate(lines)
+        if (m := _TRACEBACK_HEADER_RE.match(ln)) is not None
+    ]
+    consumed_lines: set[int] = set()
+
+    if tb_headers:
+        for pos, (start_idx, tb_indent) in enumerate(tb_headers):
+            next_tb = (
+                tb_headers[pos + 1][0] if pos + 1 < len(tb_headers) else len(lines)
+            )
+            consumed_lines.add(start_idx)
+            real_frames: list[str] = []
+            exc_match = None
+            for j in range(start_idx + 1, next_tb):
+                fm = _TRACEBACK_FILE_RE.match(lines[j])
+                if fm is not None:
+                    consumed_lines.add(j)
+                    fpath = fm.group(2)
+                    if not fpath.startswith("<"):
+                        real_frames.append(fpath)
+                    continue
+                em = _PYTHON_EXC_LINE_RE.match(lines[j])
+                if em is not None and len(em.group(1)) <= tb_indent:
+                    exc_match = em
+                    consumed_lines.add(j)
+                    break
+                consumed_lines.add(j)
+
+            if exc_match is None or not real_frames:
+                return False
+            exc_name = exc_match.group(2)
+            exc_msg = exc_match.group(3) or ""
+            last_frame = real_frames[-1].replace("\\", "/")
+            has_upstream_ancestor = any(_is_upstream_py_frame(f) for f in real_frames)
+
+            if _is_upstream_py_frame(last_frame):
+                if exc_name not in _ALLOWED_BUILD_EXC_NAMES:
+                    return False
+                if exc_name == "FileNotFoundError" and not _is_valid_repo_filenoent(
+                    exc_msg
+                ):
+                    return False
+            elif (
+                exc_name == "FileNotFoundError"
+                and has_upstream_ancestor
+                and _STDLIB_PATHLIB_FRAME_RE.search(last_frame) is not None
+                and _is_valid_repo_filenoent(exc_msg)
+            ):
+                pass
+            elif (
+                exc_name == "CalledProcessError"
+                and has_upstream_ancestor
+                and _STDLIB_SUBPROCESS_FRAME_RE.search(last_frame) is not None
+                and has_native_diag
+            ):
+                pass
+            else:
+                return False
+
+        for idx, ln in enumerate(lines):
+            if idx not in consumed_lines and _PYTHON_EXC_LINE_RE.match(ln):
+                return False
+        return True
+
+    file_matches = [
+        (idx, m)
+        for idx, ln in enumerate(lines)
+        if (m := _TRACEBACK_FILE_RE.match(ln)) is not None
+    ]
+    if file_matches:
+        if any(not _is_upstream_py_frame(m.group(2)) for _, m in file_matches):
+            return False
+        last_file_idx, last_fm = file_matches[-1]
+        file_indent = len(last_fm.group(1))
+        syntax_exc_idx = -1
+        for j in range(last_file_idx + 1, min(last_file_idx + 8, len(lines))):
+            em = _PYTHON_EXC_LINE_RE.match(lines[j])
+            if (
+                em is not None
+                and len(em.group(1)) <= file_indent
+                and em.group(2) in ("SyntaxError", "IndentationError")
+            ):
+                syntax_exc_idx = j
+                break
+        if syntax_exc_idx < 0:
+            return False
+        for idx, ln in enumerate(lines):
+            if (idx < file_matches[0][0] or idx > syntax_exc_idx) and (
+                _PYTHON_EXC_LINE_RE.match(ln) is not None
+            ):
+                return False
+        return True
+
+    if any(_PYTHON_EXC_LINE_RE.match(ln) for ln in lines):
+        return False
+    return has_native_diag
+
+
 def _classify_install_failure(
     returncode: int, stderr: str, stdout: str, *, mode: str
 ) -> tuple[str, str, bool]:
@@ -1759,11 +1934,7 @@ def _classify_install_failure(
     if mode != "cpu_empty_build":
         return "install", "infra_or_unknown", False
     payload = _strip_pip_wrapper_lines(f"{stderr}\n{stdout}")
-    if (
-        payload
-        and _UPSTREAM_BUILD_ANCHOR_RE.search(payload) is not None
-        and _UPSTREAM_BUILD_DIAGNOSTIC_RE.search(payload) is not None
-    ):
+    if payload and _has_upstream_build_source_evidence(payload):
         return "build_install", "upstream_build_source", False
     return "infra_error", "infra_or_unknown", True
 

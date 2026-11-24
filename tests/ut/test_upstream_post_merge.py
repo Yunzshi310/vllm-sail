@@ -3132,6 +3132,46 @@ def test_review_r1_p1_install_infra_and_unexecuted_stub_cannot_verify_or_classif
             "error: metadata-generation-failed",
         ),
         (1, "RuntimeError: runner worker pool exhausted"),
+        (
+            1,
+            "RuntimeError: runner worker pool exhausted\n"
+            "ERROR: Could not build wheels for vllm, which is required to install pyproject.toml-based projects",
+        ),
+        (
+            1,
+            "RuntimeError: runner crashed (env VLLM_TARGET_DEVICE=empty in setup.py)\n"
+            "ERROR: Could not build wheels for vllm, which is required to install pyproject.toml-based projects",
+        ),
+        (
+            1,
+            "Traceback (most recent call last):\n"
+            '  File "/tmp/vllm-bbbbbbbbbbbb/setup.py", line 20, in <module>\n'
+            "    t.start()\n"
+            '  File "/usr/lib/python3.11/threading.py", line 975, in start\n'
+            "    _start_new_thread()\n"
+            "RuntimeError: host thread pool exhausted",
+        ),
+        (
+            1,
+            "Traceback (most recent call last):\n"
+            '  File "/tmp/vllm-bbbbbbbbbbbb/setup.py", line 30, in run\n'
+            '    subprocess.check_call(["cmake", ".."])\n'
+            '  File "/usr/lib/python3.11/subprocess.py", line 1950, in _execute_child\n'
+            "    raise child_exception_type(errno_num, err_msg, err_filename)\n"
+            "FileNotFoundError: [Errno 2] No such file or directory: 'cmake'",
+        ),
+        (
+            1,
+            "Traceback (most recent call last):\n"
+            '  File "/usr/lib/python3.11/urllib/request.py", line 100, in urlopen\n'
+            '    raise ValueError("bad proxy config")\n'
+            "ValueError: bad proxy config\n\n"
+            "The above exception was the direct cause of the following exception:\n\n"
+            "Traceback (most recent call last):\n"
+            '  File "/tmp/vllm-bbbbbbbbbbbb/setup.py", line 50, in <module>\n'
+            '    raise RuntimeError("wheel fetch failed")\n'
+            "RuntimeError: wheel fetch failed",
+        ),
         (1, "ConnectionError: Temporary failure in name resolution"),
         (
             1,
@@ -3168,12 +3208,19 @@ def test_review_r1_p1_install_infra_and_unexecuted_stub_cannot_verify_or_classif
             == "sail_internal_patch_drift"
         )
 
-    # Normal controls 1, 2 & 3: cpu_empty_build where bad pip fails with genuine upstream
-    # build/packaging error (including real PEP 517 pyproject_hooks/_in_process traceback
-    # and FileNotFoundError [Errno 2] inside setup.py / pyproject.toml metadata prep) -> verified=True!
+    # Normal controls 1–4: cpu_empty_build where bad pip fails with genuine structurally
+    # attributed upstream build/packaging errors (setup.py RuntimeError, setup.py missing
+    # requirements/common.txt [Errno 2], PEP 517 _in_process.py + setup.py + pip wheel summary,
+    # and setup.py -> CMake Error at CMakeLists.txt) -> verified=True!
     for build_err_msg in (
+        "Traceback (most recent call last):\n"
+        '  File "/tmp/vllm-bbbbbbbbbbbb/setup.py", line 18, in <module>\n'
+        '    raise RuntimeError("VLLM_TARGET_DEVICE=empty unsupported in setup.py")\n'
         "RuntimeError: VLLM_TARGET_DEVICE=empty unsupported in setup.py",
         "Preparing metadata (pyproject.toml) ... error\n"
+        "Traceback (most recent call last):\n"
+        '  File "/tmp/vllm-bbbbbbbbbbbb/setup.py", line 42, in get_requirements\n'
+        '    with open("requirements/common.txt") as f:\n'
         "FileNotFoundError: [Errno 2] No such file or directory: 'requirements/common.txt'",
         "  error: subprocess-exited-with-error\n"
         "  × Preparing metadata (pyproject.toml) did not run successfully.\n"
@@ -3187,7 +3234,16 @@ def test_review_r1_p1_install_infra_and_unexecuted_stub_cannot_verify_or_classif
         "      RuntimeError: VLLM_TARGET_DEVICE=empty broken\n"
         "      [end of output]\n"
         "  note: This error originates from a subprocess, and is likely not a problem with pip.\n"
-        "error: metadata-generation-failed",
+        "error: metadata-generation-failed\n"
+        "ERROR: Could not build wheels for vllm, which is required to install pyproject.toml-based projects",
+        "CMake Error at CMakeLists.txt:42 (message):\n"
+        "  Unsupported target device empty\n"
+        "Traceback (most recent call last):\n"
+        '  File "/tmp/vllm-bbbbbbbbbbbb/setup.py", line 210, in build_extensions\n'
+        '    subprocess.check_call(["cmake", ".."])\n'
+        '  File "/usr/lib/python3.11/subprocess.py", line 413, in check_call\n'
+        "    raise CalledProcessError(retcode, cmd)\n"
+        "subprocess.CalledProcessError: Command '['cmake', '..']' returned non-zero exit status 1.",
     ):
         fake_real_build_fail, _ = _make_fake_run(
             bad_pip_rc=1,
@@ -3369,6 +3425,10 @@ def test_review_r1_p1_install_infra_and_unexecuted_stub_cannot_verify_or_classif
             '  File "/opt/py/lib/python3.13/site-packages/pip/_internal/operations/build/metadata.py", line 34\n'
             '  File "/opt/py/lib/python3.13/site-packages/pip/_vendor/pyproject_hooks/_impl.py", line 402\n'
             "pip._vendor.pyproject_hooks._impl.BackendUnavailable: Cannot import 'setuptools.build_meta'"
+        ),
+        (
+            "RuntimeError: runner worker pool exhausted\n"
+            "ERROR: Could not build wheels for vllm, which is required to install pyproject.toml-based projects"
         ),
     ]
     sail_sha = "c" * 40
