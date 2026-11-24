@@ -1,6 +1,6 @@
 {
   ".github/workflows/_ppu-build.yaml": {
-    "current": "6d9b48e51f7a93d4059975408b39f09495688f005535bc52137f7b06a74ddc57",
+    "current": "17a7d071fec0f935dff6a81cf76097aac09ccbe5bf5ab3bc51fe08a8d5b71ca4",
     "previous": "cce4c5efc3299d688dca53eb43c2ddbd244704130d47ac1959f081329da1292e"
   },
   "scripts/ci/build_ppu_wheels.sh": {

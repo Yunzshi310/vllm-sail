@@ -11,13 +11,17 @@ esac
 
 : "${PPU_CI_SOURCE_DIR:?PPU_CI_SOURCE_DIR is required}"
 : "${PPU_CI_SOURCE_SHA:?PPU_CI_SOURCE_SHA is required}"
-: "${PPU_CI_WHEELS_DIR:?PPU_CI_WHEELS_DIR is required}"
 : "${PPU_CI_ARTIFACT_DIR:?PPU_CI_ARTIFACT_DIR is required}"
 : "${PPU_CI_DEVICE_COUNT:?PPU_CI_DEVICE_COUNT is required}"
 : "${PPU_CI_REQUIRE_PR_ARTIFACT:?PPU_CI_REQUIRE_PR_ARTIFACT is required}"
 
+skip_wheel_install="${PPU_CI_SKIP_WHEEL_INSTALL:-false}"
+[[ "${skip_wheel_install}" =~ ^(true|false)$ ]] || {
+    echo "PPU_CI_SKIP_WHEEL_INSTALL must be true or false" >&2
+    exit 2
+}
+
 source_dir=$(realpath "${PPU_CI_SOURCE_DIR}")
-wheels_dir=$(realpath "${PPU_CI_WHEELS_DIR}")
 mkdir -p "${PPU_CI_ARTIFACT_DIR}"
 artifact_dir=$(realpath "${PPU_CI_ARTIFACT_DIR}")
 git -C "${source_dir}" rev-parse --is-inside-work-tree >/dev/null
@@ -25,12 +29,13 @@ git -C "${source_dir}" rev-parse --is-inside-work-tree >/dev/null
     echo "PPU CI source checkout does not match PPU_CI_SOURCE_SHA" >&2
     exit 2
 }
-[[ -d "${wheels_dir}" ]] || { echo "PPU CI wheel directory is missing" >&2; exit 2; }
 [[ "${PPU_CI_REQUIRE_PR_ARTIFACT}" =~ ^(true|false)$ ]] || {
     echo "PPU_CI_REQUIRE_PR_ARTIFACT must be true or false" >&2
     exit 2
 }
-verified_vllm_commit=$(tr -d '[:space:]' < "${source_dir}/.github/vllm-main-verified.commit")
+wheels_dir=""
+expected_vllm_commit=""
+expected_sail_commit=""
 candidate_vllm_commit="${PPU_CI_CANDIDATE_UPSTREAM_COMMIT:-}"
 if [[ -n "${candidate_vllm_commit}" ]]; then
     [[ "${candidate_vllm_commit}" =~ ^[0-9a-f]{40}$ ]] || {
@@ -42,14 +47,41 @@ if [[ -n "${candidate_vllm_commit}" ]]; then
         exit 2
     fi
 fi
-expected_vllm_commit="${PPU_CI_EXPECTED_VLLM_COMMIT:-${candidate_vllm_commit:-${verified_vllm_commit}}}"
-expected_sail_commit="${PPU_CI_WHEEL_SOURCE_SHA:-${PPU_CI_SOURCE_SHA}}"
-for commit in "${verified_vllm_commit}" "${expected_vllm_commit}" "${expected_sail_commit}"; do
-    [[ "${commit}" =~ ^[0-9a-f]{40}$ ]] || {
+if [[ "${skip_wheel_install}" == "true" ]]; then
+    [[ "${mode}" == "recipe-sanity" || "${mode}" == "model-accuracy" ]] || {
+        echo "PPU_CI_SKIP_WHEEL_INSTALL is only supported for recipe-sanity and model-accuracy" >&2
+        exit 2
+    }
+    [[ "${PPU_CI_REQUIRE_PR_ARTIFACT}" == "false" ]] || {
+        echo "PPU_CI_SKIP_WHEEL_INSTALL is not allowed when PPU_CI_REQUIRE_PR_ARTIFACT is true" >&2
+        exit 2
+    }
+    [[ -z "${PPU_CI_WHEELS_DIR:-}" ]] || {
+        echo "PPU_CI_WHEELS_DIR must be unset when PPU_CI_SKIP_WHEEL_INSTALL is true" >&2
+        exit 2
+    }
+    [[ -z "${candidate_vllm_commit}" && -z "${PPU_CI_EXPECTED_VLLM_COMMIT:-}" ]] || {
+        echo "PPU_CI_CANDIDATE_UPSTREAM_COMMIT and PPU_CI_EXPECTED_VLLM_COMMIT are not allowed when PPU_CI_SKIP_WHEEL_INSTALL is true" >&2
+        exit 2
+    }
+    [[ "${PPU_CI_SOURCE_SHA}" =~ ^[0-9a-f]{40}$ ]] || {
         echo "PPU CI expected commits must be immutable SHA-1 values" >&2
         exit 2
     }
-done
+else
+    : "${PPU_CI_WHEELS_DIR:?PPU_CI_WHEELS_DIR is required}"
+    wheels_dir=$(realpath "${PPU_CI_WHEELS_DIR}")
+    [[ -d "${wheels_dir}" ]] || { echo "PPU CI wheel directory is missing" >&2; exit 2; }
+    verified_vllm_commit=$(tr -d '[:space:]' < "${source_dir}/.github/vllm-main-verified.commit")
+    expected_vllm_commit="${PPU_CI_EXPECTED_VLLM_COMMIT:-${candidate_vllm_commit:-${verified_vllm_commit}}}"
+    expected_sail_commit="${PPU_CI_WHEEL_SOURCE_SHA:-${PPU_CI_SOURCE_SHA}}"
+    for commit in "${verified_vllm_commit}" "${expected_vllm_commit}" "${expected_sail_commit}"; do
+        [[ "${commit}" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "PPU CI expected commits must be immutable SHA-1 values" >&2
+            exit 2
+        }
+    done
+fi
 [[ "${PPU_CI_DEVICE_COUNT}" =~ ^[1-8]$ ]] || {
     echo "PPU_CI_DEVICE_COUNT must be between 1 and 8" >&2
     exit 2
@@ -92,8 +124,24 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-image_id=$(bash "${script_dir}/ppu_runtime_image.sh" 9>&-)
+script_dir_real=$(realpath "${script_dir}")
+container_ci_dir="/source/scripts/ci"
+if [[ "${script_dir_real}" != "${source_dir}/scripts/ci" ]]; then
+    container_ci_dir="/trusted-ci"
+fi
+digest_file="${artifact_dir}/runtime-image-digest.txt"
+image_id=$(PPU_CI_RUNTIME_DIGEST_OUT="${digest_file}" bash "${script_dir}/ppu_runtime_image.sh" 9>&-)
 printf '%s\n' "${image_id}" >"${artifact_dir}/runtime-image-id.txt"
+runtime_image_digest=""
+if [[ -f "${digest_file}" ]]; then
+    runtime_image_digest=$(tr -d '[:space:]' < "${digest_file}")
+fi
+if [[ "${skip_wheel_install}" == "true" ]]; then
+    [[ "${runtime_image_digest}" =~ ^@sha256:[0-9a-f]{64}$ ]] || {
+        echo "Prebuilt image mode requires a verified runtime image digest" >&2
+        exit 2
+    }
+fi
 
 container="${prefix}"
 device_args=(
@@ -112,20 +160,33 @@ create=(
     docker create --name "${container}" --runtime=runc
     --ipc=host --network=host
     --mount "type=bind,source=${source_dir},target=/source,readonly"
-    --mount "type=bind,source=${wheels_dir},target=/wheels,readonly"
     --mount "type=bind,source=${artifact_dir},target=/artifacts"
     --env NVIDIA_VISIBLE_DEVICES=void
     --env CUDA_VISIBLE_DEVICES="${visible_csv}"
     --env PYTHONPYCACHEPREFIX=/tmp/pycache
-    --env WHEELS_DIR=/wheels
     --env REQUIRE_PR_ARTIFACT="${PPU_CI_REQUIRE_PR_ARTIFACT}"
-    --env EXPECTED_VLLM_COMMIT="${expected_vllm_commit}"
-    --env EXPECTED_SAIL_COMMIT="${expected_sail_commit}"
+    --env PPU_CI_SKIP_WHEEL_INSTALL="${skip_wheel_install}"
+    --env PPU_CI_RUNTIME_IMAGE_ID="${image_id}"
+    --env PPU_CI_RUNTIME_IMAGE_DIGEST="${runtime_image_digest}"
 )
-create+=("${device_args[@]}")
-if [[ -n "${candidate_vllm_commit}" ]]; then
-    create+=(--env VLLM_SAIL_CANDIDATE_UPSTREAM_COMMIT="${candidate_vllm_commit}")
+if [[ "${container_ci_dir}" == "/trusted-ci" ]]; then
+    create+=(
+        --mount "type=bind,source=${script_dir_real},target=/trusted-ci,readonly"
+        --env PPU_CI_SOURCE_ROOT=/source
+    )
 fi
+if [[ "${skip_wheel_install}" == "false" ]]; then
+    create+=(
+        --mount "type=bind,source=${wheels_dir},target=/wheels,readonly"
+        --env WHEELS_DIR=/wheels
+        --env EXPECTED_VLLM_COMMIT="${expected_vllm_commit}"
+        --env EXPECTED_SAIL_COMMIT="${expected_sail_commit}"
+    )
+    if [[ -n "${candidate_vllm_commit}" ]]; then
+        create+=(--env VLLM_SAIL_CANDIDATE_UPSTREAM_COMMIT="${candidate_vllm_commit}")
+    fi
+fi
+create+=("${device_args[@]}")
 
 # Resolve a catalog model id to the concrete snapshot directory of the offline
 # HF cache and echo that absolute path. The cache is a view tree: snapshots/
@@ -314,6 +375,7 @@ case "${mode}" in
             --env RESULTS_DIR=/artifacts
             --env UPDATE_GOLDEN="${UPDATE_GOLDEN:-0}"
             --env THRESHOLD="${THRESHOLD:-0.9}"
+            --env RECORD_LEGACY_ACCURACY="${PPU_CI_RECORD_LEGACY_ACCURACY:-false}"
             --env VLLM_PORT="${VLLM_PORT:-9985}"
             --env VLLM_USE_RUST_FRONTEND=0
             --env VLLM_USE_RUST_BENCH=0
@@ -321,7 +383,7 @@ case "${mode}" in
         mount_snapshot_if_external "${model_snapshot}"
         create+=(
             --entrypoint bash "${image_id}"
-            /source/scripts/ci/ppu_e2e_accuracy.sh
+            "${container_ci_dir}/ppu_e2e_accuracy.sh"
         )
         ;;
     kernel-perf)
@@ -390,7 +452,7 @@ case "${mode}" in
         mount_snapshot_if_external "${model_snapshot}"
         create+=(
             --entrypoint bash "${image_id}"
-            /source/scripts/ci/ppu_e2e_recipe_sanity.sh
+            "${container_ci_dir}/ppu_e2e_recipe_sanity.sh"
         )
         ;;
 esac
