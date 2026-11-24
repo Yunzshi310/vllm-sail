@@ -517,6 +517,11 @@ def test_gate4_bisection_control_first_and_dual_track_triage(tmp_path):
         last_good_exit_code=0,
         first_failing_exit_code=1,
         verified=True,
+        last_good_phase="stub_check",
+        first_failing_phase="stub_check",
+        last_good_check_executed=True,
+        first_failing_check_executed=True,
+        infra_error=False,
     )
     pub_plugin_dir = tmp_path / "pub-plugin"
     plugin_pub = post_merge.publish_sanitized_channels(
@@ -2257,10 +2262,18 @@ def test_non_ppu_repro_hard_gate_real_stub_plugins_all_five_kinds(
     assert rc == 0
     repro_data = json.loads(repro_out.read_text(encoding="utf-8"))
     post_merge.assert_zero_sensitive_leaks(repro_out.read_text(encoding="utf-8"))
+    expected_phase = (
+        "build_import" if expected_mode == "cpu_empty_build" else "stub_check"
+    )
     assert repro_data == {
+        "first_failing_check_executed": True,
         "first_failing_exit_code": 1,
+        "first_failing_phase": expected_phase,
         "first_failing_sha": shas[expected_kind],
+        "infra_error": False,
+        "last_good_check_executed": True,
         "last_good_exit_code": 0,
+        "last_good_phase": expected_phase,
         "last_good_sha": shas["good"],
         "mode": expected_mode,
         "repro_kind": expected_kind,
@@ -2430,6 +2443,11 @@ def test_non_ppu_repro_hard_gate_negative_controls_ppu_only_and_tampered_evidenc
         last_good_exit_code=0,
         first_failing_exit_code=1,
         verified=True,
+        last_good_phase="stub_check",
+        first_failing_phase="stub_check",
+        last_good_check_executed=True,
+        first_failing_check_executed=True,
+        infra_error=False,
     )
     for internal_stage in sorted(post_merge.SAIL_INTERNAL_ONLY_STAGES):
         triage = post_merge.classify_failure(
@@ -2457,6 +2475,11 @@ def test_non_ppu_repro_hard_gate_negative_controls_ppu_only_and_tampered_evidenc
             1,
             1,
             True,
+            "stub_check",
+            "stub_check",
+            True,
+            True,
+            False,
         ),
         post_merge.NonPpuReproEvidence(
             "stub_plugin_cpu",
@@ -2466,6 +2489,11 @@ def test_non_ppu_repro_hard_gate_negative_controls_ppu_only_and_tampered_evidenc
             0,
             0,
             True,
+            "stub_check",
+            "stub_check",
+            True,
+            True,
+            False,
         ),
         post_merge.NonPpuReproEvidence(
             "stub_plugin_cpu",
@@ -2475,6 +2503,11 @@ def test_non_ppu_repro_hard_gate_negative_controls_ppu_only_and_tampered_evidenc
             False,  # type: ignore[arg-type]
             True,  # type: ignore[arg-type]
             True,
+            "stub_check",
+            "stub_check",
+            True,
+            True,
+            False,
         ),
         post_merge.NonPpuReproEvidence(
             "stub_plugin_cpu",
@@ -2484,6 +2517,11 @@ def test_non_ppu_repro_hard_gate_negative_controls_ppu_only_and_tampered_evidenc
             0,
             1,
             True,
+            "stub_check",
+            "stub_check",
+            True,
+            True,
+            False,
         ),
         post_merge.NonPpuReproEvidence(
             "stub_plugin_cpu",
@@ -2493,6 +2531,11 @@ def test_non_ppu_repro_hard_gate_negative_controls_ppu_only_and_tampered_evidenc
             0,
             1,
             True,
+            "stub_check",
+            "stub_check",
+            True,
+            True,
+            False,
         ),  # mismatched first_failing_sha
         post_merge.NonPpuReproEvidence(
             "cpu_empty_build",
@@ -2502,6 +2545,11 @@ def test_non_ppu_repro_hard_gate_negative_controls_ppu_only_and_tampered_evidenc
             0,
             1,
             True,
+            "build_import",
+            "build_install",
+            True,
+            False,
+            False,
         ),  # wrong mode for plugin_registration
         post_merge.NonPpuReproEvidence(
             "stub_plugin_cpu",
@@ -2510,6 +2558,11 @@ def test_non_ppu_repro_hard_gate_negative_controls_ppu_only_and_tampered_evidenc
             shas["load_general_plugins"],
             0,
             1,
+            False,
+            "stub_check",
+            "stub_check",
+            True,
+            True,
             False,
         ),
     ]
@@ -2542,6 +2595,11 @@ def test_non_ppu_repro_hard_gate_negative_controls_ppu_only_and_tampered_evidenc
                 "first_failing_sha": shas["load_general_plugins"],
                 "last_good_exit_code": 0,
                 "first_failing_exit_code": 0,
+                "last_good_phase": "stub_check",
+                "first_failing_phase": "stub_check",
+                "last_good_check_executed": True,
+                "first_failing_check_executed": True,
+                "infra_error": False,
                 "verified": True,
             }
         ),
@@ -2725,6 +2783,11 @@ def test_upstream_reproducer_author_resolution_fenced_template_and_zero_bare_pin
         last_good_exit_code=0,
         first_failing_exit_code=1,
         verified=True,
+        last_good_phase="stub_check",
+        first_failing_phase="stub_check",
+        last_good_check_executed=True,
+        first_failing_check_executed=True,
+        infra_error=False,
     )
     with_author = post_merge.render_upstream_reproducer(
         first_failing_sha=bad_sha,
@@ -2901,3 +2964,257 @@ def test_verify_non_ppu_reproducer_builtin_runner_workflow_and_fingerprint_compa
         assert entry["current"] == actual_sha, (
             f"ppu_native_fingerprint_compat.json stale for {rel_path}"
         )
+
+
+def test_review_r1_p1_install_infra_and_unexecuted_stub_cannot_verify_or_classify_upstream(
+    tmp_path, monkeypatch
+):
+    """Exact Round-1 P1 counterexamples + normal controls across producer -> evidence -> consumer."""
+    good_sha = _sha(940)
+    bad_sha = _sha(941)
+    sail_sha = _sha(942)
+
+    def _make_fake_run(
+        *,
+        bad_pip_rc: int = 0,
+        bad_pip_stderr: str = "",
+        bad_check_rc: int = 1,
+        bad_check_stderr: str = "",
+    ):
+        counters = {"bad_stub_executions": 0}
+
+        def _fake_run(cmd, **kwargs):
+            cmd_list = [str(c) for c in cmd]
+            env = kwargs.get("env") or {}
+            sha = env.get("CANDIDATE_SHA")
+            if (
+                cmd_list[:4] == ["git", "-C", str(tmp_path), "worktree"]
+                and cmd_list[4] == "add"
+            ):
+                wt_path = Path(cmd_list[7])
+                wt_path.mkdir(parents=True, exist_ok=True)
+                return subprocess.CompletedProcess(cmd_list, 0, "", "")
+            if (
+                cmd_list[:4] == ["git", "-C", str(tmp_path), "worktree"]
+                and cmd_list[4] == "remove"
+            ):
+                return subprocess.CompletedProcess(cmd_list, 0, "", "")
+            if "pip" in cmd_list and "install" in cmd_list:
+                if sha == bad_sha:
+                    return subprocess.CompletedProcess(
+                        cmd_list, bad_pip_rc, "", bad_pip_stderr
+                    )
+                return subprocess.CompletedProcess(cmd_list, 0, "", "")
+            if "repro_check.py" in " ".join(cmd_list):
+                if sha == bad_sha:
+                    counters["bad_stub_executions"] += 1
+                    return subprocess.CompletedProcess(
+                        cmd_list, bad_check_rc, "", bad_check_stderr
+                    )
+                return subprocess.CompletedProcess(cmd_list, 0, "", "")
+            return subprocess.CompletedProcess(cmd_list, 0, "", "")
+
+        return _fake_run, counters
+
+    # Counterexample 1 (exact Round-1 P1): stub_plugin_cpu where bad pip hits ENOSPC;
+    # stub never executes -> MUST be unverified, infra_error=True, sail_internal_patch_drift, no upstream draft!
+    fake_enospc, cnt1 = _make_fake_run(
+        bad_pip_rc=1,
+        bad_pip_stderr="ERROR: Could not install packages due to an OSError: [Errno 28] No space left on device",
+    )
+    monkeypatch.setattr(post_merge.subprocess, "run", fake_enospc)
+    ev_enospc = post_merge.verify_non_ppu_reproducer(
+        vllm_repo=tmp_path,
+        last_good_sha=good_sha,
+        first_failing_sha=bad_sha,
+        stage="plugin_registration",
+        target_signature="vllm.plugins.load_general_plugins",
+    )
+    assert cnt1["bad_stub_executions"] == 0
+    assert ev_enospc.verified is False
+    assert ev_enospc.infra_error is True
+    assert ev_enospc.first_failing_check_executed is False
+    assert ev_enospc.first_failing_phase == "infra_error"
+    pub_enospc = post_merge.publish_sanitized_channels(
+        gear="probe",
+        status="fail",
+        sail_sha=sail_sha,
+        upstream_sha=bad_sha,
+        verified_pin=VERIFIED_PIN,
+        cpu_status="fail",
+        ppu_status="skipped",
+        ppu_skip_reason="cpu_fast_check_failed",
+        first_failing_sha=bad_sha,
+        last_good_sha=good_sha,
+        outcome=post_merge.ProbeOutcome(
+            status="fail",
+            stage="plugin_registration",
+            target_signature="vllm.plugins.load_general_plugins",
+            is_public_plugin_interface=True,
+            non_ppu_repro=ev_enospc,
+        ),
+        first_failing_author="kevin-luu",
+        public_dir=tmp_path / "pub-p1-enospc",
+    )
+    assert (
+        pub_enospc["public_summary"]["triage"]["classification"]
+        == "sail_internal_patch_drift"
+    )
+    assert pub_enospc["issue_payload"]["upstream_reproducer_markdown"] == ""
+    assert pub_enospc["issue_payload"]["should_file_sail_issue"] is True
+
+    # Counterexample 2: stub_plugin_cpu where bad pip fails with a non-infra build error
+    # (stub check STILL never executed) -> MUST remain verified=False!
+    fake_bad_pip, cnt2 = _make_fake_run(
+        bad_pip_rc=1,
+        bad_pip_stderr="SyntaxError: invalid syntax in setup.py",
+    )
+    monkeypatch.setattr(post_merge.subprocess, "run", fake_bad_pip)
+    ev_no_stub = post_merge.verify_non_ppu_reproducer(
+        vllm_repo=tmp_path,
+        last_good_sha=good_sha,
+        first_failing_sha=bad_sha,
+        stage="plugin_registration",
+        target_signature="CustomOp.register_oot",
+    )
+    assert cnt2["bad_stub_executions"] == 0
+    assert ev_no_stub.verified is False
+    assert ev_no_stub.first_failing_phase == "install"
+    assert ev_no_stub.first_failing_check_executed is False
+
+    # Counterexample 3: cpu_empty_build where bad pip fails with ENOSPC / network / SIGKILL -> infra_error, verified=False!
+    for err_rc, err_msg in (
+        (1, "OSError: [Errno 28] No space left on device"),
+        (1, "ConnectionError: Temporary failure in name resolution"),
+        (137, "Killed"),
+    ):
+        fake_build_infra, _ = _make_fake_run(bad_pip_rc=err_rc, bad_pip_stderr=err_msg)
+        monkeypatch.setattr(post_merge.subprocess, "run", fake_build_infra)
+        ev_build_infra = post_merge.verify_non_ppu_reproducer(
+            vllm_repo=tmp_path,
+            last_good_sha=good_sha,
+            first_failing_sha=bad_sha,
+            stage="wheel_build",
+            target_signature="VLLM_TARGET_DEVICE=empty",
+        )
+        assert ev_build_infra.verified is False
+        assert ev_build_infra.infra_error is True
+        assert ev_build_infra.first_failing_phase == "infra_error"
+
+    # Normal control 1: cpu_empty_build where bad pip fails with genuine build error (non-infra) -> verified=True!
+    fake_real_build_fail, _ = _make_fake_run(
+        bad_pip_rc=1,
+        bad_pip_stderr="RuntimeError: VLLM_TARGET_DEVICE=empty unsupported in setup.py",
+    )
+    monkeypatch.setattr(post_merge.subprocess, "run", fake_real_build_fail)
+    ev_real_build = post_merge.verify_non_ppu_reproducer(
+        vllm_repo=tmp_path,
+        last_good_sha=good_sha,
+        first_failing_sha=bad_sha,
+        stage="wheel_build",
+        target_signature="VLLM_TARGET_DEVICE=empty",
+    )
+    assert ev_real_build.verified is True
+    assert ev_real_build.infra_error is False
+    assert ev_real_build.last_good_phase == "build_import"
+    assert ev_real_build.last_good_check_executed is True
+    assert ev_real_build.first_failing_phase == "build_install"
+    assert (
+        post_merge.classify_failure(
+            post_merge.ProbeOutcome(
+                status="fail",
+                stage="wheel_build",
+                target_signature="VLLM_TARGET_DEVICE=empty",
+                is_public_plugin_interface=True,
+                non_ppu_repro=ev_real_build,
+            ),
+            last_good_sha=good_sha,
+            first_failing_sha=bad_sha,
+            require_shas=True,
+        )["classification"]
+        == "plugin_interface_break"
+    )
+
+    # Counterexample 4: forged serialized JSON claiming verified=True on stub_plugin_cpu
+    # while first_failing_check_executed=False / first_failing_phase="install" -> fails closed!
+    forged_payloads = [
+        {
+            "mode": "stub_plugin_cpu",
+            "repro_kind": "load_general_plugins",
+            "last_good_sha": good_sha,
+            "first_failing_sha": bad_sha,
+            "last_good_exit_code": 0,
+            "first_failing_exit_code": 1,
+            "last_good_phase": "stub_check",
+            "first_failing_phase": "install",
+            "last_good_check_executed": True,
+            "first_failing_check_executed": False,
+            "infra_error": False,
+            "verified": True,
+        },
+        {
+            "mode": "cpu_empty_build",
+            "repro_kind": "cpu_empty_build",
+            "last_good_sha": good_sha,
+            "first_failing_sha": bad_sha,
+            "last_good_exit_code": 0,
+            "first_failing_exit_code": 1,
+            "last_good_phase": "build_import",
+            "first_failing_phase": "infra_error",
+            "last_good_check_executed": True,
+            "first_failing_check_executed": False,
+            "infra_error": True,
+            "verified": True,
+        },
+        # Legacy JSON missing execution phase / check_executed fields must also fail closed!
+        {
+            "mode": "stub_plugin_cpu",
+            "repro_kind": "load_general_plugins",
+            "last_good_sha": good_sha,
+            "first_failing_sha": bad_sha,
+            "last_good_exit_code": 0,
+            "first_failing_exit_code": 1,
+            "verified": True,
+        },
+    ]
+    for idx, payload in enumerate(forged_payloads):
+        parsed = post_merge.parse_non_ppu_repro_evidence(payload)
+        assert parsed is None or parsed.verified is False, f"forged case {idx} leaked"
+        triage = post_merge.classify_failure(
+            post_merge.ProbeOutcome(
+                status="fail",
+                stage="plugin_registration"
+                if payload["mode"] == "stub_plugin_cpu"
+                else "wheel_build",
+                target_signature="vllm.plugins.load_general_plugins"
+                if payload["mode"] == "stub_plugin_cpu"
+                else "VLLM_TARGET_DEVICE=empty",
+                is_public_plugin_interface=True,
+                non_ppu_repro=parsed,
+            ),
+            last_good_sha=good_sha,
+            first_failing_sha=bad_sha,
+            require_shas=True,
+        )
+        assert triage["classification"] == "sail_internal_patch_drift", (
+            f"forged case {idx} classified upstream"
+        )
+
+    # Counterexample 5: real subprocess `probe_cmd` in stub_plugin_cpu mode that fails
+    # before invoking `$STUB_CHECK_SCRIPT` -> mechanical marker proves check did NOT execute!
+    monkeypatch.undo()
+    ev_probe_no_exec = post_merge.verify_non_ppu_reproducer(
+        vllm_repo=tmp_path,
+        last_good_sha=good_sha,
+        first_failing_sha=bad_sha,
+        stage="plugin_registration",
+        target_signature="vllm.plugins.load_general_plugins",
+        probe_cmd=(
+            f'if [ "$CANDIDATE_SHA" = "{good_sha}" ]; then '
+            "python3 -c \"import pathlib, os; pathlib.Path(os.environ['STUB_CHECK_SCRIPT']).exists()\" && exit 0; "
+            "else echo 'pip failed before stub' >&2; exit 1; fi"
+        ),
+    )
+    assert ev_probe_no_exec.verified is False
+    assert ev_probe_no_exec.last_good_check_executed is False
+    assert ev_probe_no_exec.first_failing_check_executed is False

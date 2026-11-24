@@ -117,6 +117,32 @@ STUB_PLUGIN_REPRO_KINDS = frozenset(
         "load_general_plugins",
     }
 )
+VALID_REPRO_PHASES = (
+    "none",
+    "setup",
+    "install",
+    "build_install",
+    "build_import",
+    "stub_check",
+    "infra_error",
+)
+_INFRA_EXIT_CODES = frozenset({124, 126, 127, 137})
+_INSTALL_INFRA_ERROR_RE = re.compile(
+    r"(?i)(?:"
+    r"no space left on device|\berrno\s+28\b"
+    r"|cannot allocate memory|\berrno\s+12\b|\bmemoryerror\b"
+    r"|read-only file system|\berrno\s+30\b"
+    r"|too many open files|\berrno\s+24\b"
+    r"|permissionerror|permission denied|\berrno\s+13\b"
+    r"|temporary failure in name resolution|name or service not known|nodename nor servname"
+    r"|connectionerror|connectionreseterror|connectionrefusederror"
+    r"|readtimeouterror|connecttimeouterror|newconnectionerror|maxretryerror"
+    r"|sslerror|proxyerror|failed to establish a new connection"
+    r"|could not find a version that satisfies"
+    r"|no module named ['\"]?pip['\"]?|command not found"
+    r"|\bkilled\b|\bsigkill\b"
+    r")"
+)
 VALID_PPU_SKIP_REASONS = (
     "none",
     "already_tested",
@@ -255,6 +281,11 @@ class NonPpuReproEvidence:
     last_good_exit_code: int
     first_failing_exit_code: int
     verified: bool = False
+    last_good_phase: str = "none"
+    first_failing_phase: str = "none"
+    last_good_check_executed: bool = False
+    first_failing_check_executed: bool = False
+    infra_error: bool = False
 
     def to_public_dict(self) -> dict[str, Any]:
         return {
@@ -264,6 +295,11 @@ class NonPpuReproEvidence:
             "first_failing_sha": self.first_failing_sha,
             "last_good_exit_code": self.last_good_exit_code,
             "first_failing_exit_code": self.first_failing_exit_code,
+            "last_good_phase": self.last_good_phase,
+            "first_failing_phase": self.first_failing_phase,
+            "last_good_check_executed": bool(self.last_good_check_executed),
+            "first_failing_check_executed": bool(self.first_failing_check_executed),
+            "infra_error": bool(self.infra_error),
             "verified": bool(self.verified),
         }
 
@@ -1643,6 +1679,16 @@ def materialize_stub_plugin(repro_kind: str, workdir: Path) -> tuple[Path, Path]
     return stub_site, check_script
 
 
+def _is_infra_process_failure(
+    returncode: int, stderr: str = "", stdout: str = ""
+) -> bool:
+    """Return True when a subprocess exit indicates runner/host/network infra failure."""
+    if returncode < 0 or returncode in _INFRA_EXIT_CODES:
+        return True
+    combined = f"{stderr}\n{stdout}"
+    return _INSTALL_INFRA_ERROR_RE.search(combined) is not None
+
+
 def is_valid_non_ppu_repro(
     evidence: NonPpuReproEvidence | None,
     *,
@@ -1656,17 +1702,53 @@ def is_valid_non_ppu_repro(
         return False
     if evidence.verified is not True:
         return False
+    if evidence.infra_error is not False:
+        return False
     if evidence.mode not in VALID_NON_PPU_REPRO_MODES:
         return False
     if evidence.repro_kind not in VALID_REPRO_KINDS:
         return False
-    if evidence.mode == "cpu_empty_build" and evidence.repro_kind != "cpu_empty_build":
+    if evidence.last_good_phase not in VALID_REPRO_PHASES:
         return False
-    if (
-        evidence.mode == "stub_plugin_cpu"
-        and evidence.repro_kind not in STUB_PLUGIN_REPRO_KINDS
-    ):
+    if evidence.first_failing_phase not in VALID_REPRO_PHASES:
         return False
+    if type(evidence.last_good_check_executed) is not bool:
+        return False
+    if type(evidence.first_failing_check_executed) is not bool:
+        return False
+
+    if evidence.mode == "cpu_empty_build":
+        if evidence.repro_kind != "cpu_empty_build":
+            return False
+        if (
+            evidence.last_good_phase != "build_import"
+            or evidence.last_good_check_executed is not True
+        ):
+            return False
+        if evidence.first_failing_phase == "build_import":
+            if evidence.first_failing_check_executed is not True:
+                return False
+        elif evidence.first_failing_phase == "build_install":
+            if evidence.first_failing_check_executed is not False:
+                return False
+        else:
+            return False
+    elif evidence.mode == "stub_plugin_cpu":
+        if evidence.repro_kind not in STUB_PLUGIN_REPRO_KINDS:
+            return False
+        if (
+            evidence.last_good_phase != "stub_check"
+            or evidence.last_good_check_executed is not True
+        ):
+            return False
+        if (
+            evidence.first_failing_phase != "stub_check"
+            or evidence.first_failing_check_executed is not True
+        ):
+            return False
+    else:
+        return False
+
     if not isinstance(evidence.last_good_sha, str) or not SHA1_RE.fullmatch(
         evidence.last_good_sha
     ):
@@ -1681,8 +1763,10 @@ def is_valid_non_ppu_repro(
         evidence.last_good_exit_code != 0
     ):
         return False
-    if type(evidence.first_failing_exit_code) is not int or (
-        evidence.first_failing_exit_code == 0
+    if (
+        type(evidence.first_failing_exit_code) is not int
+        or evidence.first_failing_exit_code <= 0
+        or evidence.first_failing_exit_code in _INFRA_EXIT_CODES
     ):
         return False
 
@@ -1722,14 +1806,26 @@ def parse_non_ppu_repro_evidence(data: Any) -> NonPpuReproEvidence | None:
     first_bad = data.get("first_failing_sha")
     good_rc = data.get("last_good_exit_code")
     bad_rc = data.get("first_failing_exit_code")
+    good_phase = data.get("last_good_phase")
+    bad_phase = data.get("first_failing_phase")
+    good_exec = data.get("last_good_check_executed")
+    bad_exec = data.get("first_failing_check_executed")
+    infra_err = data.get("infra_error")
     raw_verified = data.get("verified")
     if (
         not isinstance(mode, str)
         or not isinstance(repro_kind, str)
         or not isinstance(last_good, str)
         or not isinstance(first_bad, str)
+        or not isinstance(good_phase, str)
+        or not isinstance(bad_phase, str)
+        or good_phase not in VALID_REPRO_PHASES
+        or bad_phase not in VALID_REPRO_PHASES
         or type(good_rc) is not int
         or type(bad_rc) is not int
+        or type(good_exec) is not bool
+        or type(bad_exec) is not bool
+        or type(infra_err) is not bool
         or type(raw_verified) is not bool
     ):
         return None
@@ -1741,6 +1837,11 @@ def parse_non_ppu_repro_evidence(data: Any) -> NonPpuReproEvidence | None:
         last_good_exit_code=good_rc,
         first_failing_exit_code=bad_rc,
         verified=raw_verified,
+        last_good_phase=good_phase,
+        first_failing_phase=bad_phase,
+        last_good_check_executed=good_exec,
+        first_failing_check_executed=bad_exec,
+        infra_error=infra_err,
     )
     return NonPpuReproEvidence(
         mode=candidate.mode,
@@ -1750,6 +1851,11 @@ def parse_non_ppu_repro_evidence(data: Any) -> NonPpuReproEvidence | None:
         last_good_exit_code=candidate.last_good_exit_code,
         first_failing_exit_code=candidate.first_failing_exit_code,
         verified=is_valid_non_ppu_repro(candidate),
+        last_good_phase=candidate.last_good_phase,
+        first_failing_phase=candidate.first_failing_phase,
+        last_good_check_executed=candidate.last_good_check_executed,
+        first_failing_check_executed=candidate.first_failing_check_executed,
+        infra_error=candidate.infra_error,
     )
 
 
@@ -1782,11 +1888,17 @@ def verify_non_ppu_reproducer(
             last_good_exit_code=-1,
             first_failing_exit_code=-1,
             verified=False,
+            last_good_phase="none",
+            first_failing_phase="none",
+            last_good_check_executed=False,
+            first_failing_check_executed=False,
+            infra_error=False,
         )
 
     def _run_one(
         sha: str, workdir: Path, stub_site: Path, check_script: Path
-    ) -> tuple[int, bool]:
+    ) -> tuple[int, str, bool, bool]:
+        """Return ``(exit_code, phase, check_executed, is_infra_error)``."""
         base_env = {
             k: v
             for k, v in os.environ.items()
@@ -1804,9 +1916,18 @@ def verify_non_ppu_reproducer(
         base_env["VLLM_REPO"] = str(vllm_repo)
         base_env["REPRO_KIND"] = kind
         base_env["STUB_SITE_DIR"] = str(stub_site)
-        base_env["STUB_CHECK_SCRIPT"] = str(check_script)
 
         if probe_cmd.strip():
+            marker_path = workdir / f"check-exec-{sha[:12]}.marker"
+            marker_path.unlink(missing_ok=True)
+            runner_script = workdir / f"run-check-{sha[:12]}.py"
+            runner_script.write_text(
+                "import pathlib, runpy\n"
+                f"pathlib.Path({str(marker_path)!r}).write_text('executed\\n', encoding='utf-8')\n"
+                f"runpy.run_path({str(check_script)!r}, run_name='__main__')\n",
+                encoding="utf-8",
+            )
+            base_env["STUB_CHECK_SCRIPT"] = str(runner_script)
             try:
                 proc = subprocess.run(
                     ["bash", "-c", probe_cmd],
@@ -1815,10 +1936,24 @@ def verify_non_ppu_reproducer(
                     text=True,
                     timeout=timeout_sec,
                 )
-                return proc.returncode, False
             except subprocess.TimeoutExpired:
-                return 124, True
+                return 124, "infra_error", marker_path.is_file(), True
+            executed = marker_path.is_file()
+            if proc.returncode != 0 and _is_infra_process_failure(
+                proc.returncode, proc.stderr, proc.stdout
+            ):
+                return proc.returncode, "infra_error", executed, True
+            if mode == "stub_plugin_cpu":
+                if executed:
+                    return proc.returncode, "stub_check", True, False
+                return proc.returncode, "install", False, False
+            if executed:
+                return proc.returncode, "build_import", True, False
+            if proc.returncode != 0:
+                return proc.returncode, "build_install", False, False
+            return 0, "install", False, False
 
+        base_env["STUB_CHECK_SCRIPT"] = str(check_script)
         wt_dir = workdir / f"vllm-{sha[:12]}"
         site_dir = workdir / f"site-{sha[:12]}"
         site_dir.mkdir(parents=True, exist_ok=True)
@@ -1841,12 +1976,12 @@ def verify_non_ppu_reproducer(
                 timeout=120,
             )
             if add_proc.returncode != 0:
-                return add_proc.returncode, True
+                return add_proc.returncode, "setup", False, True
             wt_added = True
 
             use_torch = wt_dir / "tools" / "use_existing_torch.py"
             if use_torch.is_file():
-                subprocess.run(
+                torch_proc = subprocess.run(
                     [python_exe, str(use_torch)],
                     cwd=str(wt_dir),
                     env=base_env,
@@ -1854,6 +1989,16 @@ def verify_non_ppu_reproducer(
                     text=True,
                     timeout=120,
                 )
+                if torch_proc.returncode != 0:
+                    is_infra = _is_infra_process_failure(
+                        torch_proc.returncode, torch_proc.stderr, torch_proc.stdout
+                    )
+                    return (
+                        torch_proc.returncode,
+                        "infra_error" if is_infra else "install",
+                        False,
+                        is_infra,
+                    )
 
             install_proc = subprocess.run(
                 [
@@ -1876,7 +2021,15 @@ def verify_non_ppu_reproducer(
                 timeout=timeout_sec,
             )
             if install_proc.returncode != 0:
-                return install_proc.returncode, False
+                is_infra = _is_infra_process_failure(
+                    install_proc.returncode, install_proc.stderr, install_proc.stdout
+                )
+                if is_infra:
+                    return install_proc.returncode, "infra_error", False, True
+                if mode == "cpu_empty_build":
+                    return install_proc.returncode, "build_install", False, False
+                # In stub_plugin_cpu mode, pip failure prevented the stub check from executing.
+                return install_proc.returncode, "install", False, False
 
             check_env = dict(base_env)
             py_entries = [str(site_dir)]
@@ -1891,9 +2044,14 @@ def verify_non_ppu_reproducer(
                 text=True,
                 timeout=timeout_sec,
             )
-            return check_proc.returncode, False
+            if check_proc.returncode != 0 and _is_infra_process_failure(
+                check_proc.returncode, check_proc.stderr, check_proc.stdout
+            ):
+                return check_proc.returncode, "infra_error", True, True
+            phase = "stub_check" if mode == "stub_plugin_cpu" else "build_import"
+            return check_proc.returncode, phase, True, False
         except subprocess.TimeoutExpired:
-            return 124, True
+            return 124, "infra_error", False, True
         finally:
             if wt_added:
                 subprocess.run(
@@ -1914,8 +2072,10 @@ def verify_non_ppu_reproducer(
     with tempfile.TemporaryDirectory(prefix="non-ppu-repro-") as td:
         workdir = Path(td)
         stub_site, check_script = materialize_stub_plugin(kind, workdir)
-        good_rc, good_infra = _run_one(good, workdir, stub_site, check_script)
-        if good_infra or good_rc != 0:
+        good_rc, good_phase, good_exec, good_infra = _run_one(
+            good, workdir, stub_site, check_script
+        )
+        if good_infra or good_rc != 0 or not good_exec:
             return NonPpuReproEvidence(
                 mode=mode,
                 repro_kind=kind,
@@ -1924,9 +2084,17 @@ def verify_non_ppu_reproducer(
                 last_good_exit_code=good_rc,
                 first_failing_exit_code=-1,
                 verified=False,
+                last_good_phase=good_phase,
+                first_failing_phase="none",
+                last_good_check_executed=good_exec,
+                first_failing_check_executed=False,
+                infra_error=good_infra,
             )
-        bad_rc, bad_infra = _run_one(bad, workdir, stub_site, check_script)
+        bad_rc, bad_phase, bad_exec, bad_infra = _run_one(
+            bad, workdir, stub_site, check_script
+        )
 
+    any_infra = good_infra or bad_infra
     raw_evidence = NonPpuReproEvidence(
         mode=mode,
         repro_kind=kind,
@@ -1934,7 +2102,12 @@ def verify_non_ppu_reproducer(
         first_failing_sha=bad,
         last_good_exit_code=good_rc,
         first_failing_exit_code=bad_rc,
-        verified=(not bad_infra and good_rc == 0 and bad_rc != 0),
+        verified=(not any_infra and good_rc == 0 and bad_rc > 0),
+        last_good_phase=good_phase,
+        first_failing_phase=bad_phase,
+        last_good_check_executed=good_exec,
+        first_failing_check_executed=bad_exec,
+        infra_error=any_infra,
     )
     return NonPpuReproEvidence(
         mode=raw_evidence.mode,
@@ -1950,6 +2123,11 @@ def verify_non_ppu_reproducer(
             first_failing_sha=bad,
             require_shas=True,
         ),
+        last_good_phase=raw_evidence.last_good_phase,
+        first_failing_phase=raw_evidence.first_failing_phase,
+        last_good_check_executed=raw_evidence.last_good_check_executed,
+        first_failing_check_executed=raw_evidence.first_failing_check_executed,
+        infra_error=raw_evidence.infra_error,
     )
 
 
