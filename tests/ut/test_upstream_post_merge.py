@@ -4948,6 +4948,7 @@ def test_rc_release_branch_priority_same_sha_dedup_cherrypick_bisect_and_cursor_
         "sha": sha_cp1,
         "status": "pass",
         "last_green_sha": sha_cp1,
+        "green_history": [sha_cp1, sha_rc0],
     }
 
     # Re-polling sha_cp1 now deduplicates cleanly!
@@ -4989,6 +4990,7 @@ def test_rc_release_branch_priority_same_sha_dedup_cherrypick_bisect_and_cursor_
         "sha": sha_cp2_bad,
         "status": "fail",
         "last_green_sha": sha_cp1,
+        "green_history": [sha_cp1, sha_rc0],
     }
 
     ls_cp3 = {**ls_cp1, "release_branches": {"releases/v0.35.0": sha_cp3_bad}}
@@ -5016,6 +5018,7 @@ def test_rc_release_branch_priority_same_sha_dedup_cherrypick_bisect_and_cursor_
         "sha": sha_cp3_bad,
         "status": "infra_error",
         "last_green_sha": sha_cp1,
+        "green_history": [sha_cp1, sha_rc0],
     }
     for main_key in (
         "last_cpu_checked_sha",
@@ -5201,9 +5204,193 @@ def test_rc_legacy_cursor_upgrade_and_manual_override_variants(tmp_path):
                 "last_green_sha": "bad",
             }
         },
+        {
+            "releases/v0.35.0": {
+                "sha": sha_cp1,
+                "status": "pass",
+                "green_history": ["not-a-sha"],
+            }
+        },
     ):
         with pytest.raises(ValueError):
             post_merge._sanitize_cursor(
                 {**legacy_cursor, "rc_branch_states": bad_branch_states},
                 verified_pin=VERIFIED_PIN,
             )
+
+
+def test_review_r1_rc_green_baseline_retry_promotion_and_rerun_revocation_bisect():
+    sha_main = _sha(1010)
+    sha_main_green = _sha(1011)
+    sha_a = _sha(1012)
+    sha_b = _sha(1013)
+    sha_c = _sha(1014)
+
+    base_cur = post_merge.advance_cursor(
+        None,
+        verified_pin=VERIFIED_PIN,
+        selected_gear="probe",
+        target_sha=sha_main_green,
+        status="pass",
+        cpu_status="pass",
+        ppu_status="pass",
+    )
+
+    # Trigger A: release branch A pass -> rc1 B fail -> force rc1 B pass -> release branch C
+    # Must promote B as last_green_sha once rc1 B passes on retry!
+    c_a_pass = post_merge.advance_cursor(
+        base_cur,
+        verified_pin=VERIFIED_PIN,
+        selected_gear="rc_qualify",
+        target_sha=sha_a,
+        rc_tag="releases/v0.35.0",
+        status="pass",
+        cpu_status="pass",
+        ppu_status="pass",
+    )
+    c_rc1_fail = post_merge.advance_cursor(
+        c_a_pass,
+        verified_pin=VERIFIED_PIN,
+        selected_gear="rc_qualify",
+        target_sha=sha_b,
+        rc_tag="v0.35.0rc1",
+        status="fail",
+        cpu_status="pass",
+        ppu_status="fail",
+    )
+    c_rc1_retry_pass = post_merge.advance_cursor(
+        c_rc1_fail,
+        verified_pin=VERIFIED_PIN,
+        selected_gear="rc_qualify",
+        target_sha=sha_b,
+        rc_tag="v0.35.0rc1",
+        status="pass",
+        cpu_status="pass",
+        ppu_status="pass",
+    )
+    route_after_retry = post_merge.route_three_gears(
+        ls_remote_data={
+            "main_sha": sha_main,
+            "tags": {"v0.35.0rc1": sha_b},
+            "release_branches": {"releases/v0.35.0": sha_c},
+        },
+        verified_pin=VERIFIED_PIN,
+        release_baseline_tag="v0.34.0",
+        requested_gear="auto",
+        cursor=c_rc1_retry_pass,
+    )
+    assert route_after_retry["selected_gear"] == "rc_qualify"
+    assert route_after_retry["rc_tag"] == "releases/v0.35.0"
+    assert route_after_retry["target_sha"] == sha_c
+    assert route_after_retry["last_green_sha"] == sha_b
+
+    # Trigger B: release branch A pass -> rc1 B pass -> manual rc1 B fail -> release branch C
+    # Must revoke B from branch green baseline and roll back to A so bisection converges to B!
+    c_rc1_pass_first = post_merge.advance_cursor(
+        c_a_pass,
+        verified_pin=VERIFIED_PIN,
+        selected_gear="rc_qualify",
+        target_sha=sha_b,
+        rc_tag="v0.35.0rc1",
+        status="pass",
+        cpu_status="pass",
+        ppu_status="pass",
+    )
+    assert (
+        c_rc1_pass_first["rc_branch_states"]["releases/v0.35.0"]["last_green_sha"]
+        == sha_b
+    )
+    c_rc1_rerun_fail = post_merge.advance_cursor(
+        c_rc1_pass_first,
+        verified_pin=VERIFIED_PIN,
+        selected_gear="rc_qualify",
+        target_sha=sha_b,
+        rc_tag="v0.35.0rc1",
+        status="fail",
+        cpu_status="pass",
+        ppu_status="fail",
+    )
+    assert (
+        c_rc1_rerun_fail["rc_branch_states"]["releases/v0.35.0"]["last_green_sha"]
+        == sha_a
+    )
+    route_after_revoke = post_merge.route_three_gears(
+        ls_remote_data={
+            "main_sha": sha_main,
+            "tags": {"v0.35.0rc1": sha_b},
+            "release_branches": {"releases/v0.35.0": sha_c},
+        },
+        verified_pin=VERIFIED_PIN,
+        release_baseline_tag="v0.34.0",
+        requested_gear="auto",
+        cursor=c_rc1_rerun_fail,
+    )
+    assert route_after_revoke["selected_gear"] == "rc_qualify"
+    assert route_after_revoke["last_green_sha"] == sha_a
+
+    # Feed routed `last_green_sha` directly into `bisect_first_failing_sha` consumer (A pass, B/C fail).
+    bisect_res = post_merge.bisect_first_failing_sha(
+        last_green_sha=route_after_revoke["last_green_sha"],
+        red_sha=route_after_revoke["target_sha"],
+        commits=[sha_b, sha_c],
+        probe_fn=lambda sha: (
+            post_merge.ProbeOutcome(status="pass")
+            if sha == sha_a
+            else post_merge.ProbeOutcome(
+                status="fail",
+                stage="plugin_registration",
+                target_signature="ModelRegistry.register_model",
+                is_public_plugin_interface=True,
+            )
+        ),
+        verify_baseline_first=True,
+    )
+    assert bisect_res["bisect_status"] == "converged"
+    assert bisect_res["first_failing_sha"] == sha_b
+    assert bisect_res["last_good_sha"] == sha_a
+
+    # Sibling Trigger C (same-SHA branch or cross tag/branch re-run failure also revokes B and preserves main cursor).
+    c_branch_b_fail = post_merge.advance_cursor(
+        c_rc1_pass_first,
+        verified_pin=VERIFIED_PIN,
+        selected_gear="rc_qualify",
+        target_sha=sha_b,
+        rc_tag="releases/v0.35.0",
+        status="fail",
+        cpu_status="pass",
+        ppu_status="fail",
+    )
+    assert (
+        c_branch_b_fail["rc_branch_states"]["releases/v0.35.0"]["last_green_sha"]
+        == sha_a
+    )
+    assert c_branch_b_fail["rc_tag_states"]["v0.35.0rc1"]["status"] == "fail"
+    assert "v0.35.0rc1" not in c_branch_b_fail["tested_rc_tags"]
+    assert c_branch_b_fail["last_ppu_green_sha"] == sha_main_green
+
+    # If the ONLY green SHA on the branch (`sha_a`) is itself revoked on re-run, `last_green_sha` falls back to main's green SHA!
+    c_only_a_revoked = post_merge.advance_cursor(
+        c_a_pass,
+        verified_pin=VERIFIED_PIN,
+        selected_gear="rc_qualify",
+        target_sha=sha_a,
+        rc_tag="releases/v0.35.0",
+        status="fail",
+        cpu_status="pass",
+        ppu_status="fail",
+    )
+    assert (
+        "last_green_sha" not in c_only_a_revoked["rc_branch_states"]["releases/v0.35.0"]
+    )
+    route_after_full_revoke = post_merge.route_three_gears(
+        ls_remote_data={
+            "main_sha": sha_main,
+            "tags": {},
+            "release_branches": {"releases/v0.35.0": sha_c},
+        },
+        verified_pin=VERIFIED_PIN,
+        release_baseline_tag="v0.34.0",
+        requested_gear="auto",
+        cursor=c_only_a_revoked,
+    )
+    assert route_after_full_revoke["last_green_sha"] == sha_main_green
