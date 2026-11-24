@@ -287,13 +287,28 @@ jobs:
 
           git init -q /tmp/vllm-src
           git -C /tmp/vllm-src remote add origin https://github.com/vllm-project/vllm.git
-          git -C /tmp/vllm-src fetch --quiet --depth=250 origin "${TARGET_SHA}"
+          git -C /tmp/vllm-src fetch --quiet --tags --depth=250 origin "${TARGET_SHA}"
           if [[ -n "${control_sha}" && "${control_sha}" != "${TARGET_SHA}" ]] && ! git -C /tmp/vllm-src cat-file -e "${control_sha}^{commit}" 2>/dev/null; then
             git -C /tmp/vllm-src fetch --quiet --depth=1 origin "${control_sha}" || true
           fi
           git -C /tmp/vllm-src checkout --quiet --detach "${TARGET_SHA}"
 
           if [[ "${BUILD_RESULT}" != "success" ]]; then
+            export RUSTUP_DIST_SERVER="${RUSTUP_DIST_SERVER:-https://rsproxy.cn}"
+            export RUSTUP_UPDATE_ROOT="${RUSTUP_UPDATE_ROOT:-https://rsproxy.cn/rustup}"
+            export CARGO_NET_GIT_FETCH_WITH_CLI=true
+            if ! command -v rustup >/dev/null 2>&1; then
+              curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+                | sh -s -- -y --profile minimal --default-toolchain none || true
+            fi
+            if [[ -r "${CARGO_HOME:-$HOME/.cargo}/env" ]]; then
+              # shellcheck disable=SC1091
+              source "${CARGO_HOME:-$HOME/.cargo}/env"
+            fi
+            python3 -m pip install -q --index-url "${SAIL_PIP_INDEX_URL}" -r requirements/build.txt || true
+            if [[ -f /tmp/vllm-src/requirements/build/cuda.txt ]]; then
+              python3 -m pip install -q --index-url "${SAIL_PIP_INDEX_URL}" -r /tmp/vllm-src/requirements/build/cuda.txt || true
+            fi
             python3 scripts/ci/ppu_upstream_post_merge.py source-build-triage \
               --vllm-repo /tmp/vllm-src \
               --sail-root "$PWD" \

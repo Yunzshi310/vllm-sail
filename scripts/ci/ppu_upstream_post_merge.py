@@ -24,6 +24,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -243,14 +244,25 @@ _REPO_FILENOENT_TARGET_RE = re.compile(
     r"""['"]?/?(?:[A-Za-z0-9_.-]+/)*(?:requirements/[A-Za-z0-9_.-]+\.(?:txt|in)|setup\.py|pyproject\.toml|CMakeLists\.txt|README\.md|version\.txt|(?:vllm|cmake|csrc)/[A-Za-z0-9_./-]+)['"]?\s*$"""
 )
 _CMAKE_REPO_ERROR_RE = re.compile(
-    r"^\s*CMake Error at (?!/usr/|/opt/|/lib/)(?:[A-Za-z0-9_./-]+/)?(?:CMakeLists\.txt|(?:cmake|csrc|vllm)/[A-Za-z0-9_./-]+):\d+"
+    r"^\s*CMake Error at (?!/usr/|/opt/|/lib/|/Library/|/System/|/Applications/)(?:[A-Za-z0-9_./-]+/)?(?:CMakeLists\.txt|(?:cmake|csrc|vllm)/[A-Za-z0-9_./-]+):\d+"
 )
 _NATIVE_COMPILE_REPO_ERROR_RE = re.compile(
-    r"^\s*(?!/usr/|/opt/|/lib/)(?:[A-Za-z0-9_./-]+/)?(?:csrc|vllm)/[A-Za-z0-9_./-]+\.(?:c|cc|cpp|cxx|h|hpp|cu):\d+(?::\d+)?:\s*(?:fatal )?error:"
+    r"^\s*(?!/usr/|/opt/|/lib/|/Library/|/System/|/Applications/)"
+    r"(?!.*(?:^|/)(?:site-packages|dist-packages|pip-build-env|\.(?:cargo|rustup))(?:/|$))"
+    r"(?:(?!/|[A-Za-z]:)[A-Za-z0-9_./-]+"
+    r"|(?:[A-Za-z0-9_./-]+/)?(?:csrc|vllm|rust|pip-req-build-[A-Za-z0-9_]+|wt-[A-Za-z0-9_-]+|vllm-[0-9a-f]{12})/[A-Za-z0-9_./-]+)"
+    r"\.(?:c|cc|cpp|cxx|h|hpp|cu):\d+(?::\d+)?:\s*(?:fatal )?error:"
 )
-_RUSTC_ERROR_CODE_RE = re.compile(r"(?m)^\s*error\[E\d+\]:")
+_RUSTC_ERROR_CODE_RE = re.compile(r"(?m)^\s*error(?:\[E\d+\])?:")
 _RUSTC_REPO_SPAN_RE = re.compile(
-    r"(?m)^\s*-->\s+(?!/usr/|/opt/|/cargo/)(?:[A-Za-z0-9_./-]+/)?(?:src|csrc|vllm)/[A-Za-z0-9_./-]+\.rs:\d+:\d+"
+    r"(?m)^\s*-->\s+(?!/usr/|/opt/|/cargo/|/Library/|/System/|/Applications/)"
+    r"(?!.*(?:^|/)\.(?:cargo|rustup)/)"
+    r"(?:(?!/|[A-Za-z]:)[A-Za-z0-9_./-]+"
+    r"|(?:[A-Za-z0-9_./-]+/)?(?:rust|src|csrc|vllm)/[A-Za-z0-9_./-]+)"
+    r"\.rs:\d+:\d+"
+)
+_BUILD_ENV_MISSING_MOD_RE = re.compile(
+    r"""(?i)\bno module named ['"]?(?:setuptools(?:_rust|_scm)?|wheel|pip|tomli|packaging|cmake|ninja|torch|cython)(?:\.[A-Za-z0-9_]+)*['"]?"""
 )
 VALID_PPU_SKIP_REASONS = (
     "none",
@@ -1654,9 +1666,34 @@ def build_stub_plugin_spec(repro_kind: str) -> dict[str, str]:
             "entry_points": "",
             "plugin_module": "",
             "check_script": (
+                "import os\n"
+                "from pathlib import Path\n"
+                "import runpy\n"
                 "import sys\n"
                 "import vllm\n\n"
                 'assert "vllm_sail" not in sys.modules\n'
+                "pkg_dir = Path(vllm.__file__).resolve().parent\n"
+                'src_root_raw = os.environ.get("VLLM_SOURCE_ROOT", "").strip()\n'
+                "src_root = Path(src_root_raw) if src_root_raw else pkg_dir.parent\n"
+                'if not (src_root / "tools" / "build_rust.py").is_file():\n'
+                "    src_root = Path.cwd()\n"
+                'build_rust_py = src_root / "tools" / "build_rust.py"\n'
+                "if build_rust_py.is_file():\n"
+                "    mod_ns = runpy.run_path(str(build_rust_py))\n"
+                '    ext_fn = mod_ns.get("rust_py_extension_module_names")\n'
+                "    declared = list(ext_fn()) if callable(ext_fn) else []\n"
+                '    for label, vllm_dir in (("source", src_root / "vllm"), ("installed", pkg_dir)):\n'
+                '        binary = vllm_dir / "vllm-rs"\n'
+                "        if not binary.is_file() or binary.stat().st_size == 0:\n"
+                '            raise SystemExit(f"required local Rust artifacts were not built ({label}): {binary}")\n'
+                "        extensions = []\n"
+                "        for module in declared:\n"
+                '            paths = list(vllm_dir.glob(f"{module}.*.so"))\n'
+                "            if len(paths) != 1 or paths[0].stat().st_size == 0:\n"
+                '                raise SystemExit(f"required local Rust extension was not built ({label}): {module}")\n'
+                "            extensions.extend(paths)\n"
+                '        if set(vllm_dir.glob("_rust_*.so")) != set(extensions):\n'
+                '            raise SystemExit(f"unexpected local Rust extensions outside upstream declarations ({label})")\n'
                 'print("cpu_empty_build_ok", vllm.__version__)\n'
             ),
         }
@@ -1949,6 +1986,15 @@ def _has_upstream_build_source_evidence(payload: str) -> bool:
             if _is_upstream_py_frame(last_frame):
                 if exc_name not in _ALLOWED_BUILD_EXC_NAMES:
                     return False
+                if (
+                    exc_name
+                    in (
+                        "ModuleNotFoundError",
+                        "ImportError",
+                    )
+                    and _BUILD_ENV_MISSING_MOD_RE.search(exc_msg) is not None
+                ):
+                    return False
                 if exc_name == "FileNotFoundError" and not _is_valid_repo_filenoent(
                     exc_msg
                 ):
@@ -1961,10 +2007,21 @@ def _has_upstream_build_source_evidence(payload: str) -> bool:
             ):
                 pass
             elif (
-                exc_name == "CalledProcessError"
-                and has_upstream_ancestor
-                and _STDLIB_SUBPROCESS_FRAME_RE.search(last_frame) is not None
+                has_upstream_ancestor
                 and has_native_diag
+                and (
+                    (
+                        exc_name == "CalledProcessError"
+                        and _STDLIB_SUBPROCESS_FRAME_RE.search(last_frame) is not None
+                    )
+                    or exc_name
+                    in (
+                        "CompileError",
+                        "DistutilsExecError",
+                        "CCompilerError",
+                        "SystemExit",
+                    )
+                )
             ):
                 pass
             elif (
@@ -2215,6 +2272,312 @@ def parse_non_ppu_repro_evidence(data: Any) -> NonPpuReproEvidence | None:
     )
 
 
+_CLEAN_BUILD_ENV_DROP_KEYS = frozenset(
+    {
+        "PYTHONPATH",
+        "VLLM_SAIL_CANDIDATE_UPSTREAM_COMMIT",
+        "VLLM_PPU_CANDIDATE_UPSTREAM_COMMIT",
+        "VLLM_USE_PRECOMPILED",
+        "VLLM_USE_PRECOMPILED_RUST",
+        "VLLM_PRECOMPILED_WHEEL_LOCATION",
+        "VLLM_VERSION",
+        "VLLM_VERSION_OVERRIDE",
+        "SETUPTOOLS_SCM_PRETEND_VERSION",
+        "SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM",
+    }
+)
+_RUST_TOOLCHAIN_CHANNEL_RE = re.compile(
+    r"""(?m)^\s*channel\s*=\s*['"]([^'"]+)['"]\s*(?:#.*)?$"""
+)
+
+
+def _read_rust_toolchain_channel(wt_dir: Path) -> str:
+    toolchain_file = wt_dir / "rust-toolchain.toml"
+    if not toolchain_file.is_file():
+        return ""
+    try:
+        raw = toolchain_file.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    try:
+        try:
+            import tomllib  # type: ignore[import-not-found]
+        except ModuleNotFoundError:
+            import tomli as tomllib  # type: ignore[import-not-found,no-redef]
+
+        parsed = tomllib.loads(raw)
+        ch = (parsed.get("toolchain") or {}).get("channel")
+        if isinstance(ch, str) and ch.strip():
+            return ch.strip()
+    except Exception:
+        pass
+    m = _RUST_TOOLCHAIN_CHANNEL_RE.search(raw)
+    return m.group(1).strip() if m else ""
+
+
+def _execute_vllm_worktree_build(
+    *,
+    vllm_repo: Path,
+    sha: str,
+    workdir: Path,
+    step_tag: str,
+    mode: str,
+    base_env: dict[str, str],
+    stub_site: Path,
+    check_script: Path,
+    python_exe: str,
+    timeout_sec: int,
+) -> tuple[int, str, str, bool, bool, str]:
+    """Build & check ``sha`` in a detached worktree, replaying mandatory Rust build in ``cpu_empty_build``.
+
+    Returns ``(exit_code, phase, failure_source, check_executed, is_infra_error, target_signature)``.
+    """
+    wt_dir = workdir / f"vllm-{step_tag}"
+    site_dir = workdir / f"site-{step_tag}"
+    site_dir.mkdir(parents=True, exist_ok=True)
+    wt_added = False
+    try:
+        add_proc = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(vllm_repo),
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                str(wt_dir),
+                sha,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if add_proc.returncode != 0:
+            return (
+                add_proc.returncode,
+                "setup",
+                "infra_or_unknown",
+                False,
+                True,
+                "VLLM_TARGET_DEVICE=empty",
+            )
+        wt_added = True
+
+        run_env = dict(base_env)
+        run_env["STUB_CHECK_SCRIPT"] = str(check_script)
+        run_env["VLLM_SOURCE_ROOT"] = str(wt_dir)
+
+        use_torch = wt_dir / "tools" / "use_existing_torch.py"
+        if use_torch.is_file():
+            torch_proc = subprocess.run(
+                [python_exe, str(use_torch)],
+                cwd=str(wt_dir),
+                env=run_env,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            if torch_proc.returncode != 0:
+                if mode == "cpu_empty_build":
+                    phase, src, is_infra = _classify_install_failure(
+                        torch_proc.returncode,
+                        torch_proc.stderr,
+                        torch_proc.stdout,
+                        mode=mode,
+                    )
+                    return (
+                        torch_proc.returncode,
+                        phase,
+                        src,
+                        False,
+                        is_infra,
+                        "VLLM_TARGET_DEVICE=empty",
+                    )
+                is_infra = _is_infra_process_failure(
+                    torch_proc.returncode, torch_proc.stderr, torch_proc.stdout
+                )
+                return (
+                    torch_proc.returncode,
+                    "infra_error" if is_infra else "install",
+                    "infra_or_unknown",
+                    False,
+                    is_infra,
+                    "VLLM_TARGET_DEVICE=empty",
+                )
+
+        has_build_rust = False
+        if mode == "cpu_empty_build":
+            build_rust_py = wt_dir / "tools" / "build_rust.py"
+            if build_rust_py.is_file():
+                has_build_rust = True
+                channel = _read_rust_toolchain_channel(wt_dir)
+                rustup_bin = shutil.which(
+                    "rustup", path=run_env.get("PATH", os.environ.get("PATH"))
+                )
+                if channel and not run_env.get("RUSTUP_TOOLCHAIN") and rustup_bin:
+                    run_env["RUSTUP_TOOLCHAIN"] = channel
+                    probe_tc = subprocess.run(
+                        [rustup_bin, "which", "rustc", "--toolchain", channel],
+                        cwd=str(wt_dir),
+                        env=run_env,
+                        capture_output=True,
+                        text=True,
+                        timeout=60,
+                    )
+                    if probe_tc.returncode != 0:
+                        tc_install = subprocess.run(
+                            [
+                                rustup_bin,
+                                "toolchain",
+                                "install",
+                                channel,
+                                "--profile",
+                                "minimal",
+                            ],
+                            cwd=str(wt_dir),
+                            env=run_env,
+                            capture_output=True,
+                            text=True,
+                            timeout=timeout_sec,
+                        )
+                        if tc_install.returncode != 0:
+                            return (
+                                tc_install.returncode,
+                                "infra_error",
+                                "infra_or_unknown",
+                                False,
+                                True,
+                                "rust_frontend_build",
+                            )
+
+                rust_proc = subprocess.run(
+                    [python_exe, str(build_rust_py), "--release"],
+                    cwd=str(wt_dir),
+                    env=run_env,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout_sec,
+                )
+                if rust_proc.returncode != 0:
+                    phase, src, is_infra = _classify_install_failure(
+                        rust_proc.returncode,
+                        rust_proc.stderr,
+                        rust_proc.stdout,
+                        mode=mode,
+                    )
+                    return (
+                        rust_proc.returncode,
+                        phase,
+                        src,
+                        False,
+                        is_infra,
+                        "rust_frontend_build",
+                    )
+
+        install_proc = subprocess.run(
+            [
+                python_exe,
+                "-m",
+                "pip",
+                "install",
+                "-q",
+                "--no-build-isolation",
+                "--no-deps",
+                "--upgrade",
+                "--target",
+                str(site_dir),
+                str(wt_dir),
+            ],
+            cwd=str(wt_dir),
+            env=run_env,
+            capture_output=True,
+            text=True,
+            timeout=timeout_sec,
+        )
+        if install_proc.returncode != 0:
+            phase, src, is_infra = _classify_install_failure(
+                install_proc.returncode,
+                install_proc.stderr,
+                install_proc.stdout,
+                mode=mode,
+            )
+            combined_out = f"{install_proc.stdout}\n{install_proc.stderr}"
+            sig = (
+                "rust_frontend_build"
+                if _RUSTC_REPO_SPAN_RE.search(combined_out) is not None
+                else "VLLM_TARGET_DEVICE=empty"
+            )
+            return install_proc.returncode, phase, src, False, is_infra, sig
+
+        check_env = dict(run_env)
+        py_entries = [str(site_dir)]
+        if mode == "stub_plugin_cpu":
+            py_entries.insert(0, str(stub_site))
+        check_env["PYTHONPATH"] = os.pathsep.join(py_entries)
+        check_proc = subprocess.run(
+            [python_exe, str(check_script)],
+            cwd=str(workdir),
+            env=check_env,
+            capture_output=True,
+            text=True,
+            timeout=timeout_sec,
+        )
+        if check_proc.returncode != 0 and _is_infra_process_failure(
+            check_proc.returncode, check_proc.stderr, check_proc.stdout
+        ):
+            return (
+                check_proc.returncode,
+                "infra_error",
+                "infra_or_unknown",
+                True,
+                True,
+                "VLLM_TARGET_DEVICE=empty",
+            )
+        phase = "stub_check" if mode == "stub_plugin_cpu" else "build_import"
+        src = (
+            "none"
+            if check_proc.returncode == 0
+            else (
+                "stub_plugin_check"
+                if mode == "stub_plugin_cpu"
+                else "upstream_import_check"
+            )
+        )
+        chk_out = f"{check_proc.stdout}\n{check_proc.stderr}"
+        sig = (
+            "rust_frontend_build"
+            if (check_proc.returncode != 0 and has_build_rust and "Rust" in chk_out)
+            else "VLLM_TARGET_DEVICE=empty"
+        )
+        return check_proc.returncode, phase, src, True, False, sig
+    except subprocess.TimeoutExpired:
+        return (
+            124,
+            "infra_error",
+            "infra_or_unknown",
+            False,
+            True,
+            "VLLM_TARGET_DEVICE=empty",
+        )
+    finally:
+        if wt_added:
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(vllm_repo),
+                    "worktree",
+                    "remove",
+                    "--force",
+                    str(wt_dir),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+
+
 def verify_non_ppu_reproducer(
     *,
     vllm_repo: Path,
@@ -2257,16 +2620,12 @@ def verify_non_ppu_reproducer(
     ) -> tuple[int, str, str, bool, bool]:
         """Return ``(exit_code, phase, failure_source, check_executed, is_infra_error)``."""
         base_env = {
-            k: v
-            for k, v in os.environ.items()
-            if k
-            not in (
-                "PYTHONPATH",
-                "VLLM_SAIL_CANDIDATE_UPSTREAM_COMMIT",
-                "VLLM_PPU_CANDIDATE_UPSTREAM_COMMIT",
-            )
+            k: v for k, v in os.environ.items() if k not in _CLEAN_BUILD_ENV_DROP_KEYS
         }
         base_env["VLLM_TARGET_DEVICE"] = "empty"
+        if mode == "cpu_empty_build":
+            base_env["VLLM_REQUIRE_RUST_FRONTEND"] = "1"
+            base_env["CARGO_NET_GIT_FETCH_WITH_CLI"] = "true"
         base_env["CUDA_VISIBLE_DEVICES"] = ""
         base_env["VLLM_PLUGINS"] = "stub" if mode == "stub_plugin_cpu" else ""
         base_env["CANDIDATE_SHA"] = sha
@@ -2328,135 +2687,19 @@ def verify_non_ppu_reproducer(
                 return proc.returncode, phase, src, False, is_infra
             return 0, "install", "none", False, False
 
-        base_env["STUB_CHECK_SCRIPT"] = str(check_script)
-        wt_dir = workdir / f"vllm-{sha[:12]}"
-        site_dir = workdir / f"site-{sha[:12]}"
-        site_dir.mkdir(parents=True, exist_ok=True)
-        wt_added = False
-        try:
-            add_proc = subprocess.run(
-                [
-                    "git",
-                    "-C",
-                    str(vllm_repo),
-                    "worktree",
-                    "add",
-                    "--quiet",
-                    "--detach",
-                    str(wt_dir),
-                    sha,
-                ],
-                capture_output=True,
-                text=True,
-                timeout=120,
-            )
-            if add_proc.returncode != 0:
-                return add_proc.returncode, "setup", "infra_or_unknown", False, True
-            wt_added = True
-
-            use_torch = wt_dir / "tools" / "use_existing_torch.py"
-            if use_torch.is_file():
-                torch_proc = subprocess.run(
-                    [python_exe, str(use_torch)],
-                    cwd=str(wt_dir),
-                    env=base_env,
-                    capture_output=True,
-                    text=True,
-                    timeout=120,
-                )
-                if torch_proc.returncode != 0:
-                    is_infra = _is_infra_process_failure(
-                        torch_proc.returncode, torch_proc.stderr, torch_proc.stdout
-                    )
-                    return (
-                        torch_proc.returncode,
-                        "infra_error" if is_infra else "install",
-                        "infra_or_unknown",
-                        False,
-                        is_infra,
-                    )
-
-            install_proc = subprocess.run(
-                [
-                    python_exe,
-                    "-m",
-                    "pip",
-                    "install",
-                    "-q",
-                    "--no-build-isolation",
-                    "--no-deps",
-                    "--upgrade",
-                    "--target",
-                    str(site_dir),
-                    str(wt_dir),
-                ],
-                cwd=str(wt_dir),
-                env=base_env,
-                capture_output=True,
-                text=True,
-                timeout=timeout_sec,
-            )
-            if install_proc.returncode != 0:
-                phase, src, is_infra = _classify_install_failure(
-                    install_proc.returncode,
-                    install_proc.stderr,
-                    install_proc.stdout,
-                    mode=mode,
-                )
-                return install_proc.returncode, phase, src, False, is_infra
-
-            check_env = dict(base_env)
-            py_entries = [str(site_dir)]
-            if mode == "stub_plugin_cpu":
-                py_entries.insert(0, str(stub_site))
-            check_env["PYTHONPATH"] = os.pathsep.join(py_entries)
-            check_proc = subprocess.run(
-                [python_exe, str(check_script)],
-                cwd=str(workdir),
-                env=check_env,
-                capture_output=True,
-                text=True,
-                timeout=timeout_sec,
-            )
-            if check_proc.returncode != 0 and _is_infra_process_failure(
-                check_proc.returncode, check_proc.stderr, check_proc.stdout
-            ):
-                return (
-                    check_proc.returncode,
-                    "infra_error",
-                    "infra_or_unknown",
-                    True,
-                    True,
-                )
-            phase = "stub_check" if mode == "stub_plugin_cpu" else "build_import"
-            src = (
-                "none"
-                if check_proc.returncode == 0
-                else (
-                    "stub_plugin_check"
-                    if mode == "stub_plugin_cpu"
-                    else "upstream_import_check"
-                )
-            )
-            return check_proc.returncode, phase, src, True, False
-        except subprocess.TimeoutExpired:
-            return 124, "infra_error", "infra_or_unknown", False, True
-        finally:
-            if wt_added:
-                subprocess.run(
-                    [
-                        "git",
-                        "-C",
-                        str(vllm_repo),
-                        "worktree",
-                        "remove",
-                        "--force",
-                        str(wt_dir),
-                    ],
-                    capture_output=True,
-                    text=True,
-                    timeout=60,
-                )
+        rc, phase, src, executed, is_infra, _sig = _execute_vllm_worktree_build(
+            vllm_repo=vllm_repo,
+            sha=sha,
+            workdir=workdir,
+            step_tag=sha[:12],
+            mode=mode,
+            base_env=base_env,
+            stub_site=stub_site,
+            check_script=check_script,
+            python_exe=python_exe,
+            timeout_sec=timeout_sec,
+        )
+        return rc, phase, src, executed, is_infra
 
     with tempfile.TemporaryDirectory(prefix="non-ppu-repro-") as td:
         workdir = Path(td)
@@ -2647,10 +2890,42 @@ def _render_standalone_repro_script(
         'git clone --filter=blob:none https://github.com/vllm-project/vllm.git "$WORKDIR/vllm"',
         'cd "$WORKDIR/vllm"',
         'git checkout --quiet --detach "$TARGET_REF"',
-        "python3 tools/use_existing_torch.py",
-        'mkdir -p "$WORKDIR/vllm_site"',
-        'VLLM_TARGET_DEVICE=empty python3 -m pip install --no-build-isolation --no-deps --upgrade --target "$WORKDIR/vllm_site" .',
+        "if [[ -f tools/use_existing_torch.py ]]; then",
+        "  python3 tools/use_existing_torch.py",
+        "fi",
     ]
+    if spec["mode"] == "cpu_empty_build":
+        lines.extend(
+            [
+                "unset VLLM_USE_PRECOMPILED VLLM_USE_PRECOMPILED_RUST VLLM_PRECOMPILED_WHEEL_LOCATION VLLM_VERSION VLLM_VERSION_OVERRIDE",
+                "export VLLM_TARGET_DEVICE=empty VLLM_REQUIRE_RUST_FRONTEND=1 CARGO_NET_GIT_FETCH_WITH_CLI=true",
+                "if [[ -f tools/build_rust.py ]]; then",
+                "  if [[ -f rust-toolchain.toml ]] && command -v rustup >/dev/null 2>&1; then",
+                "    RUSTUP_TOOLCHAIN=\"$(python3 - <<'PY'",
+                "import pathlib, re",
+                'text = pathlib.Path("rust-toolchain.toml").read_text(encoding="utf-8")',
+                'm = re.search(r"(?m)^\\s*channel\\s*=\\s*[\\x22\\x27]([^\\x22\\x27]+)[\\x22\\x27]", text)',
+                'print(m.group(1) if m else "")',
+                "PY",
+                '    )"',
+                '    if [[ -n "$RUSTUP_TOOLCHAIN" ]]; then',
+                "      export RUSTUP_TOOLCHAIN",
+                '      rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal',
+                "    fi",
+                "  fi",
+                "  python3 tools/build_rust.py --release",
+                "fi",
+                'mkdir -p "$WORKDIR/vllm_site"',
+                'python3 -m pip install --no-build-isolation --no-deps --upgrade --target "$WORKDIR/vllm_site" .',
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                'mkdir -p "$WORKDIR/vllm_site"',
+                'VLLM_TARGET_DEVICE=empty python3 -m pip install --no-build-isolation --no-deps --upgrade --target "$WORKDIR/vllm_site" .',
+            ]
+        )
     if spec["mode"] == "stub_plugin_cpu":
         lines.extend(
             [
@@ -2680,7 +2955,7 @@ def _render_standalone_repro_script(
                 "cat <<'PY' > \"$WORKDIR/repro_check.py\"",
                 spec["check_script"].rstrip("\n"),
                 "PY",
-                'PYTHONPATH="$WORKDIR/vllm_site" VLLM_TARGET_DEVICE=empty VLLM_PLUGINS="" CUDA_VISIBLE_DEVICES="" python3 "$WORKDIR/repro_check.py"',
+                'VLLM_SOURCE_ROOT="$WORKDIR/vllm" PYTHONPATH="$WORKDIR/vllm_site" VLLM_TARGET_DEVICE=empty VLLM_REQUIRE_RUST_FRONTEND=1 VLLM_PLUGINS="" CUDA_VISIBLE_DEVICES="" python3 "$WORKDIR/repro_check.py"',
             ]
         )
     return "\n".join(lines)
@@ -3619,22 +3894,23 @@ def run_source_only_build_triage(
         workdir = Path(td)
         stub_site, check_script = materialize_stub_plugin("cpu_empty_build", workdir)
         call_counter = 0
+        wheel_cache: dict[str, ProbeOutcome] = {}
+        kernel_cache: dict[str, ProbeOutcome] = {}
 
-        def _probe_source_sha(candidate_sha: str) -> ProbeOutcome:
+        def _probe_wheel_only(candidate_sha: str) -> ProbeOutcome:
+            if candidate_sha in wheel_cache:
+                return wheel_cache[candidate_sha]
             nonlocal call_counter
             call_counter += 1
             step_tag = f"{call_counter}-{candidate_sha[:12]}"
             base_env = {
                 k: v
                 for k, v in os.environ.items()
-                if k
-                not in (
-                    "PYTHONPATH",
-                    "VLLM_SAIL_CANDIDATE_UPSTREAM_COMMIT",
-                    "VLLM_PPU_CANDIDATE_UPSTREAM_COMMIT",
-                )
+                if k not in _CLEAN_BUILD_ENV_DROP_KEYS
             }
             base_env["VLLM_TARGET_DEVICE"] = "empty"
+            base_env["VLLM_REQUIRE_RUST_FRONTEND"] = "1"
+            base_env["CARGO_NET_GIT_FETCH_WITH_CLI"] = "true"
             base_env["CUDA_VISIBLE_DEVICES"] = ""
             base_env["VLLM_PLUGINS"] = ""
             base_env["CANDIDATE_SHA"] = candidate_sha
@@ -3646,6 +3922,16 @@ def run_source_only_build_triage(
             if probe_cmd.strip():
                 probe_json = workdir / f"probe-{step_tag}.json"
                 probe_json.unlink(missing_ok=True)
+                marker_path = workdir / f"probe-exec-{step_tag}.marker"
+                marker_path.unlink(missing_ok=True)
+                runner_script = workdir / f"probe-check-{step_tag}.py"
+                runner_script.write_text(
+                    "import pathlib, runpy\n"
+                    f"pathlib.Path({str(marker_path)!r}).write_text('executed\\n', encoding='utf-8')\n"
+                    f"runpy.run_path({str(check_script)!r}, run_name='__main__')\n",
+                    encoding="utf-8",
+                )
+                base_env["STUB_CHECK_SCRIPT"] = str(runner_script)
                 base_env["PROBE_RESULT_JSON"] = str(probe_json)
                 try:
                     proc = subprocess.run(
@@ -3656,11 +3942,14 @@ def run_source_only_build_triage(
                         timeout=timeout_sec,
                     )
                 except subprocess.TimeoutExpired:
-                    return ProbeOutcome(
+                    out = ProbeOutcome(
                         status="infra_error",
                         stage="wheel_build",
                         target_signature="VLLM_TARGET_DEVICE=empty",
+                        detail_code="infra_error",
                     )
+                    wheel_cache[candidate_sha] = out
+                    return out
                 if probe_json.is_file():
                     data = json.loads(probe_json.read_text(encoding="utf-8"))
                     probe_json.unlink(missing_ok=True)
@@ -3668,42 +3957,107 @@ def run_source_only_build_triage(
                         data.get("status")
                         or ("pass" if proc.returncode == 0 else "fail")
                     )
-                    return ProbeOutcome(
-                        status=raw_st
-                        if raw_st in ("pass", "fail", "infra_error")
-                        else "fail",
-                        stage=str(data.get("stage") or "wheel_build"),
+                    st = raw_st if raw_st in ("pass", "fail", "infra_error") else "fail"
+                    stg = str(data.get("stage") or "wheel_build")
+                    out = ProbeOutcome(
+                        status=st,
+                        stage=stg,
                         target_signature=str(
                             data.get("target_signature") or "VLLM_TARGET_DEVICE=empty"
                         ),
                         is_public_plugin_interface=bool(
-                            data.get("is_public_plugin_interface", True)
+                            data.get("is_public_plugin_interface", stg == "wheel_build")
                         ),
+                        detail_code=str(data.get("phase") or stg),
                     )
+                    wheel_cache[candidate_sha] = out
+                    return out
+                executed = marker_path.is_file()
                 if proc.returncode == 0:
-                    return ProbeOutcome(status="pass")
-                _phase, _src, is_infra = _classify_install_failure(
+                    out = ProbeOutcome(status="pass", detail_code="pass")
+                    wheel_cache[candidate_sha] = out
+                    return out
+                if _is_infra_process_failure(proc.returncode, proc.stderr, proc.stdout):
+                    out = ProbeOutcome(
+                        status="infra_error",
+                        stage="wheel_build",
+                        target_signature="VLLM_TARGET_DEVICE=empty",
+                        detail_code="infra_error",
+                    )
+                    wheel_cache[candidate_sha] = out
+                    return out
+                if executed:
+                    out = ProbeOutcome(
+                        status="fail",
+                        stage="wheel_build",
+                        target_signature="VLLM_TARGET_DEVICE=empty",
+                        is_public_plugin_interface=True,
+                        detail_code="build_import",
+                    )
+                    wheel_cache[candidate_sha] = out
+                    return out
+                phase, _src, is_infra = _classify_install_failure(
                     proc.returncode,
                     proc.stderr,
                     proc.stdout,
                     mode="cpu_empty_build",
                 )
                 if is_infra:
-                    return ProbeOutcome(
+                    out = ProbeOutcome(
                         status="infra_error",
                         stage="wheel_build",
                         target_signature="VLLM_TARGET_DEVICE=empty",
+                        detail_code="infra_error",
                     )
-                return ProbeOutcome(
+                else:
+                    out = ProbeOutcome(
+                        status="fail",
+                        stage="wheel_build",
+                        target_signature="VLLM_TARGET_DEVICE=empty",
+                        is_public_plugin_interface=True,
+                        detail_code=phase,
+                    )
+                wheel_cache[candidate_sha] = out
+                return out
+
+            rc, phase, _src, _exec, is_infra, sig = _execute_vllm_worktree_build(
+                vllm_repo=vllm_repo,
+                sha=candidate_sha,
+                workdir=workdir,
+                step_tag=step_tag,
+                mode="cpu_empty_build",
+                base_env=base_env,
+                stub_site=stub_site,
+                check_script=check_script,
+                python_exe=python_exe,
+                timeout_sec=timeout_sec,
+            )
+            if rc == 0 and not is_infra:
+                out = ProbeOutcome(status="pass", detail_code="pass")
+            elif is_infra:
+                out = ProbeOutcome(
+                    status="infra_error",
+                    stage="wheel_build",
+                    target_signature=sig,
+                    detail_code="infra_error",
+                )
+            else:
+                out = ProbeOutcome(
                     status="fail",
                     stage="wheel_build",
-                    target_signature="VLLM_TARGET_DEVICE=empty",
+                    target_signature=sig,
                     is_public_plugin_interface=True,
+                    detail_code=phase,
                 )
+            wheel_cache[candidate_sha] = out
+            return out
 
-            wt_dir = workdir / f"wt-{step_tag}"
-            site_dir = workdir / f"site-{step_tag}"
-            site_dir.mkdir(parents=True, exist_ok=True)
+        def _probe_kernel_only(candidate_sha: str) -> ProbeOutcome:
+            if candidate_sha in kernel_cache:
+                return kernel_cache[candidate_sha]
+            nonlocal call_counter
+            call_counter += 1
+            wt_dir = workdir / f"kern-{call_counter}-{candidate_sha[:12]}"
             wt_added = False
             try:
                 add_proc = subprocess.run(
@@ -3723,111 +4077,37 @@ def run_source_only_build_triage(
                     timeout=120,
                 )
                 if add_proc.returncode != 0:
-                    return ProbeOutcome(
+                    out = ProbeOutcome(
                         status="infra_error",
-                        stage="wheel_build",
-                        target_signature="VLLM_TARGET_DEVICE=empty",
+                        stage="kernel_port_check",
+                        target_signature="csrc/upstream",
                     )
+                    kernel_cache[candidate_sha] = out
+                    return out
                 wt_added = True
-
-                use_torch = wt_dir / "tools" / "use_existing_torch.py"
-                if use_torch.is_file():
-                    torch_proc = subprocess.run(
-                        [python_exe, str(use_torch)],
-                        cwd=str(wt_dir),
-                        env=base_env,
-                        capture_output=True,
-                        text=True,
-                        timeout=120,
-                    )
-                    if torch_proc.returncode != 0:
-                        return ProbeOutcome(
-                            status="infra_error",
-                            stage="wheel_build",
-                            target_signature="VLLM_TARGET_DEVICE=empty",
-                        )
-
-                install_proc = subprocess.run(
-                    [
-                        python_exe,
-                        "-m",
-                        "pip",
-                        "install",
-                        "--no-build-isolation",
-                        "--no-deps",
-                        "--target",
-                        str(site_dir),
-                        str(wt_dir),
-                    ],
-                    cwd=str(wt_dir),
-                    env=base_env,
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout_sec,
-                )
-                if install_proc.returncode != 0:
-                    _phase, _src, is_infra = _classify_install_failure(
-                        install_proc.returncode,
-                        install_proc.stderr,
-                        install_proc.stdout,
-                        mode="cpu_empty_build",
-                    )
-                    if is_infra:
-                        return ProbeOutcome(
-                            status="infra_error",
-                            stage="wheel_build",
-                            target_signature="VLLM_TARGET_DEVICE=empty",
-                        )
-                    return ProbeOutcome(
-                        status="fail",
-                        stage="wheel_build",
-                        target_signature="VLLM_TARGET_DEVICE=empty",
-                        is_public_plugin_interface=True,
-                    )
-
-                check_env = dict(base_env)
-                check_env["PYTHONPATH"] = str(site_dir)
-                check_proc = subprocess.run(
-                    [python_exe, str(check_script)],
-                    cwd=str(workdir),
-                    env=check_env,
-                    capture_output=True,
-                    text=True,
-                    timeout=120,
-                )
-                if check_proc.returncode != 0:
-                    if _is_infra_process_failure(
-                        check_proc.returncode, check_proc.stderr, check_proc.stdout
-                    ):
-                        return ProbeOutcome(
-                            status="infra_error",
-                            stage="wheel_build",
-                            target_signature="VLLM_TARGET_DEVICE=empty",
-                        )
-                    return ProbeOutcome(
-                        status="fail",
-                        stage="wheel_build",
-                        target_signature="VLLM_TARGET_DEVICE=empty",
-                        is_public_plugin_interface=True,
-                    )
-
-                kernel_problems = check_kernel_manifest_compatibility(
+                problems = check_kernel_manifest_compatibility(
                     wt_dir, sail_root=sail_root
                 )
-                if kernel_problems:
-                    return ProbeOutcome(
+                if problems:
+                    out = ProbeOutcome(
                         status="fail",
                         stage="kernel_port_check",
-                        target_signature=kernel_problems[0],
+                        target_signature=problems[0],
                         is_public_plugin_interface=False,
+                        detail_code="kernel_port_check",
                     )
-                return ProbeOutcome(status="pass")
+                else:
+                    out = ProbeOutcome(status="pass", detail_code="pass")
+                kernel_cache[candidate_sha] = out
+                return out
             except subprocess.TimeoutExpired:
-                return ProbeOutcome(
+                out = ProbeOutcome(
                     status="infra_error",
-                    stage="wheel_build",
-                    target_signature="VLLM_TARGET_DEVICE=empty",
+                    stage="kernel_port_check",
+                    target_signature="csrc/upstream",
                 )
+                kernel_cache[candidate_sha] = out
+                return out
             finally:
                 if wt_added:
                     subprocess.run(
@@ -3845,13 +4125,13 @@ def run_source_only_build_triage(
                         timeout=60,
                     )
 
-        # 1. Control-first check on known-good baseline (`last_green_sha` or `verified_pin`).
-        ctrl_outcome = _probe_source_sha(control)
+        # 1. Control-first mandatory wheel-build check on `control`.
+        ctrl_outcome = _probe_wheel_only(control)
         if ctrl_outcome.status != "pass":
             return _write_cpu_and_bisect(
                 cpu_status="infra_error",
                 stage="wheel_build",
-                target_sig="VLLM_TARGET_DEVICE=empty",
+                target_sig=ctrl_outcome.target_signature or "VLLM_TARGET_DEVICE=empty",
                 is_public=False,
                 bisect_status="baseline_control_failed",
                 first_failing="",
@@ -3883,8 +4163,121 @@ def run_source_only_build_triage(
                 ],
             )
 
-        # 2. Candidate source check on `target_sha`.
-        red_outcome = _probe_source_sha(target)
+        # 2. Candidate mandatory wheel-build check on `target`.
+        red_wheel = _probe_wheel_only(target)
+        if red_wheel.status == "infra_error":
+            return _write_cpu_and_bisect(
+                cpu_status="infra_error",
+                stage="wheel_build",
+                target_sig=red_wheel.target_signature or "VLLM_TARGET_DEVICE=empty",
+                is_public=False,
+                bisect_status="aborted_infra_error",
+                first_failing="",
+                last_good=control,
+                steps_executed=2,
+                probe_steps_on_range=0,
+                history=[
+                    {"sha": control, "role": "baseline_control", "status": "pass"},
+                    {"sha": target, "role": "target_head", "status": "infra_error"},
+                ],
+            )
+
+        # 2A. If upstream wheel build itself passed on `target`, check SAIL Tier-A kernel manifest independently.
+        if red_wheel.status == "pass" and not probe_cmd.strip():
+            ctrl_kern = _probe_kernel_only(control)
+            if ctrl_kern.status != "pass":
+                return _write_cpu_and_bisect(
+                    cpu_status="infra_error",
+                    stage="wheel_build",
+                    target_sig="VLLM_TARGET_DEVICE=empty",
+                    is_public=False,
+                    bisect_status="baseline_control_failed",
+                    first_failing="",
+                    last_good=control,
+                    steps_executed=3,
+                    probe_steps_on_range=0,
+                    history=[
+                        {
+                            "sha": control,
+                            "role": "baseline_control",
+                            "status": ctrl_kern.status,
+                        },
+                        {"sha": target, "role": "target_head", "status": "pass"},
+                    ],
+                )
+            red_kern = _probe_kernel_only(target)
+            if red_kern.status != "fail":
+                return _write_cpu_and_bisect(
+                    cpu_status="infra_error",
+                    stage="wheel_build",
+                    target_sig="VLLM_TARGET_DEVICE=empty",
+                    is_public=False,
+                    bisect_status="aborted_infra_error",
+                    first_failing="",
+                    last_good=control,
+                    steps_executed=2,
+                    probe_steps_on_range=0,
+                    history=[
+                        {"sha": control, "role": "baseline_control", "status": "pass"},
+                        {"sha": target, "role": "target_head", "status": "pass"},
+                    ],
+                )
+            commits = resolve_complete_first_parent_range(vllm_repo, control, target)
+            kern_hist = [
+                {"sha": control, "role": "baseline_control", "status": "pass"},
+                {"sha": target, "role": "target_head", "status": "fail"},
+            ]
+            if not commits:
+                return _write_cpu_and_bisect(
+                    cpu_status="fail",
+                    stage="kernel_port_check",
+                    target_sig=red_kern.target_signature,
+                    is_public=False,
+                    bisect_status="unresolved_history",
+                    first_failing="",
+                    last_good=control,
+                    steps_executed=2,
+                    probe_steps_on_range=0,
+                    history=kern_hist,
+                )
+            k_res = bisect_first_failing_sha(
+                last_green_sha=control,
+                red_sha=target,
+                commits=commits,
+                probe_fn=_probe_kernel_only,
+                verify_baseline_first=False,
+                initial_red_outcome=red_kern,
+            )
+            k_steps = int(k_res["steps_executed"]) + 2
+            k_merged = kern_hist + list(k_res["history"])
+            if k_res["bisect_status"] != "converged":
+                return _write_cpu_and_bisect(
+                    cpu_status="infra_error",
+                    stage="wheel_build",
+                    target_sig="VLLM_TARGET_DEVICE=empty",
+                    is_public=False,
+                    bisect_status=k_res["bisect_status"],
+                    first_failing="",
+                    last_good=control,
+                    steps_executed=k_steps,
+                    probe_steps_on_range=int(k_res["probe_steps_on_range"]),
+                    history=k_merged,
+                )
+            k_win: ProbeOutcome = k_res["winning_outcome"]
+            return _write_cpu_and_bisect(
+                cpu_status="fail",
+                stage="kernel_port_check",
+                target_sig=k_win.target_signature,
+                is_public=False,
+                bisect_status="converged",
+                first_failing=k_res["first_failing_sha"],
+                last_good=k_res["last_good_sha"],
+                steps_executed=k_steps,
+                probe_steps_on_range=int(k_res["probe_steps_on_range"]),
+                history=k_merged,
+            )
+
+        red_outcome = red_wheel
         base_hist = [
             {"sha": control, "role": "baseline_control", "status": "pass"},
             {"sha": target, "role": "target_head", "status": red_outcome.status},
@@ -3918,11 +4311,39 @@ def run_source_only_build_triage(
                 history=base_hist,
             )
 
+        # 2B. Match `target`'s observed wheel-build failure during bisection so earlier
+        # non-matching failures (e.g., Tier-A drift or a different phase where wheels still built)
+        # cannot shadow the actual target build break.
+        def _matches_target_failure(cand: ProbeOutcome) -> bool:
+            if cand.status != "fail" or cand.stage != red_outcome.stage:
+                return False
+            if (
+                red_outcome.detail_code
+                and cand.detail_code
+                and cand.detail_code != red_outcome.detail_code
+            ):
+                return False
+            if (
+                red_outcome.target_signature
+                and cand.target_signature
+                and cand.target_signature != red_outcome.target_signature
+            ):
+                return False
+            return True
+
+        def _probe_matching_target(candidate_sha: str) -> ProbeOutcome:
+            raw = _probe_wheel_only(candidate_sha)
+            if raw.status == "infra_error":
+                return raw
+            if _matches_target_failure(raw):
+                return raw
+            return ProbeOutcome(status="pass", detail_code="pass")
+
         res = bisect_first_failing_sha(
             last_green_sha=control,
             red_sha=target,
             commits=commits,
-            probe_fn=_probe_source_sha,
+            probe_fn=_probe_matching_target,
             verify_baseline_first=False,
             initial_red_outcome=red_outcome,
         )
@@ -3932,7 +4353,7 @@ def run_source_only_build_triage(
             return _write_cpu_and_bisect(
                 cpu_status="infra_error",
                 stage="wheel_build",
-                target_sig="VLLM_TARGET_DEVICE=empty",
+                target_sig=red_outcome.target_signature or "VLLM_TARGET_DEVICE=empty",
                 is_public=False,
                 bisect_status=res["bisect_status"],
                 first_failing="",
@@ -3942,7 +4363,11 @@ def run_source_only_build_triage(
                 history=merged_hist,
             )
 
+        chosen_good = str(res["last_good_sha"])
+        chosen_bad = str(res["first_failing_sha"])
         win: ProbeOutcome = res["winning_outcome"]
+
+        # 3. Verify the failure across the chosen `(last_good_sha, first_failing_sha)` boundary.
         final_cpu_status = "fail"
         repro_dict: dict[str, Any] | None = None
         if win.is_public_plugin_interface or win.stage in (
@@ -3951,17 +4376,87 @@ def run_source_only_build_triage(
         ):
             repro_ev = verify_non_ppu_reproducer(
                 vllm_repo=vllm_repo,
-                last_good_sha=res["last_good_sha"],
-                first_failing_sha=res["first_failing_sha"],
+                last_good_sha=chosen_good,
+                first_failing_sha=chosen_bad,
                 stage=win.stage,
                 target_signature=win.target_signature,
                 probe_cmd=probe_cmd,
                 python_exe=python_exe,
                 timeout_sec=timeout_sec,
             )
+            # Fallback if an intermediate revision failed a different phase (making `chosen_good`
+            # fail `repro_check.py`) or if non-monotonic history reverted and re-broke before `target`.
+            if not repro_ev.verified and not repro_ev.infra_error:
+                raw_good_probe = _probe_wheel_only(chosen_good)
+                if raw_good_probe.status == "fail" and chosen_good != control:
+                    prefix_idx = commits.index(chosen_good)
+                    prefix_commits = commits[: prefix_idx + 1]
+                    any_res = bisect_first_failing_sha(
+                        last_green_sha=control,
+                        red_sha=chosen_good,
+                        commits=prefix_commits,
+                        probe_fn=lambda s: (
+                            _probe_wheel_only(s)
+                            if _probe_wheel_only(s).stage in ("none", "wheel_build")
+                            else ProbeOutcome(status="pass", detail_code="pass")
+                        ),
+                        verify_baseline_first=False,
+                        initial_red_outcome=raw_good_probe,
+                    )
+                    if any_res["bisect_status"] == "converged":
+                        alt_win: ProbeOutcome = any_res["winning_outcome"]
+                        alt_ev = verify_non_ppu_reproducer(
+                            vllm_repo=vllm_repo,
+                            last_good_sha=str(any_res["last_good_sha"]),
+                            first_failing_sha=str(any_res["first_failing_sha"]),
+                            stage=alt_win.stage,
+                            target_signature=alt_win.target_signature,
+                            probe_cmd=probe_cmd,
+                            python_exe=python_exe,
+                            timeout_sec=timeout_sec,
+                        )
+                        if alt_ev.verified:
+                            chosen_good = str(any_res["last_good_sha"])
+                            chosen_bad = str(any_res["first_failing_sha"])
+                            win = alt_win
+                            repro_ev = alt_ev
+                            total_steps += int(any_res["steps_executed"])
+                            merged_hist.extend(list(any_res["history"]))
+                elif chosen_bad != target and len(commits) >= 2:
+                    parent_sha = commits[-2]
+                    parent_probe = _probe_wheel_only(parent_sha)
+                    total_steps += 1
+                    merged_hist.append(
+                        {
+                            "sha": parent_sha,
+                            "role": "boundary_recheck",
+                            "status": parent_probe.status,
+                        }
+                    )
+                    if parent_probe.status == "pass":
+                        alt_ev = verify_non_ppu_reproducer(
+                            vllm_repo=vllm_repo,
+                            last_good_sha=parent_sha,
+                            first_failing_sha=target,
+                            stage=red_outcome.stage,
+                            target_signature=red_outcome.target_signature,
+                            probe_cmd=probe_cmd,
+                            python_exe=python_exe,
+                            timeout_sec=timeout_sec,
+                        )
+                        if alt_ev.verified:
+                            chosen_good = parent_sha
+                            chosen_bad = target
+                            win = red_outcome
+                            repro_ev = alt_ev
+
             repro_dict = repro_ev.to_public_dict()
             _write_sanitized(repro_json_path, repro_dict)
-            if repro_ev.infra_error:
+            if repro_ev.infra_error or (
+                win.stage == "wheel_build"
+                and not probe_cmd.strip()
+                and not repro_ev.verified
+            ):
                 final_cpu_status = "infra_error"
 
         out = _write_cpu_and_bisect(
@@ -3969,9 +4464,13 @@ def run_source_only_build_triage(
             stage=win.stage,
             target_sig=win.target_signature,
             is_public=win.is_public_plugin_interface,
-            bisect_status="converged",
-            first_failing=res["first_failing_sha"],
-            last_good=res["last_good_sha"],
+            bisect_status=(
+                "aborted_infra_error"
+                if final_cpu_status == "infra_error"
+                else "converged"
+            ),
+            first_failing="" if final_cpu_status == "infra_error" else chosen_bad,
+            last_good=control if final_cpu_status == "infra_error" else chosen_good,
             steps_executed=total_steps,
             probe_steps_on_range=int(res["probe_steps_on_range"]),
             history=merged_hist,

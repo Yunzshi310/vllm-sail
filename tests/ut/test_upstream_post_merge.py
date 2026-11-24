@@ -4087,3 +4087,332 @@ def test_review_pr374_four_inline_comments_end_to_end(tmp_path, monkeypatch):
     assert ev_eg.verified is False
     assert ev_eg.infra_error is True
     assert ev_eg.failure_source == "infra_or_unknown"
+
+
+def test_review_pr374_rereview_mandatory_rust_and_target_matched_bisect(
+    tmp_path: Path,
+) -> None:
+    """Regression test for review #6035578476 (2 P1s: r4677055119 & r4677055123)."""
+    # Lightweight python wrapper implementing `-m pip install ... --target <site> <src>`
+    # without requiring external `setuptools` in bare CI/host Python environments.
+    py_shim = tmp_path / "py_pip_shim.py"
+    py_shim.write_text(
+        f"#!{sys.executable}\n"
+        "import os, shutil, subprocess, sys\n"
+        "from pathlib import Path\n"
+        "argv = sys.argv[1:]\n"
+        'if len(argv) >= 3 and argv[0] == "-m" and argv[1] == "pip" and argv[2] == "install":\n'
+        '    t_idx = argv.index("--target")\n'
+        "    site_dir = Path(argv[t_idx + 1])\n"
+        "    src_dir = Path(argv[-1])\n"
+        '    setup_py = src_dir / "setup.py"\n'
+        "    if setup_py.is_file():\n"
+        f'        r = subprocess.run(["{sys.executable}", str(setup_py)], cwd=str(src_dir))\n'
+        "        if r.returncode != 0:\n"
+        "            raise SystemExit(r.returncode)\n"
+        "    site_dir.mkdir(parents=True, exist_ok=True)\n"
+        '    dst = site_dir / "vllm"\n'
+        "    if dst.exists():\n"
+        "        shutil.rmtree(dst)\n"
+        '    pkg_src = src_dir / "vllm"\n'
+        '    skip_rs = os.environ.get("TEST_OMIT_INSTALLED_VLLM_RS") == "1"\n'
+        "    shutil.copytree(\n"
+        "        pkg_src,\n"
+        "        dst,\n"
+        '        ignore=(lambda _d, names: ["vllm-rs"] if skip_rs and "vllm-rs" in names else []),\n'
+        "    )\n"
+        "    raise SystemExit(0)\n"
+        f'os.execv("{sys.executable}", ["{sys.executable}", *argv])\n',
+        encoding="utf-8",
+    )
+    py_shim.chmod(0o755)
+
+    def _init_sail_fixture(sail_dir: Path) -> None:
+        for rel in (
+            "csrc/upstream/torch_bindings.cpp",
+            "csrc/upstream/moe/torch_bindings.cpp",
+        ):
+            p = sail_dir / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text("// healthy bindings\n", encoding="utf-8")
+        mf = sail_dir / "csrc/upstream/manifest.toml"
+        mf.write_text(
+            'compiled_tiers = ["a"]\n[[entry]]\ntier = "a"\npath = "csrc/kernel.cu"\nops = []\n',
+            encoding="utf-8",
+        )
+
+    def _init_upstream_repo(repo_dir: Path):
+        repo_dir.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "init", "-q", str(repo_dir)], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo_dir), "config", "user.email", "ci@example.com"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(repo_dir), "config", "user.name", "CI"], check=True
+        )
+        for rel in (
+            "csrc/torch_bindings.cpp",
+            "csrc/moe/torch_bindings.cpp",
+            "csrc/kernel.cu",
+        ):
+            p = repo_dir / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text("// healthy\n", encoding="utf-8")
+        (repo_dir / "vllm").mkdir(parents=True, exist_ok=True)
+        (repo_dir / "vllm/__init__.py").write_text(
+            "__version__ = '1.0'\n", encoding="utf-8"
+        )
+
+        def _commit(msg: str) -> str:
+            subprocess.run(["git", "-C", str(repo_dir), "add", "-A"], check=True)
+            subprocess.run(
+                ["git", "-C", str(repo_dir), "commit", "-qm", msg], check=True
+            )
+            return subprocess.check_output(
+                ["git", "-C", str(repo_dir), "rev-parse", "HEAD"], text=True
+            ).strip()
+
+        return _commit
+
+    sail_dir = tmp_path / "sail"
+    _init_sail_fixture(sail_dir)
+
+    # --- 1a. [P1 r4677055119] Optional-by-default native/Rust flag (`VLLM_REQUIRE_RUST_FRONTEND=1`) ---
+    opt_repo = tmp_path / "opt-repo"
+    commit_opt = _init_upstream_repo(opt_repo)
+    (opt_repo / "native.c").write_text("int ok(void) { return 0; }\n", encoding="utf-8")
+    (opt_repo / "setup.py").write_text(
+        "import os, pathlib, sys\n"
+        "req = os.getenv('VLLM_REQUIRE_RUST_FRONTEND', '').strip().lower() in ('1', 'true', 'yes', 'on')\n"
+        "src = pathlib.Path('native.c').read_text(encoding='utf-8')\n"
+        "if '#error' in src and req:\n"
+        "    sys.stderr.write('native.c:1:2: error: native probe compile regression\\n')\n"
+        "    raise SystemExit(1)\n",
+        encoding="utf-8",
+    )
+    opt_good = commit_opt("control")
+    (opt_repo / "native.c").write_text(
+        "#error native probe compile regression\n", encoding="utf-8"
+    )
+    opt_bad = commit_opt("break mandatory native build")
+
+    opt_out = tmp_path / "opt-out"
+    res_opt = post_merge.run_source_only_build_triage(
+        vllm_repo=opt_repo,
+        sail_root=sail_dir,
+        target_sha=opt_bad,
+        verified_pin=opt_good,
+        last_green_sha=opt_good,
+        output_dir=opt_out,
+        python_exe=str(py_shim),
+    )
+    assert res_opt["bisect"]["bisect_status"] == "converged"
+    assert res_opt["bisect"]["first_failing_sha"] == opt_bad
+    assert res_opt["bisect"]["last_good_sha"] == opt_good
+    assert res_opt["non_ppu_repro"]["verified"] is True
+
+    opt_pub = tmp_path / "opt-pub"
+    opt_pin = tmp_path / "opt.pin"
+    opt_pin.write_text(opt_good + "\n", encoding="utf-8")
+    assert (
+        post_merge.main(
+            [
+                "publish",
+                "--gear",
+                "probe",
+                "--status",
+                "fail",
+                "--sail-sha",
+                _sha(970),
+                "--upstream-sha",
+                opt_bad,
+                "--verified-pin-file",
+                str(opt_pin),
+                "--failure-stage",
+                "wheel_build",
+                "--cpu-result-json",
+                str(opt_out / "cpu-result.json"),
+                "--bisect-result-json",
+                str(opt_out / "bisect-result.json"),
+                "--non-ppu-repro-json",
+                str(opt_out / "non-ppu-repro.json"),
+                "--public-dir",
+                str(opt_pub),
+            ]
+        )
+        == 0
+    )
+    opt_sum = json.loads((opt_pub / "public-summary.json").read_text(encoding="utf-8"))
+    opt_iss = json.loads((opt_pub / "issue-payload.json").read_text(encoding="utf-8"))
+    assert opt_sum["triage"]["classification"] == "plugin_interface_break"
+    assert opt_iss["should_file_sail_issue"] is False
+    assert "VLLM_REQUIRE_RUST_FRONTEND=1" in opt_iss["upstream_reproducer_markdown"]
+    assert "tools/build_rust.py --release" in opt_iss["upstream_reproducer_markdown"]
+
+    # --- 1b & 1c. [P1 r4677055119] `tools/build_rust.py --release` rustc error & missing `vllm-rs` artifact ---
+    rust_repo = tmp_path / "rust-repo"
+    commit_rust = _init_upstream_repo(rust_repo)
+    (rust_repo / "setup.py").write_text("", encoding="utf-8")
+    (rust_repo / "tools").mkdir(parents=True, exist_ok=True)
+    (rust_repo / "tools/build_rust.py").write_text(
+        "from pathlib import Path\n"
+        "def rust_py_extension_module_names():\n"
+        "    return ['_rust_tool_parser']\n"
+        "if __name__ == '__main__':\n"
+        "    vdir = Path(__file__).resolve().parents[1] / 'vllm'\n"
+        "    (vdir / 'vllm-rs').write_bytes(b'#!/bin/sh\\necho vllm-rs\\n')\n"
+        "    (vdir / '_rust_tool_parser.abi3.so').write_bytes(b'ELF')\n",
+        encoding="utf-8",
+    )
+    rust_good = commit_rust("control with vllm-rs and _rust_tool_parser")
+
+    # 1b: rustc syntax error (without [E0425] code) in `rust/src/cmd/src/main.rs`
+    (rust_repo / "tools/build_rust.py").write_text(
+        "import sys\n"
+        "def rust_py_extension_module_names():\n"
+        "    return ['_rust_tool_parser']\n"
+        "if __name__ == '__main__':\n"
+        "    sys.stderr.write('error: expected `;`, found `}`\\n  --> rust/src/cmd/src/main.rs:19:5\\n')\n"
+        "    raise SystemExit(101)\n",
+        encoding="utf-8",
+    )
+    rust_compile_bad = commit_rust("break rust/src/cmd/src/main.rs")
+    rc_out = tmp_path / "rust-compile-out"
+    res_rc = post_merge.run_source_only_build_triage(
+        vllm_repo=rust_repo,
+        sail_root=sail_dir,
+        target_sha=rust_compile_bad,
+        verified_pin=rust_good,
+        last_green_sha=rust_good,
+        output_dir=rc_out,
+        python_exe=str(py_shim),
+    )
+    assert res_rc["bisect"]["bisect_status"] == "converged"
+    assert res_rc["bisect"]["first_failing_sha"] == rust_compile_bad
+    assert res_rc["bisect"]["target_signature"] == "rust_frontend_build"
+    assert res_rc["non_ppu_repro"]["verified"] is True
+
+    # 1c: `tools/build_rust.py --release` exits 0 without producing `vllm/vllm-rs`
+    subprocess.run(
+        ["git", "-C", str(rust_repo), "checkout", "-q", rust_good], check=True
+    )
+    (rust_repo / "tools/build_rust.py").write_text(
+        "def rust_py_extension_module_names():\n"
+        "    return []\n"
+        "if __name__ == '__main__':\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+    rust_missing_bin = commit_rust("silently drop vllm-rs artifact")
+    rm_out = tmp_path / "rust-missing-out"
+    res_rm = post_merge.run_source_only_build_triage(
+        vllm_repo=rust_repo,
+        sail_root=sail_dir,
+        target_sha=rust_missing_bin,
+        verified_pin=rust_good,
+        last_green_sha=rust_good,
+        output_dir=rm_out,
+        python_exe=str(py_shim),
+    )
+    assert res_rm["bisect"]["bisect_status"] == "converged"
+    assert res_rm["bisect"]["first_failing_sha"] == rust_missing_bin
+    assert res_rm["non_ppu_repro"]["verified"] is True
+    assert res_rm["non_ppu_repro"]["first_failing_phase"] == "build_import"
+    assert res_rm["non_ppu_repro"]["failure_source"] == "upstream_import_check"
+
+    # 1d: Cargo network / missing toolchain errors classify as `infra_error`, never upstream!
+    for infra_err in (
+        "error: failed to download from `https://rsproxy.cn/crates.io-index`",
+        "error: can't find Rust compiler",
+        "Traceback (most recent call last):\n"
+        '  File "/tmp/vllm/tools/build_rust.py", line 13, in <module>\n'
+        "    from setuptools_rust import RustExtension\n"
+        "ModuleNotFoundError: No module named 'setuptools_rust'",
+    ):
+        ph, fsrc, is_inf = post_merge._classify_install_failure(
+            1, infra_err, "", mode="cpu_empty_build"
+        )
+        assert (ph, fsrc, is_inf) == ("infra_error", "infra_or_unknown", True)
+
+    # --- 2a. [P1 r4677055123] Mixed Tier-A drift (still builds wheel) + later `setup.py` break ---
+    mix_repo = tmp_path / "mix-repo"
+    commit_mix = _init_upstream_repo(mix_repo)
+    (mix_repo / "setup.py").write_text("", encoding="utf-8")
+    mix_good = commit_mix("control")
+    (mix_repo / "csrc/kernel.cu").unlink()
+    mix_drift = commit_mix("move Tier-A kernel file; Python wheel still builds")
+    (mix_repo / "setup.py").write_text(
+        'raise RuntimeError("invalid upstream build configuration")\n',
+        encoding="utf-8",
+    )
+    mix_bad = commit_mix("break setup.py packaging")
+
+    mix_out = tmp_path / "mix-out"
+    res_mix = post_merge.run_source_only_build_triage(
+        vllm_repo=mix_repo,
+        sail_root=sail_dir,
+        target_sha=mix_bad,
+        verified_pin=mix_good,
+        last_green_sha=mix_good,
+        output_dir=mix_out,
+        python_exe=str(py_shim),
+    )
+    assert res_mix["bisect"]["bisect_status"] == "converged"
+    assert res_mix["bisect"]["first_failing_sha"] == mix_bad
+    assert res_mix["bisect"]["last_good_sha"] == mix_drift
+    assert res_mix["non_ppu_repro"]["verified"] is True
+
+    mix_pub = tmp_path / "mix-pub"
+    mix_pin = tmp_path / "mix.pin"
+    mix_pin.write_text(mix_good + "\n", encoding="utf-8")
+    assert (
+        post_merge.main(
+            [
+                "publish",
+                "--gear",
+                "probe",
+                "--status",
+                "fail",
+                "--sail-sha",
+                _sha(971),
+                "--upstream-sha",
+                mix_bad,
+                "--verified-pin-file",
+                str(mix_pin),
+                "--failure-stage",
+                "wheel_build",
+                "--cpu-result-json",
+                str(mix_out / "cpu-result.json"),
+                "--bisect-result-json",
+                str(mix_out / "bisect-result.json"),
+                "--non-ppu-repro-json",
+                str(mix_out / "non-ppu-repro.json"),
+                "--public-dir",
+                str(mix_pub),
+            ]
+        )
+        == 0
+    )
+    mix_sum = json.loads((mix_pub / "public-summary.json").read_text(encoding="utf-8"))
+    mix_iss = json.loads((mix_pub / "issue-payload.json").read_text(encoding="utf-8"))
+    assert mix_sum["triage"]["classification"] == "plugin_interface_break"
+    assert mix_sum["bisect"]["first_failing_sha"] == mix_bad
+    assert mix_iss["should_file_sail_issue"] is False
+    assert bool(mix_iss["upstream_reproducer_markdown"]) is True
+
+    # --- 2b. [P1 r4677055123] Independent Tier-A `kernel_port_check` triage when wheel builds at target ---
+    kern_out = tmp_path / "kern-only-out"
+    res_kern = post_merge.run_source_only_build_triage(
+        vllm_repo=mix_repo,
+        sail_root=sail_dir,
+        target_sha=mix_drift,
+        verified_pin=mix_good,
+        last_green_sha=mix_good,
+        output_dir=kern_out,
+        python_exe=str(py_shim),
+    )
+    assert res_kern["bisect"]["bisect_status"] == "converged"
+    assert res_kern["bisect"]["stage"] == "kernel_port_check"
+    assert res_kern["bisect"]["first_failing_sha"] == mix_drift
+    assert not (kern_out / "non-ppu-repro.json").exists()
