@@ -129,11 +129,12 @@ VALID_REPRO_PHASES = (
 _INFRA_EXIT_CODES = frozenset({124, 126, 127, 137})
 _INSTALL_INFRA_ERROR_RE = re.compile(
     r"(?i)(?:"
-    r"no space left on device|\berrno\s+28\b"
-    r"|cannot allocate memory|\berrno\s+12\b|\bmemoryerror\b"
-    r"|read-only file system|\berrno\s+30\b"
-    r"|too many open files|\berrno\s+24\b"
-    r"|permissionerror|permission denied|\berrno\s+13\b"
+    r"could not install packages due to an oserror"
+    r"|\[errno\s+(?!2\b)\d+\]|\berrno\s+(?!2\b)\d+\b"
+    r"|no space left on device|disk quota exceeded|input/output error|stale file handle"
+    r"|cannot allocate memory|\bmemoryerror\b"
+    r"|read-only file system|too many open files|broken pipe"
+    r"|permissionerror|permission denied|bus error|segmentation fault"
     r"|temporary failure in name resolution|name or service not known|nodename nor servname"
     r"|connectionerror|connectionreseterror|connectionrefusederror"
     r"|readtimeouterror|connecttimeouterror|newconnectionerror|maxretryerror"
@@ -141,6 +142,16 @@ _INSTALL_INFRA_ERROR_RE = re.compile(
     r"|could not find a version that satisfies"
     r"|no module named ['\"]?pip['\"]?|command not found"
     r"|\bkilled\b|\bsigkill\b"
+    r")"
+)
+_BUILD_SOURCE_FAILURE_RE = re.compile(
+    r"(?i)(?:"
+    r"building wheel for vllm|getting requirements to build|preparing metadata \(pyproject\.toml\)"
+    r"|metadata-generation-failed|subprocess-exited-with-error"
+    r"|setup\.py|pyproject\.toml|rust-toolchain\.toml|cargo\.toml|cmakelists\.txt"
+    r"|syntaxerror|indentationerror|importerror|modulenotfounderror|runtimeerror"
+    r"|valueerror|typeerror|attributeerror|keyerror|assertionerror|nameerror"
+    r"|calledprocesserror|distutilserror|setuptoolserror|cmake error|rustc|cargo build"
     r")"
 )
 VALID_PPU_SKIP_REASONS = (
@@ -1689,6 +1700,20 @@ def _is_infra_process_failure(
     return _INSTALL_INFRA_ERROR_RE.search(combined) is not None
 
 
+def _classify_install_failure(
+    returncode: int, stderr: str, stdout: str, *, mode: str
+) -> tuple[str, bool]:
+    """Classify a non-zero install/build exit into ``(phase, is_infra_error)`` fail-closed."""
+    if _is_infra_process_failure(returncode, stderr, stdout):
+        return "infra_error", True
+    if mode != "cpu_empty_build":
+        return "install", False
+    combined = f"{stderr}\n{stdout}"
+    if _BUILD_SOURCE_FAILURE_RE.search(combined) is not None:
+        return "build_install", False
+    return "infra_error", True
+
+
 def is_valid_non_ppu_repro(
     evidence: NonPpuReproEvidence | None,
     *,
@@ -1950,7 +1975,10 @@ def verify_non_ppu_reproducer(
             if executed:
                 return proc.returncode, "build_import", True, False
             if proc.returncode != 0:
-                return proc.returncode, "build_install", False, False
+                phase, is_infra = _classify_install_failure(
+                    proc.returncode, proc.stderr, proc.stdout, mode=mode
+                )
+                return proc.returncode, phase, False, is_infra
             return 0, "install", False, False
 
         base_env["STUB_CHECK_SCRIPT"] = str(check_script)
@@ -2021,15 +2049,13 @@ def verify_non_ppu_reproducer(
                 timeout=timeout_sec,
             )
             if install_proc.returncode != 0:
-                is_infra = _is_infra_process_failure(
-                    install_proc.returncode, install_proc.stderr, install_proc.stdout
+                phase, is_infra = _classify_install_failure(
+                    install_proc.returncode,
+                    install_proc.stderr,
+                    install_proc.stdout,
+                    mode=mode,
                 )
-                if is_infra:
-                    return install_proc.returncode, "infra_error", False, True
-                if mode == "cpu_empty_build":
-                    return install_proc.returncode, "build_install", False, False
-                # In stub_plugin_cpu mode, pip failure prevented the stub check from executing.
-                return install_proc.returncode, "install", False, False
+                return install_proc.returncode, phase, False, is_infra
 
             check_env = dict(base_env)
             py_entries = [str(site_dir)]

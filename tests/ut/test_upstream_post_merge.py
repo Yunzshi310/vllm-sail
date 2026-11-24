@@ -3082,10 +3082,27 @@ def test_review_r1_p1_install_infra_and_unexecuted_stub_cannot_verify_or_classif
     assert ev_no_stub.first_failing_phase == "install"
     assert ev_no_stub.first_failing_check_executed is False
 
-    # Counterexample 3: cpu_empty_build where bad pip fails with ENOSPC / network / SIGKILL -> infra_error, verified=False!
+    # Counterexample 3: cpu_empty_build where bad pip fails with ENOSPC / network / SIGKILL /
+    # Errno 122 (EDQUOT) / Errno 5 (EIO) / Errno 116 (ESTALE) / opaque error -> infra_error, verified=False!
     for err_rc, err_msg in (
         (1, "OSError: [Errno 28] No space left on device"),
+        (1, "OSError: [Errno 122] Disk quota exceeded"),
+        (1, "OSError: [Errno 5] Input/output error"),
+        (
+            1,
+            "Building wheel for vllm (pyproject.toml) ... error\n"
+            "OSError: [Errno 122] Disk quota exceeded",
+        ),
+        (1, "OSError: [Errno 116] Stale file handle"),
+        (
+            1,
+            "ERROR: Could not install packages due to an OSError: [Errno 2] host temp missing",
+        ),
         (1, "ConnectionError: Temporary failure in name resolution"),
+        (
+            1,
+            "",
+        ),  # opaque pip failure without any upstream build-backend/source error signal
         (137, "Killed"),
     ):
         fake_build_infra, _ = _make_fake_run(bad_pip_rc=err_rc, bad_pip_stderr=err_msg)
@@ -3097,43 +3114,66 @@ def test_review_r1_p1_install_infra_and_unexecuted_stub_cannot_verify_or_classif
             stage="wheel_build",
             target_signature="VLLM_TARGET_DEVICE=empty",
         )
-        assert ev_build_infra.verified is False
-        assert ev_build_infra.infra_error is True
+        assert ev_build_infra.verified is False, f"leaked infra stderr={err_msg!r}"
+        assert ev_build_infra.infra_error is True, f"not infra stderr={err_msg!r}"
         assert ev_build_infra.first_failing_phase == "infra_error"
+        assert (
+            post_merge.classify_failure(
+                post_merge.ProbeOutcome(
+                    status="fail",
+                    stage="wheel_build",
+                    target_signature="VLLM_TARGET_DEVICE=empty",
+                    is_public_plugin_interface=True,
+                    non_ppu_repro=ev_build_infra,
+                ),
+                last_good_sha=good_sha,
+                first_failing_sha=bad_sha,
+                require_shas=True,
+            )["classification"]
+            == "sail_internal_patch_drift"
+        )
 
-    # Normal control 1: cpu_empty_build where bad pip fails with genuine build error (non-infra) -> verified=True!
-    fake_real_build_fail, _ = _make_fake_run(
-        bad_pip_rc=1,
-        bad_pip_stderr="RuntimeError: VLLM_TARGET_DEVICE=empty unsupported in setup.py",
-    )
-    monkeypatch.setattr(post_merge.subprocess, "run", fake_real_build_fail)
-    ev_real_build = post_merge.verify_non_ppu_reproducer(
-        vllm_repo=tmp_path,
-        last_good_sha=good_sha,
-        first_failing_sha=bad_sha,
-        stage="wheel_build",
-        target_signature="VLLM_TARGET_DEVICE=empty",
-    )
-    assert ev_real_build.verified is True
-    assert ev_real_build.infra_error is False
-    assert ev_real_build.last_good_phase == "build_import"
-    assert ev_real_build.last_good_check_executed is True
-    assert ev_real_build.first_failing_phase == "build_install"
-    assert (
-        post_merge.classify_failure(
-            post_merge.ProbeOutcome(
-                status="fail",
-                stage="wheel_build",
-                target_signature="VLLM_TARGET_DEVICE=empty",
-                is_public_plugin_interface=True,
-                non_ppu_repro=ev_real_build,
-            ),
+    # Normal controls 1 & 2: cpu_empty_build where bad pip fails with genuine upstream build/packaging
+    # error (including FileNotFoundError [Errno 2] inside setup.py / pyproject.toml metadata prep) -> verified=True!
+    for build_err_msg in (
+        "RuntimeError: VLLM_TARGET_DEVICE=empty unsupported in setup.py",
+        "Preparing metadata (pyproject.toml) ... error\n"
+        "FileNotFoundError: [Errno 2] No such file or directory: 'requirements/common.txt'",
+    ):
+        fake_real_build_fail, _ = _make_fake_run(
+            bad_pip_rc=1,
+            bad_pip_stderr=build_err_msg,
+        )
+        monkeypatch.setattr(post_merge.subprocess, "run", fake_real_build_fail)
+        ev_real_build = post_merge.verify_non_ppu_reproducer(
+            vllm_repo=tmp_path,
             last_good_sha=good_sha,
             first_failing_sha=bad_sha,
-            require_shas=True,
-        )["classification"]
-        == "plugin_interface_break"
-    )
+            stage="wheel_build",
+            target_signature="VLLM_TARGET_DEVICE=empty",
+        )
+        assert ev_real_build.verified is True, (
+            f"rejected genuine build err={build_err_msg!r}"
+        )
+        assert ev_real_build.infra_error is False
+        assert ev_real_build.last_good_phase == "build_import"
+        assert ev_real_build.last_good_check_executed is True
+        assert ev_real_build.first_failing_phase == "build_install"
+        assert (
+            post_merge.classify_failure(
+                post_merge.ProbeOutcome(
+                    status="fail",
+                    stage="wheel_build",
+                    target_signature="VLLM_TARGET_DEVICE=empty",
+                    is_public_plugin_interface=True,
+                    non_ppu_repro=ev_real_build,
+                ),
+                last_good_sha=good_sha,
+                first_failing_sha=bad_sha,
+                require_shas=True,
+            )["classification"]
+            == "plugin_interface_break"
+        )
 
     # Counterexample 4: forged serialized JSON claiming verified=True on stub_plugin_cpu
     # while first_failing_check_executed=False / first_failing_phase="install" -> fails closed!
