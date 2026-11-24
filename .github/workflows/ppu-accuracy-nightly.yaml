@@ -41,9 +41,9 @@ name: PPU accuracy nightly
 # that chip. A true 810E lane needs the ppu-scheduler-action route the kernel
 # and perf lanes use, which the local Docker wrapper cannot provide.
 #
-# Schedule: 12:00 UTC = 20:00 CST. The serial accuracy cases are long, so the
-# window is chosen only to start ahead of the 18:30 UTC upstream-reuse and
-# 20:00 UTC perf lanes; the run does not wait for them.
+# Schedule: 16:00 UTC = 00:00 CST. The accuracy cases are long, so the window
+# starts at midnight CST ahead of the 18:30 UTC upstream-reuse and 20:00 UTC
+# perf lanes; the run does not wait for them.
 
 on:
   workflow_dispatch:
@@ -75,7 +75,7 @@ on:
         type: boolean
 
   schedule:
-    - cron: "0 12 * * *"
+    - cron: "0 16 * * *"
 
 permissions:
   contents: read
