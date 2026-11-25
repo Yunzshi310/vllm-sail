@@ -6320,3 +6320,75 @@ def test_review_6057527910_partial_rerun_cursor_exact_sha_rc_ancestry_and_infra_
     assert p12_sbt["bisect"]["bisect_status"] == "converged"
     assert p12_sbt["bisect"]["last_good_sha"] == main_green
     assert p12_sbt["bisect"]["first_failing_sha"] == sha_a
+
+    # Cross-release-line exclusion: `sha_b` revoked on `releases/v0.35.0` must also be excluded
+    # when a newer release line (`releases/v0.36.0`) qualifies `sha_c` via route/bisect/source-build-triage:
+    branch_036 = "releases/v0.36.0"
+    _git("update-ref", f"refs/heads/{branch_036}", sha_c)
+    ls_out_036 = subprocess.run(
+        [
+            "git",
+            "ls-remote",
+            str(repo),
+            "refs/heads/main",
+            "refs/heads/releases/v*",
+            "refs/tags/v*",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    refs_file.write_text(ls_out_036 + "\n", encoding="utf-8")
+    for routed_036 in (
+        _cli_route(rc_b_revoked),
+        _cli_route(rc_b_revoked, vllm_repo_arg=repo),
+    ):
+        assert routed_036["rc_tag"] == branch_036
+        assert routed_036["target_sha"] == sha_c
+        assert routed_036["last_green_sha"] == pin
+        assert sha_b not in routed_036["fallback_green_shas"].split(",")
+
+    p12_cross_bisect = tmp_path / "p12-cross-bisect.json"
+    assert (
+        post_merge.main(
+            [
+                "bisect",
+                "--vllm-repo",
+                str(repo),
+                "--last-green-sha",
+                sha_b,
+                "--rc-tag",
+                branch_036,
+                "--cursor-file",
+                str(rc_b_revoked),
+                "--verified-pin-file",
+                str(pin_file),
+                "--red-sha",
+                sha_c,
+                "--probe-cmd",
+                p12_probe_cmd,
+                "--output-json",
+                str(p12_cross_bisect),
+            ]
+        )
+        == 0
+    )
+    cross_bisect_res = json.loads(p12_cross_bisect.read_text(encoding="utf-8"))
+    assert cross_bisect_res["bisect_status"] == "converged"
+    assert cross_bisect_res["last_good_sha"] == main_green
+    assert cross_bisect_res["first_failing_sha"] == sha_a
+
+    p12_cross_sbt = post_merge.run_source_only_build_triage(
+        vllm_repo=repo,
+        sail_root=REPO_ROOT,
+        target_sha=sha_c,
+        verified_pin=pin,
+        last_green_sha=sha_b,
+        cursor=json.loads(rc_b_revoked.read_text(encoding="utf-8")),
+        rc_tag=branch_036,
+        output_dir=tmp_path / "p12-cross-sbt",
+        probe_cmd=sbt_probe_cmd,
+    )
+    assert p12_cross_sbt["bisect"]["bisect_status"] == "converged"
+    assert p12_cross_sbt["bisect"]["last_good_sha"] == main_green
+    assert p12_cross_sbt["bisect"]["first_failing_sha"] == sha_a

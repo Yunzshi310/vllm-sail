@@ -937,134 +937,63 @@ def _collect_excluded_control_shas(
     )
 
     excluded: set[str] = set()
-    line_passing: set[str] = set()
 
-    if line is not None:
-        major, minor = line
-        branch_key = f"releases/v{major}.{minor}.0"
-        br_entry = rc_branch_states.get(branch_key)
-        line_revoked: set[str] = set()
-        if isinstance(br_entry, dict):
-            raw_rev = br_entry.get("revoked_shas")
-            if isinstance(raw_rev, list):
-                for item in raw_rev:
-                    s = str(item or "").strip()
-                    if SHA1_RE.fullmatch(s):
-                        line_revoked.add(s)
-            if br_entry.get("status") != "pass":
-                br_bad = str(br_entry.get("sha") or "").strip()
-                if SHA1_RE.fullmatch(br_bad):
-                    line_revoked.add(br_bad)
+    # Fail closed across all RC release lines: any SHA with an unrecovered non-pass
+    # RC verdict on any branch or tag cannot serve as a verified green control.
+    for br_ent in rc_branch_states.values():
+        if not isinstance(br_ent, dict):
+            continue
+        for item in br_ent.get("revoked_shas") or ():
+            s = str(item or "").strip()
+            if SHA1_RE.fullmatch(s):
+                excluded.add(s)
+        if br_ent.get("status") != "pass":
+            bs_bad = str(br_ent.get("sha") or "").strip()
+            if SHA1_RE.fullmatch(bs_bad):
+                excluded.add(bs_bad)
+    for tg_ent in rc_tag_states.values():
+        if not isinstance(tg_ent, dict):
+            continue
+        ts_bad = str(tg_ent.get("sha") or "").strip()
+        if tg_ent.get("status") != "pass" and SHA1_RE.fullmatch(ts_bad):
+            excluded.add(ts_bad)
+
+    if line is not None and max_rc_num is not None:
         for tg_name, tg_entry in rc_tag_states.items():
             tm = RC_TAG_RE.fullmatch(tg_name)
             if (
                 tm
                 and (int(tm.group(1)), int(tm.group(2))) == line
+                and int(tm.group(3)) >= max_rc_num
                 and isinstance(tg_entry, dict)
             ):
                 tg_sha = str(tg_entry.get("sha") or "").strip()
-                if tg_entry.get("status") != "pass" and SHA1_RE.fullmatch(tg_sha):
-                    line_revoked.add(tg_sha)
-                if (
-                    max_rc_num is not None
-                    and int(tm.group(3)) >= max_rc_num
-                    and SHA1_RE.fullmatch(tg_sha)
-                ):
+                if SHA1_RE.fullmatch(tg_sha):
                     excluded.add(tg_sha)
-        if max_rc_num is not None:
-            for tg_name, tg_sha in tags_map.items():
-                tm = RC_TAG_RE.fullmatch(tg_name)
-                if (
-                    tm
-                    and (int(tm.group(1)), int(tm.group(2))) == line
-                    and int(tm.group(3)) >= max_rc_num
-                    and SHA1_RE.fullmatch(str(tg_sha or "").strip())
-                ):
-                    excluded.add(str(tg_sha).strip())
-        excluded.update(line_revoked)
-
-        if isinstance(br_entry, dict):
-            for item in br_entry.get("green_history") or ():
-                s = str(item or "").strip()
-                if SHA1_RE.fullmatch(s) and s not in excluded:
-                    line_passing.add(s)
-            lg = str(br_entry.get("last_green_sha") or "").strip()
-            if SHA1_RE.fullmatch(lg) and lg not in excluded:
-                line_passing.add(lg)
-            if br_entry.get("status") == "pass":
-                bs = str(br_entry.get("sha") or "").strip()
-                if SHA1_RE.fullmatch(bs) and bs not in excluded:
-                    line_passing.add(bs)
-        for tg_name, tg_entry in rc_tag_states.items():
+        for tg_name, tg_sha in tags_map.items():
             tm = RC_TAG_RE.fullmatch(tg_name)
             if (
                 tm
                 and (int(tm.group(1)), int(tm.group(2))) == line
-                and isinstance(tg_entry, dict)
-                and tg_entry.get("status") == "pass"
+                and int(tm.group(3)) >= max_rc_num
+                and SHA1_RE.fullmatch(str(tg_sha or "").strip())
             ):
-                ts = str(tg_entry.get("sha") or "").strip()
-                if SHA1_RE.fullmatch(ts) and ts not in excluded:
-                    line_passing.add(ts)
-    else:
-        any_rc_revoked: set[str] = set()
-        any_rc_passing: set[str] = set()
-        for br_ent in rc_branch_states.values():
-            if not isinstance(br_ent, dict):
-                continue
-            br_rev_local: set[str] = set()
-            for item in br_ent.get("revoked_shas") or ():
-                s = str(item or "").strip()
-                if SHA1_RE.fullmatch(s):
-                    br_rev_local.add(s)
-                    any_rc_revoked.add(s)
-            if br_ent.get("status") != "pass":
-                bs_bad = str(br_ent.get("sha") or "").strip()
-                if SHA1_RE.fullmatch(bs_bad):
-                    br_rev_local.add(bs_bad)
-                    any_rc_revoked.add(bs_bad)
-            for item in br_ent.get("green_history") or ():
-                s = str(item or "").strip()
-                if SHA1_RE.fullmatch(s) and s not in br_rev_local:
-                    any_rc_passing.add(s)
-            if br_ent.get("status") == "pass":
-                bs_ok = str(br_ent.get("sha") or "").strip()
-                if SHA1_RE.fullmatch(bs_ok) and bs_ok not in br_rev_local:
-                    any_rc_passing.add(bs_ok)
-        for tg_ent in rc_tag_states.values():
-            if not isinstance(tg_ent, dict):
-                continue
-            ts = str(tg_ent.get("sha") or "").strip()
-            if not SHA1_RE.fullmatch(ts):
-                continue
-            if tg_ent.get("status") == "pass":
-                any_rc_passing.add(ts)
-            else:
-                any_rc_revoked.add(ts)
-        excluded.update(any_rc_revoked - any_rc_passing)
+                excluded.add(str(tg_sha).strip())
 
     if isinstance(state, dict):
         cpu_checked = str(state.get("last_cpu_checked_sha") or "").strip()
         cpu_st = str(state.get("last_cpu_status") or "pass").strip()
         ppu_tested = str(state.get("last_ppu_tested_sha") or "").strip()
         ppu_st = str(state.get("last_ppu_status") or "pass").strip()
-        if (
-            cpu_st != "pass"
-            and SHA1_RE.fullmatch(cpu_checked)
-            and cpu_checked not in line_passing
-        ):
+        if cpu_st != "pass" and SHA1_RE.fullmatch(cpu_checked):
             excluded.add(cpu_checked)
-        if (
-            ppu_st != "pass"
-            and SHA1_RE.fullmatch(ppu_tested)
-            and ppu_tested not in line_passing
-        ):
+        if ppu_st != "pass" and SHA1_RE.fullmatch(ppu_tested):
             excluded.add(ppu_tested)
         for rec in state.get("probe_history") or ():
             if not isinstance(rec, dict):
                 continue
             up_sha = str(rec.get("upstream_sha") or "").strip()
-            if not SHA1_RE.fullmatch(up_sha) or up_sha in line_passing:
+            if not SHA1_RE.fullmatch(up_sha):
                 continue
             if rec.get("cpu_status") in ("fail", "infra_error") or rec.get(
                 "ppu_status"
