@@ -367,14 +367,24 @@ def _parse_flag_entries(tokens: list[str]) -> list[tuple[str, str | None, bool]]
             raise ValidationError(f"expected --flag token, got {tok!r}")
         if "=" in tok:
             flag, val = tok.split("=", 1)
-            entries.append((flag, val, True))
-            idx += 1
+            has_eq = True
+            step = 1
         elif idx + 1 < len(tokens) and not str(tokens[idx + 1]).startswith("--"):
-            entries.append((tok, str(tokens[idx + 1]), False))
-            idx += 2
+            flag, val = tok, str(tokens[idx + 1])
+            has_eq = False
+            step = 2
         else:
-            entries.append((tok, None, False))
-            idx += 1
+            flag, val = tok, None
+            has_eq = False
+            step = 1
+        opt_head = flag.split(".", 1)[0]
+        if len(opt_head) <= 2 or "_" in opt_head:
+            raise ValidationError(
+                f"CLI flag {flag!r} must use canonical hyphenated spelling "
+                f"({opt_head.replace('_', '-')!r})"
+            )
+        entries.append((flag, val, has_eq))
+        idx += step
     return entries
 
 
@@ -1483,10 +1493,18 @@ def _compute_parallel_and_dp_local(
     cli_world = cli_dp_val * world_within_dp
 
     dist_exec_backend = _flag_value(entries, "--distributed-executor-backend")
-    if topo_nodes == 1 and dist_exec_backend == "external_launcher":
-        raise ValidationError(
-            f"{context}: single-node launch cannot use --distributed-executor-backend external_launcher"
-        )
+    if dist_exec_backend is not None:
+        allowed_exec = {"mp", "ray", "uni"} if topo_nodes == 1 else {"mp", "ray"}
+        if dist_exec_backend not in allowed_exec:
+            raise ValidationError(
+                f"{context}: --distributed-executor-backend must be one of "
+                f"{sorted(allowed_exec)} for nodes={topo_nodes}, got {dist_exec_backend!r}"
+            )
+        if dist_exec_backend == "uni" and world_within_dp > 1:
+            raise ValidationError(
+                f"{context}: --distributed-executor-backend 'uni' requires per-replica "
+                f"world size 1, got {world_within_dp}"
+            )
 
     dpl_explicit = _parse_pos_int_flag(
         "--data-parallel-size-local",
@@ -1606,39 +1624,36 @@ def _compute_parallel_and_dp_local(
             f"{context}: data_parallel_external_lb can only be set when data_parallel_size > 1"
         )
 
-    # Validate VLLM_DP_* env vars and apply ParallelConfig.__post_init__ fallback when CLI DP == 1
-    env_dp_size = 1
-    if "VLLM_DP_SIZE" in effective_env:
-        env_dp_size = (
-            _parse_pos_int_flag(
-                "VLLM_DP_SIZE", effective_env["VLLM_DP_SIZE"], context=context
+    def _parse_dp_env_int(var_name: str, *, positive: bool = False) -> int:
+        raw = effective_env[var_name]
+        try:
+            val = int(raw)
+        except ValueError as exc:
+            raise ValidationError(
+                f"{context}: environment variable {var_name} must be an integer"
+            ) from exc
+        if positive and val <= 0:
+            raise ValidationError(
+                f"{context}: environment variable {var_name} must be a positive integer"
             )
-            or 1
-        )
-    env_dp_rank = 0
-    if "VLLM_DP_RANK" in effective_env:
-        try:
-            env_dp_rank = int(effective_env["VLLM_DP_RANK"])
-        except ValueError as exc:
-            raise ValidationError(
-                f"{context}: VLLM_DP_RANK must be an integer, got {effective_env['VLLM_DP_RANK']!r}"
-            ) from exc
-    if "VLLM_DP_RANK_LOCAL" in effective_env:
-        try:
-            int(effective_env["VLLM_DP_RANK_LOCAL"])
-        except ValueError as exc:
-            raise ValidationError(
-                f"{context}: VLLM_DP_RANK_LOCAL must be an integer, got "
-                f"{effective_env['VLLM_DP_RANK_LOCAL']!r}"
-            ) from exc
+        return val
+
+    # Validate VLLM_DP_* env vars and apply ParallelConfig.__post_init__ fallback when CLI DP == 1
+    env_dp_size = (
+        _parse_dp_env_int("VLLM_DP_SIZE", positive=True)
+        if "VLLM_DP_SIZE" in effective_env
+        else 1
+    )
+    env_dp_rank = (
+        _parse_dp_env_int("VLLM_DP_RANK") if "VLLM_DP_RANK" in effective_env else 0
+    )
+    env_dp_rank_local = (
+        _parse_dp_env_int("VLLM_DP_RANK_LOCAL")
+        if "VLLM_DP_RANK_LOCAL" in effective_env
+        else env_dp_rank
+    )
     if "VLLM_DP_MASTER_PORT" in effective_env:
-        try:
-            env_dp_port = int(effective_env["VLLM_DP_MASTER_PORT"])
-        except ValueError as exc:
-            raise ValidationError(
-                f"{context}: VLLM_DP_MASTER_PORT must be an integer, got "
-                f"{effective_env['VLLM_DP_MASTER_PORT']!r}"
-            ) from exc
+        env_dp_port = _parse_dp_env_int("VLLM_DP_MASTER_PORT")
         if not 0 <= env_dp_port <= 65535:
             raise ValidationError(
                 f"{context}: VLLM_DP_MASTER_PORT must be in [0, 65535], got {env_dp_port}"
@@ -1650,12 +1665,28 @@ def _compute_parallel_and_dp_local(
                 f"{context}: recipe env VLLM_DP_SIZE ({env_dp_size}) conflicts with "
                 f"--data-parallel-size ({cli_dp_val})"
             )
+        for dead_dp_var in ("VLLM_DP_RANK", "VLLM_DP_RANK_LOCAL"):
+            if dead_dp_var in server_env:
+                raise ValidationError(
+                    f"{context}: recipe env {dead_dp_var} is ignored when "
+                    f"--data-parallel-size ({cli_dp_val}) > 1"
+                )
         dp_val = cli_dp_val
     else:
+        if topo_nodes > 1 and env_dp_size > 1:
+            raise ValidationError(
+                f"{context}: multi-node topology (nodes={topo_nodes}) requires CLI "
+                f"--data-parallel-size rather than VLLM_DP_SIZE={env_dp_size} env fallback"
+            )
         dp_val = env_dp_size
         if not 0 <= env_dp_rank < dp_val:
             raise ValidationError(
                 f"{context}: VLLM_DP_RANK must be in [0, {dp_val - 1}], got {env_dp_rank}"
+            )
+        if not 0 <= env_dp_rank_local < dp_local_val:
+            raise ValidationError(
+                f"{context}: VLLM_DP_RANK_LOCAL ({env_dp_rank_local}) must be in "
+                f"[0, {dp_local_val - 1}] for allocated local DP size ({dp_local_val})"
             )
 
     ppu_count = dp_val * world_within_dp

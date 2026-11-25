@@ -4250,3 +4250,141 @@ def test_vllm_dp_env_fallback_crossnode_tp_and_hybrid_headless_contract(
         ppu_recipe.validate_serving_recipe_structure(
             bad_hybrid_headless, context="hybrid_headless"
         )
+
+    # 4. R1 P1-1: Single-node out-of-bounds VLLM_DP_RANK_LOCAL=1 (with VLLM_DP_SIZE=1)
+    #    and multi-node env-only VLLM_DP_SIZE=2 without CLI --data-parallel-size fail closed;
+    #    VLLM_DP_RANK_LOCAL=0 and CLI --data-parallel-size 2 controls pass.
+    bad_rank_local = copy.deepcopy(glm_orig)
+    bad_rank_local["presets"]["prefill"]["env"] = {
+        **bad_rank_local["presets"]["prefill"].get("env", {}),
+        "VLLM_DP_SIZE": "1",
+        "VLLM_DP_RANK_LOCAL": "1",
+    }
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"VLLM_DP_RANK_LOCAL \(1\) must be in \[0, 0\]",
+    ):
+        ppu_recipe.validate_serving_recipe_structure(
+            bad_rank_local, context="bad_rank_local"
+        )
+
+    glm_rec_path.write_text(yaml.safe_dump(glm_orig), encoding="utf-8")
+    monkeypatch.setenv("VLLM_DP_SIZE", "1")
+    monkeypatch.setenv("VLLM_DP_RANK_LOCAL", "1")
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"VLLM_DP_RANK_LOCAL \(1\) must be in \[0, 0\]",
+    ):
+        ppu_recipe.resolve_recipe(
+            glm_rec_path, policy_path=glm_pol_path, tier="fast_sanity"
+        )
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"VLLM_DP_RANK_LOCAL \(1\) must be in \[0, 0\]",
+    ):
+        ppu_e2e_select.build_recipe_matrix("glm-5.3", "fast_sanity")
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"VLLM_DP_RANK_LOCAL \(1\) must be in \[0, 0\]",
+    ):
+        ppu_recipe_runner._launch_resolved_server(
+            clean_resolved, log_path=tmp_path / "never_started_rank_local.log"
+        )
+    monkeypatch.setenv("VLLM_DP_RANK_LOCAL", "0")
+    ok_rank_local = ppu_recipe.resolve_recipe(
+        glm_rec_path, policy_path=glm_pol_path, tier="fast_sanity"
+    )
+    assert ok_rank_local["ppu_count"] == 4
+    monkeypatch.delenv("VLLM_DP_SIZE")
+    monkeypatch.delenv("VLLM_DP_RANK_LOCAL")
+
+    bad_mn_env_dp = copy.deepcopy(glm_orig)
+    ep_no_cli_dp = [
+        tok
+        for tok in bad_mn_env_dp["presets"]["decode_ep"]["args"]
+        if tok not in {"--data-parallel-size", "32"}
+    ]
+    ep_no_cli_dp.extend(["--tensor-parallel-size", "16"])
+    bad_mn_env_dp["presets"]["decode_ep"]["args"] = ep_no_cli_dp
+    bad_mn_env_dp["presets"]["decode_ep"]["env"] = {
+        **bad_mn_env_dp["presets"]["decode_ep"]["env"],
+        "VLLM_DP_SIZE": "2",
+    }
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"multi-node topology \(nodes=4\) requires CLI --data-parallel-size rather than VLLM_DP_SIZE=2",
+    ):
+        ppu_recipe.validate_serving_recipe_structure(
+            bad_mn_env_dp, context="bad_mn_env_dp"
+        )
+
+    # 5. R1 P1-2: ExecutorWithExternalLauncher class path, external_launcher, and
+    #    underscore CLI flag spellings fail closed across validation, resolve, selector, and runner.
+    for exec_val in (
+        "external_launcher",
+        "vllm.v1.executor.uniproc_executor.ExecutorWithExternalLauncher",
+        "uni",
+    ):
+        bad_exec = copy.deepcopy(glm_orig)
+        bad_exec["presets"]["prefill"]["args"] = [
+            *bad_exec["presets"]["prefill"].get("args", []),
+            "--distributed-executor-backend",
+            exec_val,
+        ]
+        with pytest.raises(
+            ppu_recipe.ValidationError, match="--distributed-executor-backend"
+        ):
+            ppu_recipe.validate_serving_recipe_structure(bad_exec, context=exec_val)
+        glm_rec_path.write_text(yaml.safe_dump(bad_exec), encoding="utf-8")
+        with pytest.raises(
+            ppu_recipe.ValidationError, match="--distributed-executor-backend"
+        ):
+            ppu_e2e_select.build_recipe_matrix("glm-5.3", "fast_sanity")
+
+    good_exec_mp = copy.deepcopy(glm_orig)
+    good_exec_mp["presets"]["prefill"]["args"] = [
+        *good_exec_mp["presets"]["prefill"].get("args", []),
+        "--distributed-executor-backend",
+        "mp",
+    ]
+    glm_rec_path.write_text(yaml.safe_dump(good_exec_mp), encoding="utf-8")
+    assert (
+        ppu_recipe.resolve_recipe(
+            glm_rec_path, policy_path=glm_pol_path, tier="fast_sanity"
+        )["ppu_count"]
+        == 4
+    )
+
+    for bad_us_args in (
+        ["--data_parallel_size", "2"],
+        ["--distributed_executor_backend", "external_launcher"],
+        ["--enable_prefix_caching"],
+    ):
+        bad_us = copy.deepcopy(glm_orig)
+        bad_us["presets"]["prefill"]["args"] = [
+            *bad_us["presets"]["prefill"].get("args", []),
+            *bad_us_args,
+        ]
+        with pytest.raises(
+            ppu_recipe.ValidationError, match="canonical hyphenated spelling"
+        ):
+            ppu_recipe.validate_serving_recipe_structure(bad_us, context="bad_us")
+        glm_rec_path.write_text(yaml.safe_dump(bad_us), encoding="utf-8")
+        with pytest.raises(
+            ppu_recipe.ValidationError, match="canonical hyphenated spelling"
+        ):
+            ppu_recipe.resolve_recipe(
+                glm_rec_path, policy_path=glm_pol_path, tier="fast_sanity"
+            )
+        with pytest.raises(
+            ppu_recipe.ValidationError, match="canonical hyphenated spelling"
+        ):
+            ppu_e2e_select.build_recipe_matrix("glm-5.3", "fast_sanity")
+        tampered = copy.deepcopy(clean_resolved)
+        tampered["flags"] = [*tampered["flags"], *bad_us_args]
+        with pytest.raises(
+            ppu_recipe.ValidationError, match="canonical hyphenated spelling"
+        ):
+            ppu_recipe_runner._launch_resolved_server(
+                tampered, log_path=tmp_path / "never_started_us.log"
+            )
