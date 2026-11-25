@@ -64,6 +64,7 @@ jobs:
       ppu_skip_reason: ${{ steps.route.outputs.ppu_skip_reason }}
       has_route_cursor: ${{ steps.route.outputs.has_route_cursor }}
       route_artifact_name: ${{ steps.route.outputs.route_artifact_name }}
+      prior_cursor_artifact: ${{ steps.prior.outputs.prior_cursor_artifact }}
     steps:
       - name: Check out vLLM SAIL
         uses: actions/checkout@v4
@@ -79,56 +80,171 @@ jobs:
             const fs = require("fs");
             fs.mkdirSync("state", { recursive: true });
             const { owner, repo } = context.repo;
+            const retryBaseMs = Number(process.env.CURSOR_DISCOVERY_RETRY_MS || 200);
+            const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+            async function withRetry(label, fn, attempts = 3) {
+              let lastErr;
+              for (let i = 1; i <= attempts; i++) {
+                try {
+                  return await fn();
+                } catch (err) {
+                  lastErr = err;
+                  if (i < attempts && retryBaseMs > 0) {
+                    await sleep(retryBaseMs * i);
+                  }
+                }
+              }
+              throw new Error(
+                `${label} failed after ${attempts} attempts: ${lastErr && lastErr.message ? lastErr.message : lastErr}`
+              );
+            }
 
             // 1. Count active PPU PR CI runs so post-merge probe yields priority.
             let activePrRuns = 0;
             for (const status of ["in_progress", "queued"]) {
-              const res = await github.rest.actions.listWorkflowRuns({
-                owner,
-                repo,
-                workflow_id: "ppu-pr-ci.yaml",
-                status,
-                per_page: 20,
-              }).catch(() => ({ data: { total_count: 0 } }));
-              activePrRuns += res.data.total_count || 0;
+              const res = await withRetry(
+                `listWorkflowRuns(ppu-pr-ci.yaml, ${status})`,
+                () =>
+                  github.rest.actions.listWorkflowRuns({
+                    owner,
+                    repo,
+                    workflow_id: "ppu-pr-ci.yaml",
+                    status,
+                    per_page: 20,
+                  }),
+                2
+              ).catch(() => ({ data: { total_count: 0 } }));
+              activePrRuns += (res.data && res.data.total_count) || 0;
             }
             fs.writeFileSync("state/active-pr-runs.txt", String(activePrRuns));
 
-            // 2. Download latest post-merge cursor artifact written by probe/rc_qualify.
-            const canaryRuns = await github.rest.actions.listWorkflowRuns({
-              owner,
-              repo,
-              workflow_id: "upstream-canary.yaml",
-              branch: "main",
-              status: "completed",
-              per_page: 20,
-            }).catch(() => ({ data: { workflow_runs: [] } }));
+            // 2. Discover globally newest non-expired post-merge cursor artifact across the
+            // retention window (including late reruns of older workflow runs), failing closed
+            // on any unrecovered GitHub REST error instead of falling back to stale/empty state.
+            const perPage = 100;
+            const nowMs = Date.now();
+            const maxRunCreatedAgeMs = 65 * 24 * 60 * 60 * 1000;
+            const maxRunUpdatedAgeMs = 32 * 24 * 60 * 60 * 1000;
 
-            let cursorFound = false;
-            for (const run of canaryRuns.data.workflow_runs || []) {
-              if (run.id === context.runId) continue;
-              const arts = await github.rest.actions.listWorkflowRunArtifacts({
-                owner,
-                repo,
-                run_id: run.id,
-                per_page: 100,
-              }).catch(() => ({ data: { artifacts: [] } }));
-              const cursorArts = (arts.data.artifacts || [])
-                .filter(a => !a.expired && a.name.startsWith("upstream-post-merge-cursor-"))
-                .sort((a, b) => {
-                  const attA = Number((a.name.match(/-(\d+)$/) || [])[1] || 0);
-                  const attB = Number((b.name.match(/-(\d+)$/) || [])[1] || 0);
-                  if (attB !== attA) return attB - attA;
-                  return (b.id || 0) - (a.id || 0);
-                });
-              const curArt = cursorArts[0];
-              if (!curArt) continue;
-              core.setOutput("prior_canary_run_id", String(run.id));
-              core.setOutput("prior_cursor_artifact", curArt.name);
-              cursorFound = true;
-              break;
+            function isBetterCursor(cand, best) {
+              if (!best) return true;
+              if (cand.runId === best.runId && cand.attempt !== best.attempt) {
+                return cand.attempt > best.attempt;
+              }
+              if (
+                Number.isFinite(cand.createdMs) &&
+                Number.isFinite(best.createdMs) &&
+                cand.createdMs !== best.createdMs
+              ) {
+                return cand.createdMs > best.createdMs;
+              }
+              if (cand.id > 0 && best.id > 0 && cand.id !== best.id) {
+                return cand.id > best.id;
+              }
+              if (cand.runId !== best.runId) {
+                return cand.runId > best.runId;
+              }
+              return cand.attempt > best.attempt;
             }
-            if (!cursorFound) {
+
+            let best = null;
+            let page = 1;
+            let seenRuns = 0;
+            let reachedRetentionHorizon = false;
+            while (!reachedRetentionHorizon) {
+              const canaryRes = await withRetry(
+                `listWorkflowRuns(upstream-canary.yaml, page=${page})`,
+                () =>
+                  github.rest.actions.listWorkflowRuns({
+                    owner,
+                    repo,
+                    workflow_id: "upstream-canary.yaml",
+                    branch: "main",
+                    status: "completed",
+                    per_page: perPage,
+                    page,
+                  })
+              );
+              const data = (canaryRes && canaryRes.data) || {};
+              const runs = Array.isArray(data.workflow_runs) ? data.workflow_runs : [];
+              if (runs.length === 0) break;
+
+              for (const run of runs) {
+                if (!run || typeof run.id !== "number") continue;
+                if (run.id === context.runId) continue;
+
+                const runCreatedMs = run.created_at ? Date.parse(run.created_at) : NaN;
+                const runUpdatedMs = run.updated_at ? Date.parse(run.updated_at) : NaN;
+                if (Number.isFinite(runCreatedMs) && nowMs - runCreatedMs > maxRunCreatedAgeMs) {
+                  reachedRetentionHorizon = true;
+                  break;
+                }
+                const latestTouchMs = Number.isFinite(runUpdatedMs) ? runUpdatedMs : runCreatedMs;
+                if (Number.isFinite(latestTouchMs) && nowMs - latestTouchMs > maxRunUpdatedAgeMs) {
+                  continue;
+                }
+                if (
+                  best &&
+                  Number.isFinite(best.createdMs) &&
+                  run.run_attempt === 1 &&
+                  Number.isFinite(runUpdatedMs) &&
+                  runUpdatedMs + 60000 < best.createdMs
+                ) {
+                  continue;
+                }
+
+                let artPage = 1;
+                let seenArts = 0;
+                while (true) {
+                  const artsRes = await withRetry(
+                    `listWorkflowRunArtifacts(run_id=${run.id}, page=${artPage})`,
+                    () =>
+                      github.rest.actions.listWorkflowRunArtifacts({
+                        owner,
+                        repo,
+                        run_id: run.id,
+                        per_page: 100,
+                        page: artPage,
+                      })
+                  );
+                  const artData = (artsRes && artsRes.data) || {};
+                  const artifacts = Array.isArray(artData.artifacts) ? artData.artifacts : [];
+                  for (const a of artifacts) {
+                    if (!a || a.expired || typeof a.name !== "string") continue;
+                    if (!a.name.startsWith("upstream-post-merge-cursor-")) continue;
+                    const m = a.name.match(/-(\d+)$/);
+                    const cand = {
+                      runId: run.id,
+                      name: a.name,
+                      id: Number(a.id || 0),
+                      attempt: Number((m && m[1]) || 0),
+                      createdMs: a.created_at ? Date.parse(a.created_at) : NaN,
+                    };
+                    if (isBetterCursor(cand, best)) {
+                      best = cand;
+                    }
+                  }
+                  seenArts += artifacts.length;
+                  const totalArts = typeof artData.total_count === "number" ? artData.total_count : null;
+                  if (artifacts.length < 100 || (totalArts !== null && seenArts >= totalArts)) {
+                    break;
+                  }
+                  artPage += 1;
+                }
+              }
+
+              seenRuns += runs.length;
+              const totalRuns = typeof data.total_count === "number" ? data.total_count : null;
+              if (runs.length < perPage || (totalRuns !== null && seenRuns >= totalRuns)) {
+                break;
+              }
+              page += 1;
+            }
+
+            if (best) {
+              core.setOutput("prior_canary_run_id", String(best.runId));
+              core.setOutput("prior_cursor_artifact", best.name);
+            } else {
               core.setOutput("prior_canary_run_id", "");
               core.setOutput("prior_cursor_artifact", "");
             }
@@ -1045,6 +1161,181 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
 
+      - name: Discover latest published cursor artifact
+        id: latest_cursor
+        if: >-
+          always() &&
+          needs.route.result == 'success' &&
+          needs.route.outputs.target_sha != '' &&
+          (needs.route.outputs.selected_gear == 'probe' || needs.route.outputs.selected_gear == 'rc_qualify')
+        env:
+          ROUTE_PRIOR_CURSOR_ARTIFACT: ${{ needs.route.outputs.prior_cursor_artifact || '' }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const retryBaseMs = Number(process.env.CURSOR_DISCOVERY_RETRY_MS || 200);
+            const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+            async function withRetry(label, fn, attempts = 3) {
+              let lastErr;
+              for (let i = 1; i <= attempts; i++) {
+                try {
+                  return await fn();
+                } catch (err) {
+                  lastErr = err;
+                  if (i < attempts && retryBaseMs > 0) {
+                    await sleep(retryBaseMs * i);
+                  }
+                }
+              }
+              throw new Error(
+                `${label} failed after ${attempts} attempts: ${lastErr && lastErr.message ? lastErr.message : lastErr}`
+              );
+            }
+
+            const perPage = 100;
+            const nowMs = Date.now();
+            const maxRunCreatedAgeMs = 65 * 24 * 60 * 60 * 1000;
+            const maxRunUpdatedAgeMs = 32 * 24 * 60 * 60 * 1000;
+
+            function isBetterCursor(cand, best) {
+              if (!best) return true;
+              if (cand.runId === best.runId && cand.attempt !== best.attempt) {
+                return cand.attempt > best.attempt;
+              }
+              if (
+                Number.isFinite(cand.createdMs) &&
+                Number.isFinite(best.createdMs) &&
+                cand.createdMs !== best.createdMs
+              ) {
+                return cand.createdMs > best.createdMs;
+              }
+              if (cand.id > 0 && best.id > 0 && cand.id !== best.id) {
+                return cand.id > best.id;
+              }
+              if (cand.runId !== best.runId) {
+                return cand.runId > best.runId;
+              }
+              return cand.attempt > best.attempt;
+            }
+
+            let best = null;
+            let page = 1;
+            let seenRuns = 0;
+            let reachedRetentionHorizon = false;
+            while (!reachedRetentionHorizon) {
+              const canaryRes = await withRetry(
+                `listWorkflowRuns(upstream-canary.yaml, page=${page})`,
+                () =>
+                  github.rest.actions.listWorkflowRuns({
+                    owner,
+                    repo,
+                    workflow_id: "upstream-canary.yaml",
+                    branch: "main",
+                    status: "completed",
+                    per_page: perPage,
+                    page,
+                  })
+              );
+              const data = (canaryRes && canaryRes.data) || {};
+              const runs = Array.isArray(data.workflow_runs) ? data.workflow_runs : [];
+              if (runs.length === 0) break;
+
+              for (const run of runs) {
+                if (!run || typeof run.id !== "number") continue;
+                if (run.id === context.runId) continue;
+
+                const runCreatedMs = run.created_at ? Date.parse(run.created_at) : NaN;
+                const runUpdatedMs = run.updated_at ? Date.parse(run.updated_at) : NaN;
+                if (Number.isFinite(runCreatedMs) && nowMs - runCreatedMs > maxRunCreatedAgeMs) {
+                  reachedRetentionHorizon = true;
+                  break;
+                }
+                const latestTouchMs = Number.isFinite(runUpdatedMs) ? runUpdatedMs : runCreatedMs;
+                if (Number.isFinite(latestTouchMs) && nowMs - latestTouchMs > maxRunUpdatedAgeMs) {
+                  continue;
+                }
+                if (
+                  best &&
+                  Number.isFinite(best.createdMs) &&
+                  run.run_attempt === 1 &&
+                  Number.isFinite(runUpdatedMs) &&
+                  runUpdatedMs + 60000 < best.createdMs
+                ) {
+                  continue;
+                }
+
+                let artPage = 1;
+                let seenArts = 0;
+                while (true) {
+                  const artsRes = await withRetry(
+                    `listWorkflowRunArtifacts(run_id=${run.id}, page=${artPage})`,
+                    () =>
+                      github.rest.actions.listWorkflowRunArtifacts({
+                        owner,
+                        repo,
+                        run_id: run.id,
+                        per_page: 100,
+                        page: artPage,
+                      })
+                  );
+                  const artData = (artsRes && artsRes.data) || {};
+                  const artifacts = Array.isArray(artData.artifacts) ? artData.artifacts : [];
+                  for (const a of artifacts) {
+                    if (!a || a.expired || typeof a.name !== "string") continue;
+                    if (!a.name.startsWith("upstream-post-merge-cursor-")) continue;
+                    const m = a.name.match(/-(\d+)$/);
+                    const cand = {
+                      runId: run.id,
+                      name: a.name,
+                      id: Number(a.id || 0),
+                      attempt: Number((m && m[1]) || 0),
+                      createdMs: a.created_at ? Date.parse(a.created_at) : NaN,
+                    };
+                    if (isBetterCursor(cand, best)) {
+                      best = cand;
+                    }
+                  }
+                  seenArts += artifacts.length;
+                  const totalArts = typeof artData.total_count === "number" ? artData.total_count : null;
+                  if (artifacts.length < 100 || (totalArts !== null && seenArts >= totalArts)) {
+                    break;
+                  }
+                  artPage += 1;
+                }
+              }
+
+              seenRuns += runs.length;
+              const totalRuns = typeof data.total_count === "number" ? data.total_count : null;
+              if (runs.length < perPage || (totalRuns !== null && seenRuns >= totalRuns)) {
+                break;
+              }
+              page += 1;
+            }
+
+            const routePrior = process.env.ROUTE_PRIOR_CURSOR_ARTIFACT || "";
+            if (best && best.name !== routePrior) {
+              core.setOutput("has_newer_external_cursor", "true");
+              core.setOutput("latest_canary_run_id", String(best.runId));
+              core.setOutput("latest_cursor_artifact", best.name);
+            } else {
+              core.setOutput("has_newer_external_cursor", "false");
+              core.setOutput("latest_canary_run_id", "");
+              core.setOutput("latest_cursor_artifact", "");
+            }
+
+      - name: Download newer external cursor artifact when superseded
+        if: >-
+          always() &&
+          needs.route.result == 'success' &&
+          steps.latest_cursor.outputs.has_newer_external_cursor == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ steps.latest_cursor.outputs.latest_cursor_artifact }}
+          run-id: ${{ steps.latest_cursor.outputs.latest_canary_run_id }}
+          path: /tmp/post-merge-latest-cursor
+          github-token: ${{ github.token }}
+
       - name: Download routing cursor artifact
         if: always() && needs.route.outputs.has_route_cursor == 'true'
         uses: actions/download-artifact@v4
@@ -1076,6 +1367,7 @@ jobs:
           RUN_PPU: ${{ needs.route.outputs.run_ppu || 'false' }}
           PPU_SKIP_REASON: ${{ needs.route.outputs.ppu_skip_reason || 'none' }}
           HAS_ROUTE_CURSOR: ${{ needs.route.outputs.has_route_cursor || 'false' }}
+          HAS_NEWER_EXTERNAL_CURSOR: ${{ steps.latest_cursor.outputs.has_newer_external_cursor || 'false' }}
           OPS_IMAGE: ${{ inputs.ops_image || '' }}
           BUILD_IMAGE: ${{ needs.build.outputs.image || '' }}
           ROUTE_RESULT: ${{ needs.route.result }}
@@ -1093,6 +1385,10 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p /tmp/post-merge-public
+          if [[ "${HAS_NEWER_EXTERNAL_CURSOR}" == "true" && ! -f /tmp/post-merge-latest-cursor/cursor.json ]]; then
+            echo "latest_cursor reported has_newer_external_cursor=true but /tmp/post-merge-latest-cursor/cursor.json is missing" >&2
+            exit 1
+          fi
           if [[ "${HAS_ROUTE_CURSOR}" == "true" && ! -f /tmp/post-merge-meta/cursor.json ]]; then
             echo "route reported has_route_cursor=true but /tmp/post-merge-meta/cursor.json is missing" >&2
             exit 1
@@ -1122,7 +1418,9 @@ jobs:
           rm -f "${resolved_env}"
 
           extra_args=()
-          if [[ -f /tmp/post-merge-meta/cursor.json ]]; then
+          if [[ "${HAS_NEWER_EXTERNAL_CURSOR}" == "true" ]]; then
+            extra_args+=(--cursor-in /tmp/post-merge-latest-cursor/cursor.json)
+          elif [[ -f /tmp/post-merge-meta/cursor.json ]]; then
             extra_args+=(--cursor-in /tmp/post-merge-meta/cursor.json)
           fi
           if [[ -f /tmp/post-merge-meta/cpu-result.json ]]; then
@@ -1168,6 +1466,9 @@ jobs:
       - name: Upload persistent post-merge cursor artifact
         if: >-
           always() &&
+          needs.route.result == 'success' &&
+          needs.route.outputs.target_sha != '' &&
+          (steps.latest_cursor.outcome == 'success' || steps.latest_cursor.outcome == 'skipped') &&
           steps.publish.outcome == 'success' &&
           (needs.route.outputs.selected_gear == 'probe' || needs.route.outputs.selected_gear == 'rc_qualify') &&
           steps.publish.outputs.final_status != 'noop'

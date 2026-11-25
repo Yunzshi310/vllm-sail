@@ -6436,3 +6436,496 @@ def test_review_6057527910_partial_rerun_cursor_exact_sha_rc_ancestry_and_infra_
         }
         assert ovr_kv["last_green_sha"] != sha_b
         assert sha_b not in ovr_kv["fallback_green_shas"].split(",")
+
+
+def test_review_6066390398_cursor_discovery_late_rerun_and_durable_branch_revocation(
+    tmp_path: Path,
+):
+    """End-to-end regression suite for GitHub review #6066390398 (2 P1s + 1 P2)."""
+    repo = tmp_path / "upstream"
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(repo)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    def _git(*args: str) -> str:
+        return subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "-c",
+                "user.name=RC Review",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                *args,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    hashes: list[str] = []
+    for label in ("pin", "main-green", "A", "B", "C"):
+        (repo / "version").write_text(f"{label}\n", encoding="utf-8")
+        _git("add", "version")
+        _git("commit", "-qm", label)
+        hashes.append(_git("rev-parse", "HEAD"))
+    pin_sha, main_green, sha_a, sha_b, sha_c = hashes
+    pin_file = tmp_path / "pin"
+    pin_file.write_text(f"{pin_sha}\n", encoding="utf-8")
+    baseline_tag = tmp_path / "release"
+    baseline_tag.write_text("v0.34.0\n", encoding="utf-8")
+    refs_file = tmp_path / "ls-remote.txt"
+    branch = "releases/v0.35.0"
+    sail_sha = "f" * 40
+
+    _git("branch", "main-green", main_green)
+    _git("checkout", "-q", "main-green")
+    _git("update-ref", "refs/heads/main", main_green)
+
+    def _snapshot(tip: str, tags: dict[str, str]) -> None:
+        _git("update-ref", f"refs/heads/{branch}", tip)
+        for t_name, t_sha in tags.items():
+            _git("update-ref", f"refs/tags/{t_name}", t_sha)
+        ls_out = subprocess.run(
+            [
+                "git",
+                "ls-remote",
+                str(repo),
+                "refs/heads/main",
+                "refs/heads/releases/v*",
+                "refs/tags/v*",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        refs_file.write_text(f"{ls_out}\n", encoding="utf-8")
+
+    def _cli_route(
+        cursor: Path | None, gear: str = "auto", override: str = ""
+    ) -> dict[str, str]:
+        out_env = tmp_path / "route-gh.out"
+        out_env.unlink(missing_ok=True)
+        argv = [
+            "route",
+            "--ls-remote-file",
+            str(refs_file),
+            "--verified-pin-file",
+            str(pin_file),
+            "--release-tag-file",
+            str(baseline_tag),
+            "--vllm-repo",
+            str(repo),
+            "--gear",
+            gear,
+            "--upstream-ref",
+            override,
+            "--github-output",
+            str(out_env),
+        ]
+        if cursor is not None:
+            argv.extend(["--cursor-file", str(cursor)])
+        assert post_merge.main(argv) == 0
+        return {
+            k: v
+            for k, _, v in (
+                ln.partition("=")
+                for ln in out_env.read_text(encoding="utf-8").splitlines()
+            )
+        }
+
+    def _cli_publish(
+        label: str,
+        cursor: Path | None,
+        gear: str,
+        sha: str,
+        rc_ref: str = "",
+        status: str = "pass",
+    ) -> Path:
+        pub_dir = tmp_path / label
+        argv = [
+            "publish",
+            "--gear",
+            gear,
+            "--upstream-sha",
+            sha,
+            "--verified-pin-file",
+            str(pin_file),
+            "--sail-sha",
+            sail_sha,
+            "--public-dir",
+            str(pub_dir),
+            "--status",
+            status,
+            "--cpu-status",
+            "pass" if sha else "not_run",
+            "--ppu-status",
+            status if sha else "not_run",
+            "--rc-tag",
+            rc_ref,
+        ]
+        if status == "fail":
+            argv.extend(["--failure-stage", "rc_model_sanity"])
+        elif status == "infra_error":
+            argv.extend(["--failure-stage", "route"])
+        if cursor is not None:
+            argv.extend(["--cursor-in", str(cursor)])
+        assert post_merge.main(argv) == 0
+        return pub_dir / "cursor.json"
+
+    main_cursor = _cli_publish("main-cursor", None, "probe", main_green)
+    a_pass = _cli_publish("br-a-pass", main_cursor, "rc_qualify", sha_a, branch)
+    b_pass = _cli_publish("br-b-pass", a_pass, "rc_qualify", sha_b, branch)
+    b_fail = _cli_publish("br-b-rejected", b_pass, "rc_qualify", sha_b, branch, "fail")
+    _snapshot(sha_c, {})
+
+    wf = yaml.safe_load(
+        (REPO_ROOT / ".github/workflows/upstream-canary.yaml").read_text(
+            encoding="utf-8"
+        )
+    )["jobs"]
+    assert (
+        wf["route"]["outputs"]["prior_cursor_artifact"]
+        == "${{ steps.prior.outputs.prior_cursor_artifact }}"
+    )
+    cursor_upload = next(
+        s
+        for s in wf["publish-and-triage"]["steps"]
+        if s.get("name") == "Upload persistent post-merge cursor artifact"
+    )
+    assert "needs.route.result == 'success'" in cursor_upload["if"]
+    assert "needs.route.outputs.target_sha != ''" in cursor_upload["if"]
+
+    # Failed route (`upstream-sha=""`) must NOT emit a reset cursor.json:
+    failed_route_cursor = _cli_publish(
+        "route-failed-pub", None, "probe", "", status="infra_error"
+    )
+    assert not failed_route_cursor.exists()
+    assert (
+        json.loads(
+            (failed_route_cursor.parent / "public-summary.json").read_text(
+                encoding="utf-8"
+            )
+        )["status"]
+        == "infra_error"
+    )
+
+    node_bin = shutil.which("node")
+    if node_bin:
+        prior_script = next(
+            s["with"]["script"] for s in wf["route"]["steps"] if s.get("id") == "prior"
+        )
+        latest_script = next(
+            s["with"]["script"]
+            for s in wf["publish-and-triage"]["steps"]
+            if s.get("id") == "latest_cursor"
+        )
+        driver = tmp_path / "discovery_driver.cjs"
+        driver.write_text(
+            """
+const fs = require("node:fs");
+const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+const { script, scenario } = JSON.parse(fs.readFileSync(0, "utf8"));
+const calls = [];
+const outputs = {};
+let transientLeft = Number(scenario.transientCount || 0);
+const actions = {
+  async listWorkflowRuns(input) {
+    if (input.workflow_id === "ppu-pr-ci.yaml") return { data: { total_count: 0 } };
+    calls.push(["listRuns", input.page || 1, input.per_page]);
+    if (scenario.error === "runs") {
+      if (transientLeft > 0) {
+        transientLeft -= 1;
+        throw new Error("503 transient while listing workflow runs");
+      }
+      if (!scenario.recover) throw new Error("503 while listing workflow runs");
+    }
+    const offset = ((input.page || 1) - 1) * input.per_page;
+    const slice = scenario.runs.slice(offset, offset + input.per_page).map((x) => {
+      const item = { id: x.id };
+      if (x.created_at) item.created_at = x.created_at;
+      if (x.updated_at) item.updated_at = x.updated_at;
+      if (typeof x.run_attempt === "number") item.run_attempt = x.run_attempt;
+      return item;
+    });
+    return { data: { total_count: scenario.runs.length, workflow_runs: slice } };
+  },
+  async listWorkflowRunArtifacts(input) {
+    const page = input.page || 1;
+    const perPage = input.per_page || 100;
+    calls.push(["listArtifacts", input.run_id, page]);
+    if (input.run_id === scenario.error) {
+      if (transientLeft > 0) {
+        transientLeft -= 1;
+        throw new Error("503 transient while listing run artifacts");
+      }
+      if (!scenario.recover) throw new Error("503 while listing run artifacts");
+    }
+    const run = scenario.runs.find((x) => x.id === input.run_id);
+    const allArts = (run && run.artifacts) || [];
+    const offset = (page - 1) * perPage;
+    return {
+      data: {
+        total_count: allArts.length,
+        artifacts: allArts.slice(offset, offset + perPage),
+      },
+    };
+  },
+};
+new AsyncFunction("github", "context", "core", "require", script)(
+  { rest: { actions } },
+  { repo: { owner: "fixture", repo: "fixture" }, runId: scenario.runId || 9999 },
+  { setOutput: (k, v) => { outputs[k] = v; } },
+  require
+).then(() => {
+  process.stdout.write(JSON.stringify({ outputs, calls }));
+}).catch((e) => {
+  console.error(e && e.message ? e.message : String(e));
+  process.exitCode = 1;
+});
+""".lstrip(),
+            encoding="utf-8",
+        )
+
+        def _run_js(
+            script_src: str,
+            runs_data: list[dict],
+            *,
+            error: object = None,
+            transient_count: int = 0,
+            recover: bool = False,
+            run_id: int = 9999,
+            extra_env: dict[str, str] | None = None,
+        ) -> subprocess.CompletedProcess[str]:
+            work = tmp_path / "js-cwd"
+            work.mkdir(exist_ok=True)
+            return subprocess.run(
+                [node_bin, str(driver)],
+                input=json.dumps(
+                    {
+                        "script": script_src,
+                        "scenario": {
+                            "runs": runs_data,
+                            "error": error,
+                            "transientCount": transient_count,
+                            "recover": recover,
+                            "runId": run_id,
+                        },
+                    }
+                ),
+                text=True,
+                capture_output=True,
+                cwd=work,
+                env={
+                    **os.environ,
+                    "CURSOR_DISCOVERY_RETRY_MS": "2",
+                    **(extra_env or {}),
+                },
+                check=False,
+            )
+
+        def _art(run_id: int, attempt: int, art_id: int) -> dict:
+            day = min(art_id, 28)
+            return {
+                "id": art_id,
+                "name": f"upstream-post-merge-cursor-{run_id}-{attempt}",
+                "expired": False,
+                "created_at": f"2026-11-{day:02d}T{art_id % 24:02d}:00:00Z",
+            }
+
+        base_runs = [
+            {"id": 12, "artifacts": [_art(12, 1, 12)]},
+            {"id": 11, "artifacts": [_art(11, 1, 11)]},
+        ]
+
+        # [P1 r4702066251] Persistent 503 on artifact listing or run listing MUST fail closed:
+        p_art_503 = _run_js(prior_script, base_runs, error=12)
+        assert p_art_503.returncode != 0
+        assert "503 while listing run artifacts" in p_art_503.stderr
+
+        p_runs_503 = _run_js(prior_script, base_runs, error="runs")
+        assert p_runs_503.returncode != 0
+        assert "503 while listing workflow runs" in p_runs_503.stderr
+
+        # Transient single/double 503 recovers cleanly via retry:
+        p_rec_art = _run_js(
+            prior_script, base_runs, error=12, transient_count=2, recover=True
+        )
+        assert p_rec_art.returncode == 0, p_rec_art.stderr
+        assert (
+            json.loads(p_rec_art.stdout)["outputs"]["prior_cursor_artifact"]
+            == "upstream-post-merge-cursor-12-1"
+        )
+
+        # 20 and 125 cursorless runs (spanning 2 pages of per_page=100) still recover run 12:
+        for cursorless_n in (20, 125):
+            padded = [
+                {"id": 2000 - idx, "artifacts": []} for idx in range(cursorless_n)
+            ] + base_runs
+            p_pad = _run_js(prior_script, padded)
+            assert p_pad.returncode == 0, p_pad.stderr
+            out_pad = json.loads(p_pad.stdout)["outputs"]
+            assert out_pad["prior_canary_run_id"] == "12"
+            assert out_pad["prior_cursor_artifact"] == "upstream-post-merge-cursor-12-1"
+            dec_pad = _cli_route(b_fail, "rc_qualify", branch)
+            assert dec_pad["last_green_sha"] == sha_a
+
+        # >100 non-cursor artifacts in a single run paginate to page 2:
+        noise_arts = [
+            {
+                "id": 500 + idx,
+                "name": f"other-artifact-{idx}",
+                "expired": False,
+                "created_at": "2026-11-12T00:00:00Z",
+            }
+            for idx in range(110)
+        ] + [_art(12, 1, 12)]
+        p_art_pages = _run_js(prior_script, [{"id": 12, "artifacts": noise_arts}])
+        assert p_art_pages.returncode == 0, p_art_pages.stderr
+        assert (
+            json.loads(p_art_pages.stdout)["outputs"]["prior_cursor_artifact"]
+            == "upstream-post-merge-cursor-12-1"
+        )
+
+        # Genuine first run (0 cursors across successful listings) outputs empty strings:
+        p_empty = _run_js(prior_script, [{"id": 50, "artifacts": []}])
+        assert p_empty.returncode == 0
+        assert json.loads(p_empty.stdout)["outputs"] == {
+            "prior_canary_run_id": "",
+            "prior_cursor_artifact": "",
+        }
+
+        # [P1 r4702066258] Late rerun of older workflow run (run 12 attempt 2 after run 13 attempt 1):
+        newer_probe = _cli_publish("intervening-probe", b_pass, "probe", sha_a)
+        rerun_fail = _cli_publish(
+            "older-run-attempt-2", newer_probe, "rc_qualify", sha_b, branch, "fail"
+        )
+        runs_late = [
+            {"id": 13, "artifacts": [_art(13, 1, 13)]},
+            {"id": 12, "artifacts": [_art(12, 2, 14), _art(12, 1, 12)]},
+        ]
+        p_late = _run_js(prior_script, runs_late)
+        assert p_late.returncode == 0, p_late.stderr
+        assert json.loads(p_late.stdout)["outputs"] == {
+            "prior_canary_run_id": "12",
+            "prior_cursor_artifact": "upstream-post-merge-cursor-12-2",
+        }
+        dec_after_late = _cli_route(rerun_fail, "rc_qualify", branch)
+        assert dec_after_late["last_green_sha"] == sha_a
+        after_c = json.loads(
+            _cli_publish(
+                "after-late-c", rerun_fail, "rc_qualify", sha_c, branch
+            ).read_text(encoding="utf-8")
+        )
+        assert sha_b in after_c["rc_branch_states"][branch]["revoked_shas"]
+        assert after_c["last_ppu_green_sha"] == sha_a
+
+        # Partial failed-job rerun on run 12 (`route` did not re-run; saw `11-1` while run 13 published `13-1`):
+        p_superseded = _run_js(
+            latest_script,
+            [
+                {"id": 13, "artifacts": [_art(13, 1, 13)]},
+                {"id": 12, "artifacts": [_art(12, 1, 12)]},
+                {"id": 11, "artifacts": [_art(11, 1, 11)]},
+            ],
+            run_id=12,
+            extra_env={
+                "ROUTE_PRIOR_CURSOR_ARTIFACT": "upstream-post-merge-cursor-11-1"
+            },
+        )
+        assert p_superseded.returncode == 0, p_superseded.stderr
+        assert json.loads(p_superseded.stdout)["outputs"] == {
+            "has_newer_external_cursor": "true",
+            "latest_canary_run_id": "13",
+            "latest_cursor_artifact": "upstream-post-merge-cursor-13-1",
+        }
+        # Normal partial rerun with no intervening external run keeps `has_newer_external_cursor == "false"`:
+        p_same_ext = _run_js(
+            latest_script,
+            [
+                {"id": 12, "artifacts": [_art(12, 1, 12)]},
+                {"id": 11, "artifacts": [_art(11, 1, 11)]},
+            ],
+            run_id=12,
+            extra_env={
+                "ROUTE_PRIOR_CURSOR_ARTIFACT": "upstream-post-merge-cursor-11-1"
+            },
+        )
+        assert p_same_ext.returncode == 0
+        assert (
+            json.loads(p_same_ext.stdout)["outputs"]["has_newer_external_cursor"]
+            == "false"
+        )
+
+    # [P2 r4702066263] Untagged release branch retains live control revocations across >20 and >256 failures:
+    _git("checkout", "-q", "--detach", main_green)
+    cur_branch = main_cursor
+    for idx in range(25):
+        if idx == 0:
+            tip_sha = main_green
+        else:
+            _git("commit", "--allow-empty", "-qm", f"release-tip-{idx}")
+            tip_sha = _git("rev-parse", "HEAD")
+        _snapshot(tip_sha, {})
+        dec_tip = _cli_route(cur_branch, "auto")
+        assert (
+            dec_tip["selected_gear"] == "rc_qualify"
+            and dec_tip["target_sha"] == tip_sha
+        )
+        assert dec_tip["last_green_sha"] == pin_sha
+        cur_branch = _cli_publish(
+            f"untagged-fail-{idx}",
+            cur_branch,
+            "rc_qualify",
+            tip_sha,
+            dec_tip["rc_tag"],
+            "fail",
+        )
+        cur_model = json.loads(cur_branch.read_text(encoding="utf-8"))
+        assert cur_model["rc_tag_states"] == {} and cur_model["tested_rc_tags"] == []
+        assert main_green in cur_model["rc_branch_states"][branch]["revoked_shas"]
+
+    _git("commit", "--allow-empty", "-qm", "release-tip-after-25")
+    tip_26 = _git("rev-parse", "HEAD")
+    _snapshot(tip_26, {})
+    dec_26 = _cli_route(cur_branch, "auto")
+    assert dec_26["selected_gear"] == "rc_qualify"
+    assert dec_26["last_green_sha"] == pin_sha
+
+    # Even after 300 additional ephemeral failures (> MAX_EPHEMERAL_REVOKED_SHAS), `main_green` stays revoked:
+    cur_obj = json.loads(cur_branch.read_text(encoding="utf-8"))
+    for k in range(300):
+        cur_obj = post_merge.advance_cursor(
+            cur_obj,
+            verified_pin=pin_sha,
+            selected_gear="rc_qualify",
+            target_sha=f"{k + 1:040x}",
+            rc_tag=branch,
+            status="fail",
+            cpu_status="pass",
+            ppu_status="fail",
+        )
+    assert main_green in cur_obj["rc_branch_states"][branch]["revoked_shas"]
+    assert (
+        len(cur_obj["rc_branch_states"][branch]["revoked_shas"])
+        == post_merge.MAX_EPHEMERAL_REVOKED_SHAS + 1
+    )
+    cur_300 = tmp_path / "cur-after-300.json"
+    cur_300.write_text(json.dumps(cur_obj), encoding="utf-8")
+    assert _cli_route(cur_300, "auto")["last_green_sha"] == pin_sha
+
+    # Passing requalification of `main_green` clears its revocation cleanly:
+    cur_requal = _cli_publish(
+        "requalify-main-green", cur_300, "rc_qualify", main_green, branch, "pass"
+    )
+    req_model = json.loads(cur_requal.read_text(encoding="utf-8"))
+    assert main_green not in req_model["rc_branch_states"][branch].get(
+        "revoked_shas", ()
+    )
+    assert _cli_route(cur_requal, "auto")["last_green_sha"] == main_green

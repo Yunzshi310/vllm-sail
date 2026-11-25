@@ -916,6 +916,86 @@ def _match_rc_line_context(
     return None, None
 
 
+MAX_EPHEMERAL_REVOKED_SHAS = 256
+
+
+def _protected_control_shas_in_cursor(
+    state: dict[str, Any] | None, *, verified_pin: str = ""
+) -> set[str]:
+    """Return every SHA still referenced as a candidate green control in ``state`` or ``verified_pin``.
+
+    Revocations for these SHAs must never be evicted by subsequent ephemeral branch-tip
+    failures; they may only be cleared when that exact SHA passes RC requalification.
+    """
+    protected: set[str] = set()
+
+    def _keep(raw: Any) -> None:
+        s = str(raw or "").strip()
+        if SHA1_RE.fullmatch(s):
+            protected.add(s)
+
+    _keep(verified_pin)
+    if not isinstance(state, dict):
+        return protected
+
+    for key in (
+        "last_ppu_green_sha",
+        "last_cpu_green_sha",
+        "last_ppu_tested_sha",
+        "last_cpu_checked_sha",
+    ):
+        _keep(state.get(key))
+
+    raw_last = state.get("last_probe_record")
+    if isinstance(raw_last, dict):
+        for key in ("upstream_sha", "last_ppu_green_sha", "last_ppu_tested_sha"):
+            _keep(raw_last.get(key))
+
+    for rec in state.get("probe_history") or ():
+        if isinstance(rec, dict):
+            for key in ("upstream_sha", "last_ppu_green_sha", "last_ppu_tested_sha"):
+                _keep(rec.get(key))
+
+    for br_ent in (state.get("rc_branch_states") or {}).values():
+        if not isinstance(br_ent, dict):
+            continue
+        _keep(br_ent.get("last_green_sha"))
+        if br_ent.get("status") == "pass":
+            _keep(br_ent.get("sha"))
+        for item in br_ent.get("green_history") or ():
+            _keep(item)
+
+    for tg_ent in (state.get("rc_tag_states") or {}).values():
+        if isinstance(tg_ent, dict) and tg_ent.get("status") == "pass":
+            _keep(tg_ent.get("sha"))
+
+    return protected
+
+
+def _cap_revoked_shas(
+    revoked: Sequence[str],
+    protected_shas: set[str],
+    *,
+    max_ephemeral: int = MAX_EPHEMERAL_REVOKED_SHAS,
+) -> list[str]:
+    """Bound ephemeral failed branch tips while retaining all live control revocations."""
+    kept: list[str] = []
+    seen: set[str] = set()
+    ephemeral_count = 0
+    for raw in revoked:
+        s = str(raw or "").strip()
+        if not SHA1_RE.fullmatch(s) or s in seen:
+            continue
+        if s in protected_shas:
+            kept.append(s)
+            seen.add(s)
+        elif ephemeral_count < max_ephemeral:
+            kept.append(s)
+            seen.add(s)
+            ephemeral_count += 1
+    return kept
+
+
 def _collect_excluded_control_shas(
     state: dict[str, Any] | None,
     *,
@@ -1398,7 +1478,7 @@ def _sanitize_cursor(
             entry_clean["last_green_sha"] = hist[0]
             entry_clean["green_history"] = hist
         if revoked_list:
-            entry_clean["revoked_shas"] = revoked_list[:20]
+            entry_clean["revoked_shas"] = revoked_list
         clean_branch_states[br_clean] = entry_clean
 
     # Enforce cross-entry fail-closed SHA verdict per release line (`fail` > `infra_error` > `pass`).
@@ -1467,7 +1547,7 @@ def _sanitize_cursor(
             if rem_hist:
                 b_ent["last_green_sha"] = rem_hist[0]
                 b_ent["green_history"] = rem_hist
-            b_ent["revoked_shas"] = bad_order[:20]
+            b_ent["revoked_shas"] = bad_order
 
     tested_rcs = [
         t
@@ -1567,6 +1647,18 @@ def _sanitize_cursor(
     sanitized["probe_history"] = clean_history
     if clean_history and "last_probe_record" not in sanitized:
         sanitized["last_probe_record"] = clean_history[0]
+
+    protected_controls = _protected_control_shas_in_cursor(sanitized, verified_pin=pin)
+    for b_ent in sanitized["rc_branch_states"].values():
+        if isinstance(b_ent, dict) and "revoked_shas" in b_ent:
+            capped_rev = _cap_revoked_shas(
+                b_ent.get("revoked_shas") or (), protected_controls
+            )
+            if capped_rev:
+                b_ent["revoked_shas"] = capped_rev
+            else:
+                b_ent.pop("revoked_shas", None)
+
     return sanitized
 
 
@@ -2229,7 +2321,7 @@ def advance_cursor(
                 b_cur = updated["rc_branch_states"][br_k]
                 if b_cur.get("sha") == good_sha:
                     b_cur["status"] = "pass"
-                rem_rev = [s for s in _prior_revoked_list(br_k) if s != good_sha][:20]
+                rem_rev = [s for s in _prior_revoked_list(br_k) if s != good_sha]
                 if rem_rev:
                     b_cur["revoked_shas"] = rem_rev
                 else:
@@ -2357,7 +2449,7 @@ def advance_cursor(
                     br_cur["revoked_shas"] = [
                         target_sha,
                         *(s for s in prev_rev if s != target_sha),
-                    ][:20]
+                    ]
                     updated["rc_branch_states"][branch_key] = br_cur
         elif branch_match:
             major, minor = int(branch_match.group(1)), int(branch_match.group(2))
@@ -2370,7 +2462,7 @@ def advance_cursor(
                 ]
                 _restore_line_sha(major, minor, target_sha)
                 hist = [target_sha, *seeded_before][:20]
-                rem_rev = [s for s in prev_rev if s != target_sha][:20]
+                rem_rev = [s for s in prev_rev if s != target_sha]
                 br_entry: dict[str, Any] = {
                     "sha": target_sha,
                     "status": "pass",
@@ -2393,7 +2485,7 @@ def advance_cursor(
                     "revoked_shas": [
                         target_sha,
                         *(s for s in prev_rev if s != target_sha),
-                    ][:20],
+                    ],
                 }
                 if hist:
                     br_entry["last_green_sha"] = hist[0]
@@ -2402,6 +2494,18 @@ def advance_cursor(
             updated["rc_branch_states"] = dict(
                 sorted(updated["rc_branch_states"].items())
             )
+        protected_rc_controls = _protected_control_shas_in_cursor(
+            updated, verified_pin=pin
+        )
+        for b_ent in updated["rc_branch_states"].values():
+            if isinstance(b_ent, dict) and "revoked_shas" in b_ent:
+                capped_rev = _cap_revoked_shas(
+                    b_ent.get("revoked_shas") or (), protected_rc_controls
+                )
+                if capped_rev:
+                    b_ent["revoked_shas"] = capped_rev
+                else:
+                    b_ent.pop("revoked_shas", None)
         return updated
 
     pre_lane_failure = (
@@ -6593,7 +6697,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             step_summary_path=args.step_summary,
         )
         cursor_path = args.public_dir / "cursor.json"
-        if args.gear in ("probe", "rc_qualify") and effective_status != "noop":
+        if (
+            args.gear in ("probe", "rc_qualify")
+            and effective_status != "noop"
+            and SHA1_RE.fullmatch(args.upstream_sha.strip())
+        ):
             next_cursor = advance_cursor(
                 prev_cursor,
                 verified_pin=verified_pin,
