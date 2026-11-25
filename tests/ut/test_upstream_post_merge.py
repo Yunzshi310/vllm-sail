@@ -5718,3 +5718,476 @@ def test_review_r2_sub1_symmetric_same_sha_multi_tag_and_cross_branch_recovery()
         cursor=after_rc1_genuine_retry,
     )
     assert route_after_t2["last_green_sha"] == sha_b
+
+
+def test_review_6057527910_partial_rerun_cursor_exact_sha_rc_ancestry_and_infra_verdict(
+    tmp_path: Path,
+) -> None:
+    """Regression suite for PR #374 re-review #6057527910 (2 P1s + 2 P2s + controls)."""
+    repo = tmp_path / "upstream"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+
+    def _git(*args: str) -> str:
+        return subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "-c",
+                "user.name=RC Review",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                *args,
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+    (repo / "vllm").mkdir()
+    (repo / "vllm" / "__init__.py").write_text(
+        "__version__ = '0.35.0'\n", encoding="utf-8"
+    )
+    (repo / "setup.py").write_text("# ok\n", encoding="utf-8")
+    shas: list[str] = []
+    for label in ("pin", "main-green", "A", "B", "C"):
+        (repo / "version").write_text(label + "\n", encoding="utf-8")
+        if label == "A":
+            (repo / "setup.py").write_text(
+                'raise RuntimeError("VLLM_TARGET_DEVICE=empty broken")\n',
+                encoding="utf-8",
+            )
+        _git("add", "-A")
+        _git("commit", "-qm", label)
+        shas.append(_git("rev-parse", "HEAD"))
+    pin, main_green, sha_a, sha_b, sha_c = shas
+
+    pin_file = tmp_path / "pin"
+    pin_file.write_text(pin + "\n", encoding="utf-8")
+    baseline_tag = tmp_path / "release"
+    baseline_tag.write_text("v0.34.0\n", encoding="utf-8")
+    refs_file = tmp_path / "ls-remote.txt"
+    branch = "releases/v0.35.0"
+    rc0, rc1 = "v0.35.0rc0", "v0.35.0rc1"
+    sail_sha = _sha(991)
+
+    _git("branch", "main-green", main_green)
+    _git("checkout", "-q", "main-green")
+    _git("update-ref", "refs/heads/main", main_green)
+
+    def _snapshot(tip: str, tags: dict[str, str]) -> None:
+        _git("update-ref", f"refs/heads/{branch}", tip)
+        for tag, sha in tags.items():
+            _git("update-ref", f"refs/tags/{tag}", sha)
+        out = subprocess.run(
+            [
+                "git",
+                "ls-remote",
+                str(repo),
+                "refs/heads/main",
+                "refs/heads/releases/v*",
+                "refs/tags/v*",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        refs_file.write_text(out + "\n", encoding="utf-8")
+
+    def _cli_route(
+        cursor_path: Path | None,
+        gear: str = "auto",
+        override: str = "",
+        vllm_repo_arg: Path | None = None,
+    ) -> dict[str, str]:
+        out_env = tmp_path / "gh-out.txt"
+        out_env.unlink(missing_ok=True)
+        argv = [
+            "route",
+            "--ls-remote-file",
+            str(refs_file),
+            "--verified-pin-file",
+            str(pin_file),
+            "--release-tag-file",
+            str(baseline_tag),
+            "--gear",
+            gear,
+            "--upstream-ref",
+            override,
+            "--github-output",
+            str(out_env),
+        ]
+        if cursor_path is not None:
+            argv += ["--cursor-file", str(cursor_path)]
+        if vllm_repo_arg is not None:
+            argv += ["--vllm-repo", str(vllm_repo_arg)]
+        assert post_merge.main(argv) == 0
+        parsed: dict[str, str] = {}
+        for line in out_env.read_text(encoding="utf-8").splitlines():
+            k, _, v = line.partition("=")
+            parsed[k] = v
+        return parsed
+
+    def _cli_publish(
+        label: str,
+        cursor_path: Path | None,
+        gear: str,
+        sha: str,
+        rc_ref: str = "",
+        status: str = "pass",
+        cpu_status: str = "pass",
+        ppu_status: str | None = None,
+        failure_stage: str = "none",
+    ) -> Path:
+        pub_dir = tmp_path / label
+        eff_ppu = status if ppu_status is None else ppu_status
+        argv = [
+            "publish",
+            "--gear",
+            gear,
+            "--upstream-sha",
+            sha,
+            "--verified-pin-file",
+            str(pin_file),
+            "--sail-sha",
+            sail_sha,
+            "--public-dir",
+            str(pub_dir),
+            "--status",
+            status,
+            "--cpu-status",
+            cpu_status,
+            "--ppu-status",
+            eff_ppu,
+            "--rc-tag",
+            rc_ref,
+        ]
+        if failure_stage != "none":
+            argv += ["--failure-stage", failure_stage]
+        elif status == "fail":
+            argv += ["--failure-stage", "rc_model_sanity"]
+        if cursor_path is not None:
+            argv += ["--cursor-in", str(cursor_path)]
+        assert post_merge.main(argv) == 0
+        return pub_dir / "cursor.json"
+
+    # --- 1. [P1 r4694815962] Exact-SHA RC retry updates matching release line & fails closed on ambiguity ---
+    main_cursor = _cli_publish("main-cursor", None, "probe", main_green)
+    a_pass = _cli_publish("br-a-pass", main_cursor, "rc_qualify", sha_a, branch)
+    b_pass = _cli_publish("br-b-pass", a_pass, "rc_qualify", sha_b, branch)
+    _snapshot(sha_b, {})
+
+    for label, ref in (("exact-sha", sha_b), ("named-branch-control", branch)):
+        dec = _cli_route(b_pass, "rc_qualify", ref)
+        assert dec["target_sha"] == sha_b
+        assert dec["rc_tag"] == branch
+        cur = _cli_publish(
+            f"pub-{label}", b_pass, dec["selected_gear"], sha_b, dec["rc_tag"], "fail"
+        )
+        persisted = json.loads(cur.read_text(encoding="utf-8"))["rc_branch_states"][
+            branch
+        ]
+        assert persisted["status"] == "fail"
+        _snapshot(sha_c, {})
+        following = _cli_route(cur)
+        assert following["last_green_sha"] == sha_a
+        _snapshot(sha_b, {})
+
+    # Exact-SHA retry after branch tip already moved to C in ls-remote (matched via cursor history):
+    _snapshot(sha_c, {})
+    dec_hist_sha = _cli_route(b_pass, "rc_qualify", sha_b)
+    assert dec_hist_sha["rc_tag"] == branch
+    # Direct publish with empty --rc-tag also resolves unique release line in cursor:
+    direct_empty_rc = _cli_publish(
+        "pub-direct-empty-rc", b_pass, "rc_qualify", sha_b, "", "fail"
+    )
+    assert (
+        json.loads(direct_empty_rc.read_text(encoding="utf-8"))["rc_branch_states"][
+            branch
+        ]["last_green_sha"]
+        == sha_a
+    )
+    # Ambiguous exact SHA across two active release lines fails closed:
+    with pytest.raises(ValueError, match="ambiguous"):
+        post_merge.route_three_gears(
+            ls_remote_data={
+                "main_sha": main_green,
+                "tags": {},
+                "release_branches": {
+                    "releases/v0.35.0": sha_b,
+                    "releases/v0.36.0": sha_b,
+                },
+            },
+            verified_pin=pin,
+            release_baseline_tag="v0.34.0",
+            requested_gear="rc_qualify",
+            upstream_ref_override=sha_b,
+            cursor=json.loads(b_pass.read_text(encoding="utf-8")),
+        )
+
+    # --- 2. [P1 r4694815957] Partial retry (`Re-run failed jobs`) preserves route cursor & upstream artifacts ---
+    wf = yaml.safe_load(
+        (REPO_ROOT / ".github/workflows/upstream-canary.yaml").read_text(
+            encoding="utf-8"
+        )
+    )["jobs"]
+    restore_step = next(
+        s
+        for s in wf["route"]["steps"]
+        if s.get("name") == "Restore prior cursor artifact when available"
+    )
+    assert "continue-on-error" not in restore_step
+    assert "has_route_cursor" in wf["route"]["outputs"]
+    assert "route_artifact_name" in wf["route"]["outputs"]
+    assert "fallback_green_shas" in wf["route"]["outputs"]
+    assert "has_cpu_artifact" in wf["cpu-fast-check"]["outputs"]
+    assert "cpu_artifact_name" in wf["cpu-fast-check"]["outputs"]
+    assert "has_ppu_artifact" in wf["ppu-probe-smoke"]["outputs"]
+    assert "ppu_artifact_name" in wf["ppu-probe-smoke"]["outputs"]
+    assert "selection_artifact" in wf["rc-ops-select"]["outputs"]
+    assert (
+        wf["rc-ops-tests"]["with"]["selection_artifact"]
+        == "${{ needs.rc-ops-select.outputs.selection_artifact }}"
+    )
+
+    pub_downloads = [
+        s
+        for s in wf["publish-and-triage"]["steps"]
+        if s.get("uses", "").startswith("actions/download-artifact@")
+    ]
+    assert len(pub_downloads) >= 3
+    for dl in pub_downloads:
+        assert "continue-on-error" not in dl
+        assert "pattern" not in dl["with"]
+        assert "github.run_attempt" not in dl["with"].get("name", "")
+
+    route_dl = next(
+        dl
+        for dl in pub_downloads
+        if dl["with"].get("name") == "${{ needs.route.outputs.route_artifact_name }}"
+    )
+    # Simulate attempt 1 producing `upstream-post-merge-route-42-1` and attempt 2 reusing `needs.route.outputs`:
+    available_artifacts = {"upstream-post-merge-route-42-1"}
+    route_output_from_attempt_1 = "upstream-post-merge-route-42-1"
+    for attempt in (1, 2):
+        requested_name = route_dl["with"]["name"].replace(
+            "${{ needs.route.outputs.route_artifact_name }}",
+            route_output_from_attempt_1,
+        )
+        assert requested_name in available_artifacts
+        cur_attempt = _cli_publish(
+            f"attempt-{attempt}", b_pass, "rc_qualify", sha_c, branch
+        )
+        loaded = json.loads(cur_attempt.read_text(encoding="utf-8"))
+        assert loaded["last_ppu_green_sha"] == main_green
+        assert loaded["rc_branch_states"][branch]["green_history"] == [
+            sha_c,
+            sha_b,
+            sha_a,
+        ]
+        assert len(loaded["probe_history"]) == 1
+
+    # --- 3. [P2 r4694815973] Verified first-parent ancestor selected for RC backlog & post-cut divergent main ---
+    _snapshot(sha_b, {rc0: sha_a, rc1: sha_b})
+    first_poll = _cli_route(main_cursor)
+    assert first_poll["rc_tag"] == rc1 and first_poll["target_sha"] == sha_b
+    cur_after_rc1 = _cli_publish(
+        "newer-tag-passed", main_cursor, "rc_qualify", sha_b, rc1
+    )
+    second_poll = _cli_route(cur_after_rc1)
+    assert second_poll["rc_tag"] == rc0 and second_poll["target_sha"] == sha_a
+    # Even without --vllm-repo, rc0 must NOT pick newer sibling/descendant rc1(B) as its control:
+    assert second_poll["last_green_sha"] == main_green
+
+    bisect_backlog = tmp_path / "bisect-backlog.json"
+    assert (
+        post_merge.main(
+            [
+                "bisect",
+                "--vllm-repo",
+                str(repo),
+                "--last-green-sha",
+                second_poll["last_green_sha"],
+                "--red-sha",
+                sha_a,
+                "--probe-cmd",
+                "true",
+                "--output-json",
+                str(bisect_backlog),
+            ]
+        )
+        == 0
+    )
+    backlog_res = json.loads(bisect_backlog.read_text(encoding="utf-8"))
+    assert backlog_res["bisect_status"] == "converged"
+    assert backlog_res["first_failing_sha"] == sha_a
+
+    # Divergent main after release branch cut: `pin -> main-green -> newer_main` vs `pin -> main-green -> A`
+    _git("update-ref", "-d", f"refs/tags/{rc0}")
+    _git("update-ref", "-d", f"refs/tags/{rc1}")
+    (repo / "version").write_text("main after release cut\n", encoding="utf-8")
+    _git("add", "version")
+    _git("commit", "-qm", "main after release cut")
+    newer_main = _git("rev-parse", "HEAD")
+    _git("update-ref", "refs/heads/main", newer_main)
+    advanced_main = _cli_publish("main-after-cut", main_cursor, "probe", newer_main)
+    _snapshot(sha_a, {})
+
+    # (a) Repo-aware route (used by upstream-canary.yaml) picks verified ancestor `main_green` directly,
+    #     including on an empty shallow clone with `origin` configured (matching `state/vllm-diff`):
+    routed_with_repo = _cli_route(advanced_main, vllm_repo_arg=repo)
+    assert routed_with_repo["target_sha"] == sha_a
+    assert routed_with_repo["last_green_sha"] == main_green
+
+    empty_diff_repo = tmp_path / "vllm-diff-sim"
+    subprocess.run(["git", "init", "-q", str(empty_diff_repo)], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(empty_diff_repo),
+            "remote",
+            "add",
+            "origin",
+            repo.as_uri(),
+        ],
+        check=True,
+    )
+    routed_shallow_origin = _cli_route(advanced_main, vllm_repo_arg=empty_diff_repo)
+    assert routed_shallow_origin["target_sha"] == sha_a
+    assert routed_shallow_origin["last_green_sha"] == main_green
+
+    # (b) Offline route without --vllm-repo emits fallback_green_shas, and bisect with --cursor-file /
+    #     --fallback-green-shas walks older verified controls to `main_green` and converges to `sha_a`:
+    routed_offline = _cli_route(advanced_main)
+    assert main_green in routed_offline["fallback_green_shas"].split(",")
+    bisect_divergent = tmp_path / "bisect-divergent.json"
+    assert (
+        post_merge.main(
+            [
+                "bisect",
+                "--vllm-repo",
+                str(repo),
+                "--last-green-sha",
+                routed_offline["last_green_sha"],
+                "--fallback-green-shas",
+                routed_offline["fallback_green_shas"],
+                "--cursor-file",
+                str(advanced_main),
+                "--verified-pin-file",
+                str(pin_file),
+                "--red-sha",
+                sha_a,
+                "--probe-cmd",
+                "true",
+                "--output-json",
+                str(bisect_divergent),
+            ]
+        )
+        == 0
+    )
+    div_res = json.loads(bisect_divergent.read_text(encoding="utf-8"))
+    assert div_res["bisect_status"] == "converged"
+    assert div_res["first_failing_sha"] == sha_a
+    assert div_res["last_good_sha"] == main_green
+
+    # Also verify source-build-triage resolves verified ancestor `main_green` when given divergent `newer_main`:
+    sbt_div_dir = tmp_path / "sbt-divergent"
+    sbt_probe_cmd = (
+        "set -euo pipefail\n"
+        'wt="$(mktemp -d)"\n'
+        'trap \'git -C "$VLLM_REPO" worktree remove --force "$wt" >/dev/null 2>&1 || rm -rf "$wt"\' EXIT\n'
+        'git -C "$VLLM_REPO" worktree add --quiet --detach "$wt" "$CANDIDATE_SHA"\n'
+        f'"{sys.executable}" "$wt/setup.py"\n'
+        f'PYTHONPATH="$wt" "{sys.executable}" "$STUB_CHECK_SCRIPT"\n'
+    )
+    sbt_div = post_merge.run_source_only_build_triage(
+        vllm_repo=repo,
+        sail_root=REPO_ROOT,
+        target_sha=sha_a,
+        verified_pin=pin,
+        last_green_sha=routed_offline["last_green_sha"],
+        fallback_green_shas=routed_offline["fallback_green_shas"].split(","),
+        cursor=json.loads(advanced_main.read_text(encoding="utf-8")),
+        rc_tag=branch,
+        output_dir=sbt_div_dir,
+        probe_cmd=sbt_probe_cmd,
+    )
+    assert sbt_div["bisect"]["bisect_status"] == "converged"
+    assert sbt_div["bisect"]["first_failing_sha"] == sha_a
+    assert sbt_div["bisect"]["last_good_sha"] == main_green
+
+    # (c) Unverified fork-point control: if release branch forked from an unverified commit `unver_mid`
+    #     (`pin -> unver_mid -> newer_main2` and `pin -> unver_mid -> rc_cut`), only verified `pin` is chosen!
+    _git("checkout", "-q", "--detach", pin)
+    (repo / "version").write_text("unverified-mid\n", encoding="utf-8")
+    _git("add", "version")
+    _git("commit", "-qm", "unverified-mid")
+    unver_mid = _git("rev-parse", "HEAD")
+    (repo / "version").write_text("newer-main-2\n", encoding="utf-8")
+    _git("add", "version")
+    _git("commit", "-qm", "newer-main-2")
+    newer_main2 = _git("rev-parse", "HEAD")
+    _git("checkout", "-q", "--detach", unver_mid)
+    (repo / "version").write_text("rc-from-unver\n", encoding="utf-8")
+    _git("add", "version")
+    _git("commit", "-qm", "rc-from-unver")
+    rc_from_unver = _git("rev-parse", "HEAD")
+    _git("update-ref", "refs/heads/main", newer_main2)
+    cur_only_pin_and_nm2 = _cli_publish("only-nm2", None, "probe", newer_main2)
+    _snapshot(rc_from_unver, {})
+    routed_unver = _cli_route(cur_only_pin_and_nm2, vllm_repo_arg=repo)
+    assert routed_unver["last_green_sha"] == pin
+
+    # --- 4. [P2 r4694815979] Explicit `infra_error` verdict survives cursor reload & unrelated main probes ---
+    _snapshot(sha_b, {})
+    infra_cursor = _cli_publish(
+        "infra-rc",
+        a_pass,
+        "rc_qualify",
+        sha_b,
+        branch,
+        status="fail",
+        cpu_status="not_run",
+        ppu_status="not_run",
+        failure_stage="wheel_build",
+    )
+    infra_summary = json.loads(
+        (tmp_path / "infra-rc" / "public-summary.json").read_text(encoding="utf-8")
+    )
+    assert infra_summary["status"] == "infra_error"
+    assert (
+        json.loads(infra_cursor.read_text(encoding="utf-8"))["rc_branch_states"][
+            branch
+        ]["status"]
+        == "infra_error"
+    )
+    after_unrelated_main = _cli_publish(
+        "unrelated-main", infra_cursor, "probe", newer_main
+    )
+    after_data = json.loads(after_unrelated_main.read_text(encoding="utf-8"))
+    assert after_data["rc_branch_states"][branch]["status"] == "infra_error"
+    assert sha_b in after_data["rc_branch_states"][branch]["revoked_shas"]
+    assert after_data["rc_branch_states"][branch]["last_green_sha"] == sha_a
+
+    # Same preservation when an RC tag also has `infra_error` while `fail` still wins on true conflict:
+    tag_infra_cur = post_merge._sanitize_cursor(
+        {
+            **after_data,
+            "rc_tag_states": {rc1: {"sha": sha_b, "status": "infra_error"}},
+        },
+        verified_pin=pin,
+    )
+    assert tag_infra_cur["rc_tag_states"][rc1]["status"] == "infra_error"
+    assert tag_infra_cur["rc_branch_states"][branch]["status"] == "infra_error"
+    tag_fail_conflict = post_merge._sanitize_cursor(
+        {
+            **after_data,
+            "rc_tag_states": {rc1: {"sha": sha_b, "status": "fail"}},
+        },
+        verified_pin=pin,
+    )
+    assert tag_fail_conflict["rc_tag_states"][rc1]["status"] == "fail"
+    assert tag_fail_conflict["rc_branch_states"][branch]["status"] == "fail"

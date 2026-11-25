@@ -57,10 +57,13 @@ jobs:
       target_sha: ${{ steps.route.outputs.target_sha }}
       rc_tag: ${{ steps.route.outputs.rc_tag }}
       last_green_sha: ${{ steps.route.outputs.last_green_sha }}
+      fallback_green_shas: ${{ steps.route.outputs.fallback_green_shas }}
       last_ppu_tested_sha: ${{ steps.route.outputs.last_ppu_tested_sha }}
       run_cpu: ${{ steps.route.outputs.run_cpu }}
       run_ppu: ${{ steps.route.outputs.run_ppu }}
       ppu_skip_reason: ${{ steps.route.outputs.ppu_skip_reason }}
+      has_route_cursor: ${{ steps.route.outputs.has_route_cursor }}
+      route_artifact_name: ${{ steps.route.outputs.route_artifact_name }}
     steps:
       - name: Check out vLLM SAIL
         uses: actions/checkout@v4
@@ -108,11 +111,17 @@ jobs:
                 owner,
                 repo,
                 run_id: run.id,
-                per_page: 20,
+                per_page: 100,
               }).catch(() => ({ data: { artifacts: [] } }));
-              const curArt = (arts.data.artifacts || []).find(
-                a => !a.expired && a.name.startsWith("upstream-post-merge-cursor-")
-              );
+              const cursorArts = (arts.data.artifacts || [])
+                .filter(a => !a.expired && a.name.startsWith("upstream-post-merge-cursor-"))
+                .sort((a, b) => {
+                  const attA = Number((a.name.match(/-(\d+)$/) || [])[1] || 0);
+                  const attB = Number((b.name.match(/-(\d+)$/) || [])[1] || 0);
+                  if (attB !== attA) return attB - attA;
+                  return (b.id || 0) - (a.id || 0);
+                });
+              const curArt = cursorArts[0];
               if (!curArt) continue;
               core.setOutput("prior_canary_run_id", String(run.id));
               core.setOutput("prior_cursor_artifact", curArt.name);
@@ -126,7 +135,6 @@ jobs:
 
       - name: Restore prior cursor artifact when available
         if: steps.prior.outputs.prior_canary_run_id != ''
-        continue-on-error: true
         uses: actions/download-artifact@v4
         with:
           name: ${{ steps.prior.outputs.prior_cursor_artifact }}
@@ -142,8 +150,14 @@ jobs:
           UPSTREAM_REF_OVERRIDE: ${{ inputs.upstream_ref || '' }}
           LAST_GREEN_OVERRIDE: ${{ inputs.last_green_sha || '' }}
           FORCE_PROBE: ${{ inputs.force || false }}
+          PRIOR_CANARY_RUN_ID: ${{ steps.prior.outputs.prior_canary_run_id || '' }}
         run: |
+          set -euo pipefail
           mkdir -p state
+          if [[ -n "${PRIOR_CANARY_RUN_ID}" && ! -f state/prior-cursor/cursor.json ]]; then
+            echo "prior cursor artifact from run ${PRIOR_CANARY_RUN_ID} did not contain cursor.json" >&2
+            exit 1
+          fi
           git ls-remote https://github.com/vllm-project/vllm.git refs/heads/main "refs/heads/releases/v*" "refs/tags/v*" > state/ls-remote.txt
           if [[ -f state/prior-cursor/cursor.json ]]; then
             cp state/prior-cursor/cursor.json state/cursor.json
@@ -162,12 +176,13 @@ jobs:
           fi
           head_main_sha="$(awk '$2 == "refs/heads/main" { print $1 }' state/ls-remote.txt)"
           target_for_diff="${UPSTREAM_REF_OVERRIDE:-$head_main_sha}"
+          rm -rf state/vllm-diff
+          git init -q state/vllm-diff
+          git -C state/vllm-diff remote add origin https://github.com/vllm-project/vllm.git
           if [[ "$target_for_diff" =~ ^[0-9a-f]{40}$ && "$base_ppu_green_sha" =~ ^[0-9a-f]{40}$ && "$target_for_diff" != "$base_ppu_green_sha" ]]; then
-            git init -q state/vllm-diff
-            if git -C state/vllm-diff fetch --quiet --depth=120 https://github.com/vllm-project/vllm.git "$target_for_diff" "$base_ppu_green_sha" 2>/dev/null; then
+            if git -C state/vllm-diff fetch --quiet --depth=120 origin "$target_for_diff" "$base_ppu_green_sha" 2>/dev/null; then
               git -C state/vllm-diff diff --no-renames --name-only "$base_ppu_green_sha" "$target_for_diff" > state/changed-files.txt || true
             fi
-            rm -rf state/vllm-diff
           fi
 
           active_pr="$(cat state/active-pr-runs.txt 2>/dev/null || echo 0)"
@@ -185,8 +200,10 @@ jobs:
             --changed-files-file state/changed-files.txt \
             --changed-files-base-sha "${base_ppu_green_sha}" \
             --active-pr-runs "${active_pr}" \
+            --vllm-repo state/vllm-diff \
             "${force_arg[@]}" \
             --github-output "$GITHUB_OUTPUT")"
+          rm -rf state/vllm-diff
           printf '%s\n' "${route_json}"
 
           if [[ -n "${LAST_GREEN_OVERRIDE}" ]]; then
@@ -204,14 +221,26 @@ jobs:
               p.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
           PY
           fi
+          if [[ -f state/cursor.json ]]; then
+            {
+              printf 'has_route_cursor=true\n'
+              printf 'route_artifact_name=upstream-post-merge-route-%s-%s\n' "${GITHUB_RUN_ID}" "${GITHUB_RUN_ATTEMPT}"
+            } >> "$GITHUB_OUTPUT"
+          else
+            {
+              printf 'has_route_cursor=false\n'
+              printf 'route_artifact_name=\n'
+            } >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Upload sanitized routing state for downstream jobs
+        if: steps.route.outputs.has_route_cursor == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: upstream-post-merge-route-${{ github.run_id }}-${{ github.run_attempt }}
+          name: ${{ steps.route.outputs.route_artifact_name }}
           path: |
             state/cursor.json
-          if-no-files-found: ignore
+          if-no-files-found: error
           retention-days: 7
 
   build:
@@ -244,12 +273,17 @@ jobs:
       )
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    outputs:
+      has_cpu_artifact: ${{ steps.cpu_meta.outputs.has_cpu_artifact }}
+      cpu_artifact_name: ${{ steps.cpu_meta.outputs.cpu_artifact_name }}
     container:
       image: download.t-head.cn/docker_release/pytorch@sha256:a33a67832f7ec442c481421e94255518dd67e464406f8e610c15d2b594b21f80
     env:
       SAIL_PIP_INDEX_URL: https://mirrors.aliyun.com/pypi/simple/
       TARGET_SHA: ${{ needs.route.outputs.target_sha }}
       LAST_GREEN_SHA: ${{ needs.route.outputs.last_green_sha }}
+      FALLBACK_GREEN_SHAS: ${{ needs.route.outputs.fallback_green_shas || '' }}
+      RC_TAG: ${{ needs.route.outputs.rc_tag || '' }}
       BUILD_RESULT: ${{ needs.build.result }}
     steps:
       - name: Disable internal GitHub mirror rewrite silently
@@ -280,11 +314,11 @@ jobs:
           run-id: ${{ github.run_id }}
           github-token: ${{ github.token }}
 
-      - name: Download routing cursor if present
-        continue-on-error: true
+      - name: Download routing cursor when available
+        if: needs.route.outputs.has_route_cursor == 'true'
         uses: actions/download-artifact@v4
         with:
-          name: upstream-post-merge-route-${{ github.run_id }}-${{ github.run_attempt }}
+          name: ${{ needs.route.outputs.route_artifact_name }}
           path: /tmp/post-merge-route
 
       - name: Install candidate wheels and execute SDK CPU fast check
@@ -295,6 +329,10 @@ jobs:
           mkdir -p /tmp/post-merge-cpu
           verified_pin="$(tr -d '[:space:]' < .github/vllm-main-verified.commit)"
           control_sha="${LAST_GREEN_SHA:-$verified_pin}"
+          cursor_arg=()
+          if [[ -f /tmp/post-merge-route/cursor.json ]]; then
+            cursor_arg=(--cursor-file /tmp/post-merge-route/cursor.json)
+          fi
 
           git init -q /tmp/vllm-src
           git -C /tmp/vllm-src remote add origin https://github.com/vllm-project/vllm.git
@@ -325,6 +363,9 @@ jobs:
               --sail-root "$PWD" \
               --target-sha "${TARGET_SHA}" \
               --last-green-sha "${control_sha}" \
+              --fallback-green-shas "${FALLBACK_GREEN_SHAS}" \
+              --rc-tag "${RC_TAG}" \
+              "${cursor_arg[@]}" \
               --output-dir /tmp/post-merge-cpu
             exit 1
           fi
@@ -354,7 +395,7 @@ jobs:
           rc=$?
           set -e
 
-          if [[ "$rc" -ne 0 && -n "${LAST_GREEN_SHA}" && "${LAST_GREEN_SHA}" != "${TARGET_SHA}" ]]; then
+          if [[ "$rc" -ne 0 && ( ( -n "${LAST_GREEN_SHA}" && "${LAST_GREEN_SHA}" != "${TARGET_SHA}" ) || -n "${FALLBACK_GREEN_SHAS}" ) ]]; then
             SAIL_ROOT="$PWD"
             export SAIL_ROOT
             # shellcheck disable=SC2016
@@ -382,7 +423,11 @@ jobs:
             '
             python3 scripts/ci/ppu_upstream_post_merge.py bisect \
               --vllm-repo /tmp/vllm-src \
-              --last-green-sha "${LAST_GREEN_SHA}" \
+              --last-green-sha "${control_sha}" \
+              --fallback-green-shas "${FALLBACK_GREEN_SHAS}" \
+              --rc-tag "${RC_TAG}" \
+              "${cursor_arg[@]}" \
+              --verified-pin-file .github/vllm-main-verified.commit \
               --red-sha "${TARGET_SHA}" \
               --probe-cmd "${probe_cmd}" \
               --initial-red-json /tmp/post-merge-cpu/cpu-result.json \
@@ -428,16 +473,33 @@ jobs:
           fi
           exit "$rc"
 
-      - name: Upload sanitized CPU check & bisection metadata
+      - name: Record CPU check artifact metadata
+        id: cpu_meta
         if: always()
+        shell: bash
+        run: |
+          if [[ -f /tmp/post-merge-cpu/cpu-result.json || -f /tmp/post-merge-cpu/bisect-result.json || -f /tmp/post-merge-cpu/non-ppu-repro.json ]]; then
+            {
+              printf 'has_cpu_artifact=true\n'
+              printf 'cpu_artifact_name=upstream-post-merge-cpu-%s-%s\n' "${GITHUB_RUN_ID}" "${GITHUB_RUN_ATTEMPT}"
+            } >> "$GITHUB_OUTPUT"
+          else
+            {
+              printf 'has_cpu_artifact=false\n'
+              printf 'cpu_artifact_name=\n'
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload sanitized CPU check & bisection metadata
+        if: always() && steps.cpu_meta.outputs.has_cpu_artifact == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: upstream-post-merge-cpu-${{ github.run_id }}-${{ github.run_attempt }}
+          name: ${{ steps.cpu_meta.outputs.cpu_artifact_name }}
           path: |
             /tmp/post-merge-cpu/cpu-result.json
             /tmp/post-merge-cpu/bisect-result.json
             /tmp/post-merge-cpu/non-ppu-repro.json
-          if-no-files-found: ignore
+          if-no-files-found: error
           retention-days: 7
 
   ppu-probe-smoke:
@@ -452,6 +514,9 @@ jobs:
        (needs.route.outputs.run_cpu != 'true' && needs.cpu-fast-check.result == 'skipped'))
     runs-on: 8-ppu-m890p
     timeout-minutes: 90
+    outputs:
+      has_ppu_artifact: ${{ steps.ppu_meta.outputs.has_ppu_artifact }}
+      ppu_artifact_name: ${{ steps.ppu_meta.outputs.ppu_artifact_name }}
     concurrency:
       group: upstream-post-merge-ppu-slot
       cancel-in-progress: false
@@ -459,6 +524,7 @@ jobs:
       GIT_CONFIG_NOSYSTEM: "1"
       TARGET_SHA: ${{ needs.route.outputs.target_sha }}
       LAST_GREEN_SHA: ${{ needs.route.outputs.last_green_sha }}
+      FALLBACK_GREEN_SHAS: ${{ needs.route.outputs.fallback_green_shas || '' }}
     defaults:
       run:
         shell: bash
@@ -498,6 +564,13 @@ jobs:
           run-id: ${{ github.run_id }}
           github-token: ${{ github.token }}
 
+      - name: Download routing cursor when available
+        if: needs.route.outputs.has_route_cursor == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.route.outputs.route_artifact_name }}
+          path: ${{ steps.runtime.outputs.bisect_dir }}/route-cursor
+
       - name: Run 1-card Qwen3.8-27B TP1 smoke via unified Recipe executor (with bisect on red)
         id: smoke
         env:
@@ -516,6 +589,7 @@ jobs:
         run: |
           umask 077
           verified="$(tr -d '[:space:]' < "${PPU_CI_SOURCE_DIR}/.github/vllm-main-verified.commit")"
+          control_sha="${LAST_GREEN_SHA:-$verified}"
           export PPU_CI_EXPECTED_VLLM_COMMIT="${TARGET_SHA}"
           if [[ "${TARGET_SHA}" != "${verified}" ]]; then
             export PPU_CI_CANDIDATE_UPSTREAM_COMMIT="${TARGET_SHA}"
@@ -527,11 +601,15 @@ jobs:
           rc=$?
           set -e
 
-          if [[ "$rc" -ne 0 && -n "${LAST_GREEN_SHA}" && "${LAST_GREEN_SHA}" != "${TARGET_SHA}" ]]; then
+          if [[ "$rc" -ne 0 && ( ( -n "${LAST_GREEN_SHA}" && "${LAST_GREEN_SHA}" != "${TARGET_SHA}" ) || -n "${FALLBACK_GREEN_SHAS}" ) ]]; then
             git init -q "${BISECT_DIR}/vllm-src"
             git -C "${BISECT_DIR}/vllm-src" remote add origin https://github.com/vllm-project/vllm.git
             git -C "${BISECT_DIR}/vllm-src" fetch --quiet --depth=250 origin "${TARGET_SHA}" || true
-            git -C "${BISECT_DIR}/vllm-src" fetch --quiet --depth=1 origin "${LAST_GREEN_SHA}" || true
+            git -C "${BISECT_DIR}/vllm-src" fetch --quiet --depth=1 origin "${control_sha}" || true
+            cursor_arg=()
+            if [[ -f "${BISECT_DIR}/route-cursor/cursor.json" ]]; then
+              cursor_arg=(--cursor-file "${BISECT_DIR}/route-cursor/cursor.json")
+            fi
 
             # shellcheck disable=SC2016
             probe_cmd='
@@ -580,7 +658,10 @@ jobs:
             '
             python3 "${PPU_CI_SOURCE_DIR}/scripts/ci/ppu_upstream_post_merge.py" bisect \
               --vllm-repo "${BISECT_DIR}/vllm-src" \
-              --last-green-sha "${LAST_GREEN_SHA}" \
+              --last-green-sha "${control_sha}" \
+              --fallback-green-shas "${FALLBACK_GREEN_SHAS}" \
+              "${cursor_arg[@]}" \
+              --verified-pin-file "${PPU_CI_SOURCE_DIR}/.github/vllm-main-verified.commit" \
               --red-sha "${TARGET_SHA}" \
               --probe-cmd "${probe_cmd}" \
               --default-stage ppu_probe_smoke \
@@ -601,13 +682,31 @@ jobs:
           umask 077
           python3 -I "${PPU_CI_SOURCE_DIR}/scripts/ci/ppu_recipe_retention.py" || true
 
-      - name: Upload sanitized PPU bisection metadata
+      - name: Record PPU bisection artifact metadata
+        id: ppu_meta
         if: always() && steps.runtime.outcome == 'success'
+        env:
+          BISECT_DIR: ${{ steps.runtime.outputs.bisect_dir }}
+        run: |
+          if [[ -f "${BISECT_DIR}/bisect-result.json" ]]; then
+            {
+              printf 'has_ppu_artifact=true\n'
+              printf 'ppu_artifact_name=upstream-post-merge-ppu-%s-%s\n' "${GITHUB_RUN_ID}" "${GITHUB_RUN_ATTEMPT}"
+            } >> "$GITHUB_OUTPUT"
+          else
+            {
+              printf 'has_ppu_artifact=false\n'
+              printf 'ppu_artifact_name=\n'
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload sanitized PPU bisection metadata
+        if: always() && steps.runtime.outcome == 'success' && steps.ppu_meta.outputs.has_ppu_artifact == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: upstream-post-merge-ppu-${{ github.run_id }}-${{ github.run_attempt }}
+          name: ${{ steps.ppu_meta.outputs.ppu_artifact_name }}
           path: ${{ steps.runtime.outputs.bisect_dir }}/bisect-result.json
-          if-no-files-found: ignore
+          if-no-files-found: error
           retention-days: 7
 
       - name: Remove temporary runner directories
@@ -693,6 +792,7 @@ jobs:
       matrix: ${{ steps.select.outputs.matrix }}
       has_tests: ${{ steps.select.outputs.has_tests }}
       runtime_image: ${{ steps.select.outputs.runtime_image }}
+      selection_artifact: ${{ steps.select.outputs.selection_artifact }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -755,10 +855,11 @@ jobs:
             --expected-vllm-commit "${EXPECTED_VLLM_COMMIT}" \
             --scope full \
             --output ops-selection/selection.json
+          printf 'selection_artifact=ppu-ops-selection-%s-%s\n' "${GITHUB_RUN_ID}" "${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ppu-ops-selection-${{ github.run_id }}-${{ github.run_attempt }}
+          name: ${{ steps.select.outputs.selection_artifact }}
           path: ops-selection/
           if-no-files-found: error
           retention-days: 14
@@ -777,7 +878,7 @@ jobs:
     with:
       build_run_id: ${{ github.run_id }}
       matrix: ${{ needs.rc-ops-select.outputs.matrix }}
-      selection_artifact: ppu-ops-selection-${{ github.run_id }}-${{ github.run_attempt }}
+      selection_artifact: ${{ needs.rc-ops-select.outputs.selection_artifact }}
       build_image: ${{ needs.build.outputs.image }}
       expected_vllm_commit: ${{ needs.route.outputs.target_sha }}
       image: ${{ needs.rc-ops-select.outputs.runtime_image }}
@@ -941,13 +1042,26 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
 
-      - name: Download route, CPU, and PPU metadata artifacts
-        continue-on-error: true
+      - name: Download routing cursor artifact
+        if: always() && needs.route.outputs.has_route_cursor == 'true'
         uses: actions/download-artifact@v4
         with:
-          pattern: upstream-post-merge-*-${{ github.run_id }}-${{ github.run_attempt }}
+          name: ${{ needs.route.outputs.route_artifact_name }}
           path: /tmp/post-merge-meta
-          merge-multiple: true
+
+      - name: Download CPU metadata artifact
+        if: always() && needs.cpu-fast-check.outputs.has_cpu_artifact == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.cpu-fast-check.outputs.cpu_artifact_name }}
+          path: /tmp/post-merge-meta
+
+      - name: Download PPU bisection artifact
+        if: always() && needs.ppu-probe-smoke.outputs.has_ppu_artifact == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.ppu-probe-smoke.outputs.ppu_artifact_name }}
+          path: /tmp/post-merge-meta
 
       - name: Render and mechanically verify public Console, Summary, Artifact, and Issue payloads
         id: publish
@@ -958,6 +1072,7 @@ jobs:
           RUN_CPU: ${{ needs.route.outputs.run_cpu || 'false' }}
           RUN_PPU: ${{ needs.route.outputs.run_ppu || 'false' }}
           PPU_SKIP_REASON: ${{ needs.route.outputs.ppu_skip_reason || 'none' }}
+          HAS_ROUTE_CURSOR: ${{ needs.route.outputs.has_route_cursor || 'false' }}
           OPS_IMAGE: ${{ inputs.ops_image || '' }}
           BUILD_IMAGE: ${{ needs.build.outputs.image || '' }}
           ROUTE_RESULT: ${{ needs.route.result }}
@@ -975,6 +1090,10 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p /tmp/post-merge-public
+          if [[ "${HAS_ROUTE_CURSOR}" == "true" && ! -f /tmp/post-merge-meta/cursor.json ]]; then
+            echo "route reported has_route_cursor=true but /tmp/post-merge-meta/cursor.json is missing" >&2
+            exit 1
+          fi
           resolved_env="/tmp/post-merge-public/resolved-outcome.env"
           : > "${resolved_env}"
           python3 scripts/ci/ppu_upstream_post_merge.py resolve-outcome \
