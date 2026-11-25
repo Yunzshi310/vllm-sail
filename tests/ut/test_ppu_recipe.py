@@ -2815,13 +2815,15 @@ def test_hardware_precision_binding_contract(tmp_path: Path) -> None:
     glm_pol = yaml.safe_load((POLICY_DIR / "models" / "glm-5.3.yaml").read_text())
     qwen_doc = yaml.safe_load((RECIPES_DIR / "Qwen" / "Qwen3.8-27B.yaml").read_text())
 
-    # 1. Valid M890 (mxfp4/fp4/fp8) and 810E (int8/w8a8_int8/w4a8_int8) controls
+    # 1. Valid M890 (bf16/mxfp4/fp4/fp8) and 810E (bf16/int8/w8a8_int8/w4a8_int8) controls
     for hw, prec in (
+        ("zhenwu_m890", "bf16"),
         ("zhenwu_m890", "mxfp4"),
         ("zhenwu_m890", "mxfp4_fp8"),
         ("zhenwu_m890", "fp4"),
         ("zhenwu_m890", "fp8"),
         ("zhenwu_m890", "fp8_channel"),
+        ("zhenwu_810e", "bf16"),
         ("zhenwu_810e", "int8"),
         ("zhenwu_810e", "w8a8_int8"),
         ("zhenwu_810e", "w4a8_int8"),
@@ -2830,14 +2832,14 @@ def test_hardware_precision_binding_contract(tmp_path: Path) -> None:
             hardware=hw, precision=prec, context="control"
         )
 
-    # 2. Cross-binding & bf16 counterexamples rejected on recipe variants
+    # 2. Cross-binding & unsupported precision counterexamples rejected on recipe variants
     for hw, bad_prec, match in (
-        ("zhenwu_m890", "w8a8_int8", "only allows mxfp4/fp4/fp8"),
-        ("zhenwu_m890", "int8", "only allows mxfp4/fp4/fp8"),
-        ("zhenwu_m890", "bf16", "precision 'bf16' is forbidden"),
-        ("zhenwu_810e", "mxfp4", "only allows int8 precision"),
-        ("zhenwu_810e", "fp8", "only allows int8 precision"),
-        ("zhenwu_810e", "bf16", "precision 'bf16' is forbidden"),
+        ("zhenwu_m890", "w8a8_int8", "only allows bf16 or mxfp4/fp4/fp8"),
+        ("zhenwu_m890", "int8", "only allows bf16 or mxfp4/fp4/fp8"),
+        ("zhenwu_m890", "fp16", "only allows bf16 or mxfp4/fp4/fp8"),
+        ("zhenwu_810e", "mxfp4", "only allows bf16 or int8 precision"),
+        ("zhenwu_810e", "fp8", "only allows bf16 or int8 precision"),
+        ("zhenwu_810e", "fp16", "only allows bf16 or int8 precision"),
     ):
         bad = copy.deepcopy(glm_doc)
         bad["variants"]["default"]["hardware"] = hw
@@ -2848,12 +2850,14 @@ def test_hardware_precision_binding_contract(tmp_path: Path) -> None:
     # 3. Policy cross-binding rejected (810E policy pointing at MXFP4 variant, or M890 at w8a8_int8)
     bad_pol_810e = copy.deepcopy(glm_pol)
     bad_pol_810e["hardware"] = "zhenwu_810e"
-    with pytest.raises(ppu_recipe.ValidationError, match="only allows int8"):
+    with pytest.raises(ppu_recipe.ValidationError, match="only allows bf16 or int8"):
         ppu_recipe.validate_policy_structure(bad_pol_810e, context="bad_pol_810e")
 
     bad_pol_m890 = copy.deepcopy(glm_pol)
     bad_pol_m890["variant"] = "w8a8_int8"
-    with pytest.raises(ppu_recipe.ValidationError, match="only allows mxfp4/fp4/fp8"):
+    with pytest.raises(
+        ppu_recipe.ValidationError, match="only allows bf16 or mxfp4/fp4/fp8"
+    ):
         ppu_recipe.validate_policy_structure(bad_pol_m890, context="bad_pol_m890")
 
     # 4. Cross-hardware preset resolution fails closed
@@ -2864,33 +2868,29 @@ def test_hardware_precision_binding_contract(tmp_path: Path) -> None:
             preset="decode",
         )
 
-    # 5. Legacy BF16 smoke exception only applies to single-variant preset-less fast_sanity
+    # 5. BF16 is allowed across hardware with presets, sibling quantized variants, and model_sanity
     ppu_recipe.validate_serving_recipe_structure(qwen_doc, context="qwen_control")
     qwen_with_preset = copy.deepcopy(qwen_doc)
-    qwen_with_preset["presets"] = {"prefill": {"args": []}}
-    with pytest.raises(
-        ppu_recipe.ValidationError, match="precision 'bf16' is forbidden"
-    ):
-        ppu_recipe.validate_serving_recipe_structure(
-            qwen_with_preset, context="qwen_preset"
-        )
+    qwen_with_preset["presets"] = {
+        "prefill": {"hardware": "zhenwu_m890", "args": []},
+        "decode": {"hardware": "zhenwu_810e", "args": []},
+    }
+    ppu_recipe.validate_serving_recipe_structure(
+        qwen_with_preset, context="qwen_preset"
+    )
 
     qwen_two_vars = copy.deepcopy(qwen_doc)
     qwen_two_vars["variants"]["fp8"] = {"precision": "fp8"}
-    with pytest.raises(
-        ppu_recipe.ValidationError, match="precision 'bf16' is forbidden"
-    ):
-        ppu_recipe.validate_serving_recipe_structure(
-            qwen_two_vars, context="qwen_two_vars"
-        )
+    ppu_recipe.validate_serving_recipe_structure(qwen_two_vars, context="qwen_two_vars")
 
     qwen_pol = yaml.safe_load((POLICY_DIR / "models" / "qwen3.8-27b.yaml").read_text())
     qwen_pol_ms = copy.deepcopy(qwen_pol)
-    qwen_pol_ms["tiers"]["model_sanity"] = glm_pol["tiers"]["model_sanity"]
-    with pytest.raises(
-        ppu_recipe.ValidationError, match="precision 'bf16' is forbidden"
-    ):
-        ppu_recipe.validate_policy_structure(qwen_pol_ms, context="qwen_ms")
+    qwen_pol_ms["tiers"]["model_sanity"] = copy.deepcopy(
+        glm_pol["tiers"]["model_sanity"]
+    )
+    for stage in qwen_pol_ms["tiers"]["model_sanity"]["stages"]:
+        stage.pop("preset", None)
+    ppu_recipe.validate_policy_structure(qwen_pol_ms, context="qwen_ms")
 
     # 6. Unknown hardware rejected on recipe and policy
     bad_hw_recipe = copy.deepcopy(glm_doc)
@@ -3174,82 +3174,119 @@ def test_model_sanity_rejects_mismatched_stage_presets() -> None:
         ppu_recipe.validate_policy_structure(pol, context="mismatched_stage_preset")
 
 
-def test_bf16_legacy_exception_bound_to_qwen38_27b_fixture(
+def test_bf16_supported_across_hardware_and_respects_hardware_pins(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     qwen_doc = yaml.safe_load((RECIPES_DIR / "Qwen" / "Qwen3.8-27B.yaml").read_text())
     qwen_pol = yaml.safe_load((POLICY_DIR / "models" / "qwen3.8-27b.yaml").read_text())
 
-    # 1. Counterexample (R1 P1-01): cloning Qwen's preset-less single-variant BF16 shape
-    #    for another model (zai-org/GLM-5.3) must be rejected everywhere (structure, paths,
-    #    resolve, policy, and single-node CI selector).
-    glm_bf16 = copy.deepcopy(qwen_doc)
-    glm_bf16["model"]["model_id"] = "zai-org/GLM-5.3"
-    glm_bf16["ppu"]["hf_model_id"] = "zai-org/GLM-5.3"
-    glm_bf16["ppu"]["assets"] = {"model": "glm-5.3-bf16", "tokenizer": "glm-5.3-bf16"}
-    glm_bf16["ppu"]["served_name"] = "glm-5.3-bf16"
-    with pytest.raises(
-        ppu_recipe.ValidationError, match="precision 'bf16' is forbidden"
-    ):
-        ppu_recipe.validate_serving_recipe_structure(glm_bf16, context="glm_bf16")
+    # 1. Portable BF16 recipe with M890 and 810E presets + hardware_overrides passes
+    #    structure validation, parser checks, catalog expansion, and hardware-aware policies.
+    small_bf16 = copy.deepcopy(qwen_doc)
+    small_bf16["model"]["model_id"] = "Qwen/Qwen3-8B"
+    small_bf16["ppu"]["hf_model_id"] = "Qwen/Qwen3-8B"
+    small_bf16["ppu"]["assets"] = {"model": "qwen3-8b", "tokenizer": "qwen3-8b"}
+    small_bf16["ppu"]["served_name"] = "qwen3-8b"
+    small_bf16["hardware_overrides"] = {
+        "zhenwu_810e": {"extra_args": ["--max-num-seqs", "64"]}
+    }
+    small_bf16["presets"] = {
+        "prefill": {
+            "hardware": "zhenwu_m890",
+            "args": ["--max-num-batched-tokens", "8192"],
+        },
+        "decode": {
+            "hardware": "zhenwu_810e",
+            "args": ["--max-num-batched-tokens", "2048"],
+        },
+    }
+    ppu_recipe.validate_serving_recipe_structure(small_bf16, context="small_bf16")
 
     shutil.copytree(ROOT / "tests/ppu", tmp_path / "tests/ppu")
     monkeypatch.setattr(ppu_e2e_select, "REPO_ROOT", tmp_path)
     monkeypatch.setattr(ppu_recipe, "REPO_ROOT", tmp_path)
-    rec_path = tmp_path / "tests/ppu/recipes/zai-org/GLM-5.3-BF16.yaml"
-    rec_path.write_text(yaml.safe_dump(glm_bf16), encoding="utf-8")
-    pol_doc = copy.deepcopy(qwen_pol)
-    pol_doc["model_id"] = "zai-org/GLM-5.3"
-    pol_doc["recipe"] = "tests/ppu/recipes/zai-org/GLM-5.3-BF16.yaml"
-    pol_path = tmp_path / "tests/ppu/policy/models/glm-5.3-bf16.yaml"
-    pol_path.write_text(yaml.safe_dump(pol_doc), encoding="utf-8")
+    rec_path = tmp_path / "tests/ppu/recipes/Qwen/Qwen3-8B.yaml"
+    rec_path.write_text(yaml.safe_dump(small_bf16, sort_keys=False), encoding="utf-8")
 
-    with pytest.raises(
-        ppu_recipe.ValidationError, match="precision 'bf16' is forbidden"
-    ):
-        ppu_recipe.validate_paths(
-            [rec_path], vllm_parser_mode="required", parser=_sample_vllm_parser()
+    report = ppu_recipe.validate_paths(
+        [rec_path], vllm_parser_mode="required", parser=_sample_vllm_parser()
+    )
+    # 2 baselines (m890 default + 810e hardware_override) + 2 presets (prefill/m890, decode/810e)
+    assert report["checked_combinations"] == 4
+    entries = ppu_recipe.iter_recipe_catalog_entries(rec_path)
+    assert [(e["variant"], e["preset"], e["hardware"]) for e in entries] == [
+        ("default", None, "zhenwu_m890"),
+        ("default", None, "zhenwu_810e"),
+        ("default", "prefill", "zhenwu_m890"),
+        ("default", "decode", "zhenwu_810e"),
+    ]
+    decode_810e = ppu_recipe.resolve_recipe(rec_path, preset="decode")
+    assert decode_810e["hardware"] == "zhenwu_810e"
+    assert "--max-num-seqs" in decode_810e["flags"]
+    assert "--max-num-batched-tokens" in decode_810e["flags"]
+
+    pol_m890 = copy.deepcopy(qwen_pol)
+    pol_m890["model_id"] = "Qwen/Qwen3-8B"
+    pol_m890["recipe"] = "tests/ppu/recipes/Qwen/Qwen3-8B.yaml"
+    pol_m890["tiers"]["fast_sanity"]["preset"] = "prefill"
+    pol_m890_path = tmp_path / "tests/ppu/policy/models/qwen3-8b.yaml"
+    pol_m890_path.write_text(yaml.safe_dump(pol_m890), encoding="utf-8")
+
+    pol_810e = copy.deepcopy(pol_m890)
+    pol_810e["hardware"] = "zhenwu_810e"
+    pol_810e["tiers"]["fast_sanity"]["preset"] = "decode"
+    pol_810e_path = tmp_path / "tests/ppu/policy/models/qwen3-8b-810e.yaml"
+    pol_810e_path.write_text(yaml.safe_dump(pol_810e), encoding="utf-8")
+
+    ppu_recipe.validate_policy_structure(
+        pol_m890, context="pol_m890", base_dir=tmp_path
+    )
+    ppu_recipe.validate_policy_structure(
+        pol_810e, context="pol_810e", base_dir=tmp_path
+    )
+    # Default M890 selector picks qwen3-8b and skips qwen3-8b-810e
+    m890_keys = {
+        item["key"]
+        for item in ppu_e2e_select.build_recipe_matrix("", "fast_sanity")["include"]
+    }
+    assert "qwen3-8b" in m890_keys
+    assert "qwen3-8b-810e" not in m890_keys
+
+    # 2. Explicitly pinned BF16 variant still enforces hardware pin on presets and policies
+    pinned_m890 = copy.deepcopy(small_bf16)
+    pinned_m890["variants"]["default"]["hardware"] = "zhenwu_m890"
+    with pytest.raises(ppu_recipe.ValidationError, match="matches no compatible"):
+        ppu_recipe.validate_serving_recipe_structure(
+            pinned_m890, context="pinned_m890_orphan_810e_preset"
         )
-    with pytest.raises(
-        ppu_recipe.ValidationError, match="precision 'bf16' is forbidden"
-    ):
-        ppu_recipe.resolve_recipe(rec_path, policy_path=pol_path, tier="fast_sanity")
-    with pytest.raises(
-        ppu_recipe.ValidationError, match="precision 'bf16' is forbidden"
-    ):
-        ppu_e2e_select.build_recipe_matrix("", "fast_sanity")
 
-    # 2. Spoofing model.model_id while changing hf_model_id (at ppu or variant level) fails
-    for spoof in (
-        lambda d: d["ppu"].update({"hf_model_id": "zai-org/GLM-5.3"}),
-        lambda d: d["variants"]["default"].update({"hf_model_id": "zai-org/GLM-5.3"}),
-    ):
-        bad = copy.deepcopy(qwen_doc)
-        spoof(bad)
-        with pytest.raises(
-            ppu_recipe.ValidationError, match="precision 'bf16' is forbidden"
-        ):
-            ppu_recipe.validate_serving_recipe_structure(bad, context="spoof_bf16")
-
-    # 3. Non-Qwen policy pointing to Qwen3.8-27B.yaml fails closed
-    bad_pol = copy.deepcopy(qwen_pol)
-    bad_pol["model_id"] = "zai-org/GLM-5.3"
+    pinned_m890["presets"]["decode"]["variants"] = ["default"]
     with pytest.raises(
-        ppu_recipe.ValidationError, match="precision 'bf16' is forbidden"
+        ppu_recipe.ValidationError, match="conflicts with preset hardware 'zhenwu_810e'"
+    ):
+        ppu_recipe.validate_serving_recipe_structure(
+            pinned_m890, context="pinned_m890_conflict_preset"
+        )
+
+    pinned_only = copy.deepcopy(qwen_doc)
+    pinned_only["variants"]["default"]["hardware"] = "zhenwu_m890"
+    pinned_path = tmp_path / "tests/ppu/recipes/Qwen/Qwen3-8B-Pinned.yaml"
+    pinned_path.write_text(yaml.safe_dump(pinned_only), encoding="utf-8")
+    bad_810e_pol = copy.deepcopy(qwen_pol)
+    bad_810e_pol["hardware"] = "zhenwu_810e"
+    bad_810e_pol["recipe"] = "tests/ppu/recipes/Qwen/Qwen3-8B-Pinned.yaml"
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match="targets hardware 'zhenwu_m890', incompatible with policy hardware 'zhenwu_810e'",
     ):
         ppu_recipe.validate_policy_structure(
-            bad_pol, context="bad_bf16_pol", base_dir=tmp_path
+            bad_810e_pol, context="bad_pinned_bf16_pol", base_dir=tmp_path
         )
-
-    # 4. Positive control: removing the rogue BF16 files restores green validation & selector
-    rec_path.unlink()
-    pol_path.unlink()
-    qwen_entry = next(
-        item
-        for item in ppu_e2e_select.build_recipe_matrix("", "fast_sanity")["include"]
-        if item["key"] == "qwen3.8-27b"
-    )
-    assert qwen_entry["model_id"] == "Qwen/Qwen3.8-27B"
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match="targets hardware 'zhenwu_m890', incompatible with 'zhenwu_810e'",
+    ):
+        ppu_recipe.resolve_recipe(pinned_path, hardware="zhenwu_810e")
 
 
 def test_topology_flag_invariant_blocks_multinode_and_disagg_bypass(

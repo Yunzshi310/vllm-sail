@@ -32,7 +32,6 @@ DATASET_SCHEMA = "ppu-dataset/v1"
 POLICY_SCHEMA = "ppu-test-policy/v1"
 POLICY_TIERS = frozenset({"fast_sanity", "model_sanity", "nightly", "release"})
 SUPPORTED_HARDWARE = frozenset({"zhenwu_m890", "zhenwu_810e"})
-LEGACY_BF16_SMOKE_MODEL_IDS = frozenset({"Qwen/Qwen3.8-27B"})
 _M890_PRECISION_RE = re.compile(
     r"^(?:(?:mx)?fp4(?:_fp8)?|fp8(?:_[a-z0-9]+)?|w4a4_mxfp4|w8a8_fp8)$"
 )
@@ -1083,41 +1082,23 @@ def _normalize_precision(precision: Any, *, context: str) -> str:
     return precision.strip().lower()
 
 
-def _is_legacy_bf16_smoke_recipe(recipe: Mapping[str, Any]) -> bool:
-    model_blk = recipe.get("model")
-    ppu_blk = recipe.get("ppu")
-    if not isinstance(model_blk, Mapping) or not isinstance(ppu_blk, Mapping):
-        return False
-    model_id = model_blk.get("model_id")
-    if model_id not in LEGACY_BF16_SMOKE_MODEL_IDS:
-        return False
-    hf_model_id = ppu_blk.get("hf_model_id", model_id)
-    if hf_model_id not in LEGACY_BF16_SMOKE_MODEL_IDS:
-        return False
-    topo = ppu_blk.get("topology")
-    if (
-        not isinstance(topo, Mapping)
-        or topo.get("kind") != "single_node"
-        or topo.get("nodes") != 1
-    ):
-        return False
-    variants = recipe.get("variants")
-    if not isinstance(variants, Mapping) or set(variants) != {"default"}:
-        return False
-    default_var = variants["default"]
-    if not isinstance(default_var, Mapping) or "hardware" in default_var:
-        return False
-    if (
-        "hf_model_id" in default_var
-        and default_var.get("hf_model_id") not in LEGACY_BF16_SMOKE_MODEL_IDS
-    ):
-        return False
-    prec = default_var.get("precision")
-    if not isinstance(prec, str) or prec.strip().lower() != "bf16":
-        return False
-    if recipe.get("presets") or recipe.get("hardware_overrides"):
-        return False
-    return True
+def _variant_compatible_hardware(
+    var_cfg: Mapping[str, Any], *, context: str
+) -> frozenset[str]:
+    explicit = var_cfg.get("hardware")
+    if explicit is not None:
+        if explicit not in SUPPORTED_HARDWARE:
+            raise ValidationError(
+                f"{context}.hardware invalid: {explicit!r}; "
+                f"expected one of {sorted(SUPPORTED_HARDWARE)}"
+            )
+        return frozenset({str(explicit)})
+    prec = _normalize_precision(var_cfg.get("precision"), context=context)
+    if prec == "bf16":
+        return SUPPORTED_HARDWARE
+    if _810E_PRECISION_RE.fullmatch(prec):
+        return frozenset({"zhenwu_810e"})
+    return frozenset({"zhenwu_m890"})
 
 
 def _infer_variant_hardware(var_cfg: Mapping[str, Any], *, context: str) -> str:
@@ -1140,7 +1121,6 @@ def _validate_hardware_precision(
     hardware: str,
     precision: Any,
     context: str,
-    allow_legacy_bf16_smoke: bool = False,
 ) -> None:
     if hardware not in SUPPORTED_HARDWARE:
         raise ValidationError(
@@ -1149,23 +1129,50 @@ def _validate_hardware_precision(
         )
     prec = _normalize_precision(precision, context=context)
     if prec == "bf16":
-        if allow_legacy_bf16_smoke and hardware == "zhenwu_m890":
-            return
-        raise ValidationError(
-            f"{context}: precision 'bf16' is forbidden for serving/performance variants and presets"
-        )
+        return
     if hardware == "zhenwu_m890":
         if not _M890_PRECISION_RE.fullmatch(prec):
             raise ValidationError(
-                f"{context}: hardware 'zhenwu_m890' only allows mxfp4/fp4/fp8 "
+                f"{context}: hardware 'zhenwu_m890' only allows bf16 or mxfp4/fp4/fp8 "
                 f"precision variants, got {prec!r}"
             )
     elif hardware == "zhenwu_810e":
         if not _810E_PRECISION_RE.fullmatch(prec):
             raise ValidationError(
-                f"{context}: hardware 'zhenwu_810e' only allows int8 precision "
+                f"{context}: hardware 'zhenwu_810e' only allows bf16 or int8 precision "
                 f"variants (e.g. w8a8_int8, w4a8_int8), got {prec!r}"
             )
+
+
+def _iter_variant_preset_targets(
+    recipe: Mapping[str, Any], *, context: str
+) -> list[tuple[str, str | None, str]]:
+    """Return deterministic ``(variant, preset, hardware)`` expansion tuples."""
+    variants_blk = recipe.get("variants", {})
+    presets_blk = recipe.get("presets", {})
+    hw_overrides = recipe.get("hardware_overrides", {})
+    targets: list[tuple[str, str | None, str]] = []
+    for vname, vcfg in variants_blk.items():
+        vctx = f"{context}.variants.{vname}"
+        compat_hw = _variant_compatible_hardware(vcfg, context=vctx)
+        default_hw = _infer_variant_hardware(vcfg, context=vctx)
+        baseline_hws = [default_hw] + [
+            hw for hw in sorted(compat_hw) if hw != default_hw and hw in hw_overrides
+        ]
+        for hw in baseline_hws:
+            targets.append((vname, None, hw))
+        for pname, pcfg in presets_blk.items():
+            if pcfg.get("variants") is not None and vname not in pcfg["variants"]:
+                continue
+            preset_hw = pcfg.get("hardware")
+            if preset_hw is not None:
+                if preset_hw not in compat_hw:
+                    continue
+                targets.append((vname, pname, str(preset_hw)))
+            else:
+                for hw in baseline_hws:
+                    targets.append((vname, pname, hw))
+    return targets
 
 
 def _validate_topology_block(
@@ -1706,17 +1713,10 @@ def _resolve_recipe_from_doc(
             f"{recipe_label}: preset {eff_preset!r} targets hardware "
             f"{preset_hw!r}, incompatible with {eff_hardware!r}"
         )
-    allow_bf16 = (
-        _is_legacy_bf16_smoke_recipe(recipe)
-        and eff_preset is None
-        and tier in (None, "fast_sanity")
-        and (policy is None or policy.get("model_id") in LEGACY_BF16_SMOKE_MODEL_IDS)
-    )
     _validate_hardware_precision(
         hardware=eff_hardware,
         precision=var_blk["precision"],
         context=f"{recipe_label}.variants.{eff_variant}",
-        allow_legacy_bf16_smoke=allow_bf16,
     )
 
     ordered: list[tuple[str, str | None, bool]] = []
@@ -2269,7 +2269,6 @@ def validate_serving_recipe_structure(
                 context=f"{context}.features.{fname}.env",
             )
 
-    allow_legacy_bf16 = _is_legacy_bf16_smoke_recipe(recipe)
     if ppu["framework"] == "vllm":
         raw_variants = recipe.get("variants")
         if not isinstance(raw_variants, dict) or not raw_variants:
@@ -2281,7 +2280,7 @@ def validate_serving_recipe_structure(
         variants_blk = recipe.get("variants", {})
         if not isinstance(variants_blk, dict):
             raise ValidationError(f"{context}.variants must be mapping")
-    variant_hw_map: dict[str, str] = {}
+    variant_compat_hw_map: dict[str, frozenset[str]] = {}
     for vname, vcfg in variants_blk.items():
         _check_keys(
             vcfg,
@@ -2299,14 +2298,16 @@ def validate_serving_recipe_structure(
             required={"precision"},
             context=f"{context}.variants.{vname}",
         )
-        var_hw = _infer_variant_hardware(vcfg, context=f"{context}.variants.{vname}")
-        _validate_hardware_precision(
-            hardware=var_hw,
-            precision=vcfg["precision"],
-            context=f"{context}.variants.{vname}",
-            allow_legacy_bf16_smoke=allow_legacy_bf16,
+        compat_hw = _variant_compatible_hardware(
+            vcfg, context=f"{context}.variants.{vname}"
         )
-        variant_hw_map[vname] = var_hw
+        for hw in sorted(compat_hw):
+            _validate_hardware_precision(
+                hardware=hw,
+                precision=vcfg["precision"],
+                context=f"{context}.variants.{vname}",
+            )
+        variant_compat_hw_map[vname] = compat_hw
         if "topology" in vcfg:
             _validate_topology_block(
                 vcfg["topology"], context=f"{context}.variants.{vname}.topology"
@@ -2401,10 +2402,13 @@ def validate_serving_recipe_structure(
                     raise ValidationError(
                         f"{context}.presets.{pname}.variants references unknown variant {vname!r}"
                     )
-                if "hardware" in pcfg and variant_hw_map[vname] != pcfg["hardware"]:
+                if (
+                    "hardware" in pcfg
+                    and pcfg["hardware"] not in variant_compat_hw_map[vname]
+                ):
                     raise ValidationError(
-                        f"{context}.presets.{pname}: variant {vname!r} hardware "
-                        f"{variant_hw_map[vname]!r} conflicts with preset hardware {pcfg['hardware']!r}"
+                        f"{context}.presets.{pname}: variant {vname!r} compatible hardware "
+                        f"{sorted(variant_compat_hw_map[vname])} conflicts with preset hardware {pcfg['hardware']!r}"
                     )
         expected_role = (
             "prefill"
@@ -2480,7 +2484,7 @@ def validate_serving_recipe_structure(
                 if (pcfg.get("variants") is None or vname in pcfg["variants"])
                 and (
                     pcfg.get("hardware") is None
-                    or variant_hw_map[vname] == pcfg["hardware"]
+                    or pcfg["hardware"] in variant_compat_hw_map[vname]
                 )
             ]
             if not matched_variants:
@@ -2494,28 +2498,17 @@ def validate_serving_recipe_structure(
             raise ValidationError("; ".join(findings))
 
     if validate_expansions and ppu["framework"] == "vllm":
-        for vname, var_hw in variant_hw_map.items():
+        for vname, pname, target_hw in _iter_variant_preset_targets(
+            recipe, context=context
+        ):
             _resolve_recipe_from_doc(
                 recipe,
                 recipe_label=context,
                 variant=vname,
-                hardware=var_hw,
-                preset=None,
+                hardware=target_hw,
+                preset=pname,
                 cache=None,
             )
-            for pname, pcfg in presets_blk.items():
-                if pcfg.get("variants") is not None and vname not in pcfg["variants"]:
-                    continue
-                if pcfg.get("hardware") is not None and pcfg["hardware"] != var_hw:
-                    continue
-                _resolve_recipe_from_doc(
-                    recipe,
-                    recipe_label=context,
-                    variant=vname,
-                    hardware=var_hw,
-                    preset=pname,
-                    cache=None,
-                )
 
 
 def validate_dataset_structure(dataset: dict[str, Any], *, context: str) -> None:
@@ -2647,18 +2640,18 @@ def validate_policy_structure(
             raise ValidationError(
                 f"{context}: unknown variant {policy_variant!r} in {policy['recipe']}"
             )
-        tiers_preview = policy.get("tiers", {})
-        allow_bf16_pol = (
-            _is_legacy_bf16_smoke_recipe(rec_doc)
-            and policy.get("model_id") in LEGACY_BF16_SMOKE_MODEL_IDS
-            and set(tiers_preview) <= {"fast_sanity"}
-        )
+        var_cfg = variants_blk[policy_variant]
         _validate_hardware_precision(
             hardware=policy["hardware"],
-            precision=variants_blk[policy_variant].get("precision"),
+            precision=var_cfg.get("precision"),
             context=f"{context} ({policy['recipe']}#{policy_variant})",
-            allow_legacy_bf16_smoke=allow_bf16_pol,
         )
+        var_explicit_hw = var_cfg.get("hardware")
+        if var_explicit_hw is not None and var_explicit_hw != policy["hardware"]:
+            raise ValidationError(
+                f"{context}: variant {policy_variant!r} in {policy['recipe']} targets hardware "
+                f"{var_explicit_hw!r}, incompatible with policy hardware {policy['hardware']!r}"
+            )
 
     tiers = policy.get("tiers", {})
     if tiers:
@@ -2926,52 +2919,27 @@ def iter_recipe_catalog_entries(
         allow_internal_visibility=allow_internal_visibility,
         validate_expansions=False,
     )
-    variants_blk = rdoc.get("variants", {})
-    presets_blk = rdoc.get("presets", {})
     entries: list[dict[str, Any]] = []
-    for vname, vcfg in variants_blk.items():
-        var_hw = _infer_variant_hardware(
-            vcfg, context=f"{recipe_path}.variants.{vname}"
-        )
-        baseline = _resolve_recipe_from_doc(
+    for vname, pname, target_hw in _iter_variant_preset_targets(
+        rdoc, context=str(recipe_path)
+    ):
+        resolved = _resolve_recipe_from_doc(
             rdoc,
             recipe_label=str(recipe_path),
             variant=vname,
-            hardware=var_hw,
-            preset=None,
+            hardware=target_hw,
+            preset=pname,
             cache=None,
         )
         entries.append(
             {
                 "recipe_path": recipe_path,
                 "variant": vname,
-                "preset": None,
-                "hardware": var_hw,
-                "resolved": baseline,
+                "preset": pname,
+                "hardware": target_hw,
+                "resolved": resolved,
             }
         )
-        for pname, pcfg in presets_blk.items():
-            if pcfg.get("variants") is not None and vname not in pcfg["variants"]:
-                continue
-            if pcfg.get("hardware") is not None and pcfg["hardware"] != var_hw:
-                continue
-            resolved = _resolve_recipe_from_doc(
-                rdoc,
-                recipe_label=str(recipe_path),
-                variant=vname,
-                hardware=var_hw,
-                preset=pname,
-                cache=None,
-            )
-            entries.append(
-                {
-                    "recipe_path": recipe_path,
-                    "variant": vname,
-                    "preset": pname,
-                    "hardware": var_hw,
-                    "resolved": resolved,
-                }
-            )
     return entries
 
 
@@ -2990,10 +2958,11 @@ def _collect_all_recipe_flag_sets(
     for item in entries:
         vname = item["variant"]
         pname = item["preset"]
+        hw = item["hardware"]
         label = (
-            f"{recipe_path.name}:{vname}:baseline"
+            f"{recipe_path.name}:{vname}:{hw}:baseline"
             if pname is None
-            else f"{recipe_path.name}:{vname}:{pname}"
+            else f"{recipe_path.name}:{vname}:{hw}:{pname}"
         )
         sub_flags, _ = _validate_resolved_topology_and_placeholders(
             item["resolved"], context=label
@@ -3008,15 +2977,15 @@ def _collect_all_recipe_flag_sets(
                 recipe,
                 recipe_label=str(recipe_path),
                 variant=vname,
-                hardware=item["hardware"],
+                hardware=hw,
                 cache="enabled",
                 dummy_weights=True,
                 layer_override=2,
             )
             fs_flags, _ = _validate_resolved_topology_and_placeholders(
-                fs_res, context=f"{recipe_path.name}:fast_sanity_2l"
+                fs_res, context=f"{recipe_path.name}:{hw}:fast_sanity_2l"
             )
-            sets.append((f"{recipe_path.name}:fast_sanity_2l", fs_flags))
+            sets.append((f"{recipe_path.name}:{hw}:fast_sanity_2l", fs_flags))
 
     for feat_name, feat_cfg in recipe.get("features", {}).items():
         if "modes" in feat_cfg:
