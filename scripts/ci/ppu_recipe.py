@@ -93,12 +93,22 @@ JSON_FLAGS = frozenset(
         "--speculative-config",
     }
 )
-INVERSE_BOOLEAN_GROUPS: tuple[tuple[str, str], ...] = (
+INVERSE_BOOLEAN_GROUPS: tuple[tuple[str, ...], ...] = (
     ("--enable-prefix-caching", "--no-enable-prefix-caching"),
     ("--trust-remote-code", "--no-trust-remote-code"),
-    ("--enable-auto-tool-choice", "--disable-auto-tool-choice"),
-    ("--enable-expert-parallel", "--disable-expert-parallel"),
+    (
+        "--enable-auto-tool-choice",
+        "--disable-auto-tool-choice",
+        "--no-enable-auto-tool-choice",
+    ),
+    (
+        "--enable-expert-parallel",
+        "--no-enable-expert-parallel",
+        "--disable-expert-parallel",
+    ),
     ("--enforce-eager", "--no-enforce-eager"),
+    ("--data-parallel-external-lb", "--no-data-parallel-external-lb"),
+    ("--data-parallel-hybrid-lb", "--no-data-parallel-hybrid-lb"),
 )
 FORBIDDEN_RECIPE_FLAGS = frozenset(
     {
@@ -333,11 +343,14 @@ def _deep_merge_dicts(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, 
     return merged
 
 
-def _inverse_map() -> dict[str, str]:
-    pairs: dict[str, str] = {}
-    for pos, neg in INVERSE_BOOLEAN_GROUPS:
-        pairs[pos] = neg
-        pairs[neg] = pos
+def _inverse_map() -> dict[str, frozenset[str]]:
+    pairs: dict[str, frozenset[str]] = {}
+    for group in INVERSE_BOOLEAN_GROUPS:
+        pos = group[0]
+        negs = frozenset(group[1:])
+        pairs[pos] = negs
+        for neg in negs:
+            pairs[neg] = frozenset({pos, *(n for n in negs if n != neg)})
     return pairs
 
 
@@ -372,11 +385,11 @@ def _apply_flag_entries(
     """Append flags with last-wins deduplication and inverse-flag clearing."""
     result = list(ordered)
     for flag, val, has_eq in _parse_flag_entries(new_tokens):
-        inverse = _INVERSE_FLAGS.get(flag)
+        inverses = _INVERSE_FLAGS.get(flag)
         result = [
             item
             for item in result
-            if item[0] != flag and (inverse is None or item[0] != inverse)
+            if item[0] != flag and (inverses is None or item[0] not in inverses)
         ]
         result.append((flag, val, has_eq))
     return result
@@ -1150,14 +1163,13 @@ def _iter_variant_preset_targets(
     """Return deterministic ``(variant, preset, hardware)`` expansion tuples."""
     variants_blk = recipe.get("variants", {})
     presets_blk = recipe.get("presets", {})
-    hw_overrides = recipe.get("hardware_overrides", {})
     targets: list[tuple[str, str | None, str]] = []
     for vname, vcfg in variants_blk.items():
         vctx = f"{context}.variants.{vname}"
         compat_hw = _variant_compatible_hardware(vcfg, context=vctx)
         default_hw = _infer_variant_hardware(vcfg, context=vctx)
         baseline_hws = [default_hw] + [
-            hw for hw in sorted(compat_hw) if hw != default_hw and hw in hw_overrides
+            hw for hw in sorted(compat_hw) if hw != default_hw
         ]
         for hw in baseline_hws:
             targets.append((vname, None, hw))
@@ -1381,6 +1393,177 @@ def _parse_mooncake_host_port(address: str, *, context: str) -> tuple[str, int]:
     return host, int(port_raw)
 
 
+def _parse_pos_int_flag(flag_name: str, raw: str | None, *, context: str) -> int | None:
+    if raw is None:
+        return None
+    try:
+        val = int(raw)
+    except ValueError as exc:
+        raise ValidationError(
+            f"{context}: {flag_name} must be a positive int, got {raw!r}"
+        ) from exc
+    if val <= 0:
+        raise ValidationError(
+            f"{context}: {flag_name} must be a positive int, got {raw!r}"
+        )
+    return val
+
+
+def _effective_bool_flag(
+    entries: Sequence[tuple[str, str | None, bool]],
+    pos_flag: str,
+    neg_flags: Sequence[str] = (),
+    *,
+    default: bool = False,
+    context: str,
+) -> bool:
+    neg_set = set(neg_flags)
+    state = default
+    for flag, val, _ in entries:
+        if flag == pos_flag:
+            if val is not None:
+                raise ValidationError(
+                    f"{context}: boolean flag {flag} does not accept a value, got {val!r}"
+                )
+            state = True
+        elif flag in neg_set:
+            if val is not None:
+                raise ValidationError(
+                    f"{context}: boolean flag {flag} does not accept a value, got {val!r}"
+                )
+            state = False
+    return state
+
+
+def _compute_parallel_and_dp_local(
+    entries: list[tuple[str, str | None, bool]],
+    server_env: Mapping[str, Any],
+    *,
+    topo_nodes: int,
+    context: str,
+) -> tuple[int, int, int, int | None]:
+    """Return ``(ppu_count, dp_size, dp_size_local, dpl_explicit)`` matching pinned vLLM."""
+    dp_val = (
+        _parse_pos_int_flag(
+            "--data-parallel-size",
+            _flag_value(entries, "--data-parallel-size"),
+            context=context,
+        )
+        or 1
+    )
+    tp_val = (
+        _parse_pos_int_flag(
+            "--tensor-parallel-size",
+            _flag_value(entries, "--tensor-parallel-size"),
+            context=context,
+        )
+        or 1
+    )
+    pp_val = (
+        _parse_pos_int_flag(
+            "--pipeline-parallel-size",
+            _flag_value(entries, "--pipeline-parallel-size"),
+            context=context,
+        )
+        or 1
+    )
+    pcp_val = (
+        _parse_pos_int_flag(
+            "--prefill-context-parallel-size",
+            _flag_value(entries, "--prefill-context-parallel-size"),
+            context=context,
+        )
+        or 1
+    )
+    ppu_count = dp_val * tp_val * pp_val * pcp_val
+
+    dpl_explicit = _parse_pos_int_flag(
+        "--data-parallel-size-local",
+        _flag_value(entries, "--data-parallel-size-local"),
+        context=context,
+    )
+    if dpl_explicit is not None and dpl_explicit > dp_val:
+        raise ValidationError(
+            f"{context}: --data-parallel-size-local ({dpl_explicit}) "
+            f"cannot exceed --data-parallel-size ({dp_val})"
+        )
+
+    dp_rank_raw = _flag_value(entries, "--data-parallel-rank")
+    if dp_rank_raw is not None:
+        try:
+            dp_rank_val = int(dp_rank_raw)
+        except ValueError as exc:
+            raise ValidationError(
+                f"{context}: --data-parallel-rank must be an integer, got {dp_rank_raw!r}"
+            ) from exc
+        if not 0 <= dp_rank_val < dp_val:
+            raise ValidationError(
+                f"{context}: --data-parallel-rank must be in [0, {dp_val - 1}], got {dp_rank_val}"
+            )
+
+    dp_backend = _flag_value(entries, "--data-parallel-backend") or "mp"
+    if dp_backend not in {"mp", "ray"}:
+        raise ValidationError(
+            f"{context}: --data-parallel-backend must be 'mp' or 'ray', got {dp_backend!r}"
+        )
+    if topo_nodes > 1 and dp_backend != "mp":
+        raise ValidationError(
+            f"{context}: multi-node topology (nodes={topo_nodes}) requires "
+            f"--data-parallel-backend mp, got {dp_backend!r}"
+        )
+
+    ext_lb = _effective_bool_flag(
+        entries,
+        "--data-parallel-external-lb",
+        ("--no-data-parallel-external-lb",),
+        default=False,
+        context=context,
+    ) or (dp_rank_raw is not None)
+    hybrid_lb = _effective_bool_flag(
+        entries,
+        "--data-parallel-hybrid-lb",
+        ("--no-data-parallel-hybrid-lb",),
+        default=False,
+        context=context,
+    )
+    if ext_lb and hybrid_lb:
+        raise ValidationError(
+            f"{context}: --data-parallel-hybrid-lb and --data-parallel-external-lb "
+            f"cannot both be enabled"
+        )
+
+    if ext_lb:
+        if topo_nodes == 1 and dp_rank_raw is None:
+            raise ValidationError(
+                f"{context}: --data-parallel-external-lb requires --data-parallel-rank when nodes=1"
+            )
+        if dpl_explicit not in (None, 1):
+            raise ValidationError(
+                f"{context}: external data-parallel mode requires --data-parallel-size-local 1 "
+                f"or omitted, got {dpl_explicit}"
+            )
+        dp_local_val = 1
+    elif dpl_explicit is not None:
+        dp_local_val = dpl_explicit
+    else:
+        if hybrid_lb:
+            raise ValidationError(
+                f"{context}: --data-parallel-hybrid-lb requires --data-parallel-size-local"
+            )
+        if topo_nodes > 1:
+            world_within_dp = tp_val * pp_val * pcp_val
+            local_world = max(ppu_count // topo_nodes, 1)
+            dp_local_val = max(local_world // world_within_dp, 1)
+        elif (
+            dp_backend == "ray"
+            and str(server_env.get("VLLM_RAY_DP_PACK_STRATEGY", "")) == "span"
+        ):
+            dp_local_val = 1
+        else:
+            dp_local_val = dp_val
+    return ppu_count, dp_val, dp_local_val, dpl_explicit
+
+
 def _validate_resolved_topology_and_placeholders(
     resolved: Mapping[str, Any], *, context: str
 ) -> tuple[list[str], dict[str, str]]:
@@ -1391,11 +1574,14 @@ def _validate_resolved_topology_and_placeholders(
     topo_kind = topo["kind"]
     topo_nodes = int(topo["nodes"])
     topo_capacity = topo_nodes * int(topo["devices_per_node"])
-    ppu_count = int(resolved["ppu_count"])
     preset_name = resolved.get("preset")
 
     entries = _parse_flag_entries(flags)
     flag_names = {name for name, _, _ in entries}
+    calc_ppu_count, dp_val, dp_local_val, dpl_explicit = _compute_parallel_and_dp_local(
+        entries, server_env, topo_nodes=topo_nodes, context=context
+    )
+    ppu_count = max(int(resolved["ppu_count"]), calc_ppu_count)
 
     if ppu_count > topo_capacity:
         raise ValidationError(
@@ -1445,6 +1631,11 @@ def _validate_resolved_topology_and_placeholders(
                 f"{context}: single_node topology must not set multi-node flag(s): "
                 f"{', '.join(bad_mn)}"
             )
+        if dp_local_val != dp_val:
+            raise ValidationError(
+                f"{context}: single-node launch requires effective local DP size "
+                f"({dp_local_val}) to equal global --data-parallel-size ({dp_val})"
+            )
         if "--kv-transfer-config" in flag_names:
             raise ValidationError(
                 f"{context}: single_node topology must not set --kv-transfer-config; "
@@ -1467,6 +1658,22 @@ def _validate_resolved_topology_and_placeholders(
             raise ValidationError(
                 f"{context}: multi_node_ep parallelism ({ppu_count}) must match "
                 f"declared topology capacity ({topo_nodes}x{topo['devices_per_node']}={topo_capacity})"
+            )
+        ep_enabled = _effective_bool_flag(
+            entries,
+            "--enable-expert-parallel",
+            ("--no-enable-expert-parallel", "--disable-expert-parallel"),
+            default=False,
+            context=context,
+        )
+        if not ep_enabled:
+            raise ValidationError(
+                f"{context}: multi_node_ep topology requires effective --enable-expert-parallel"
+            )
+        if dpl_explicit is not None and dpl_explicit * topo_nodes != dp_val:
+            raise ValidationError(
+                f"{context}: multi_node_ep --data-parallel-size-local ({dpl_explicit}) * "
+                f"topology.nodes ({topo_nodes}) must equal --data-parallel-size ({dp_val})"
             )
     elif topo_kind == "pd_disagg":
         kv_raw = _flag_value(entries, "--kv-transfer-config")
@@ -1585,6 +1792,11 @@ def _validate_resolved_topology_and_placeholders(
                 raise ValidationError(
                     f"{context}: single-node pd_disagg topology must not set multi-node flag(s): "
                     f"{', '.join(bad_mn)}"
+                )
+            if dp_local_val != dp_val:
+                raise ValidationError(
+                    f"{context}: single-node pd_disagg role requires effective local DP size "
+                    f"({dp_local_val}) to equal global --data-parallel-size ({dp_val})"
                 )
         else:
             missing_mn = sorted(MULTI_NODE_REQUIRED_PLACEHOLDERS - placeholders)
@@ -1848,47 +2060,12 @@ def _resolve_recipe_from_doc(
         *flags_only,
     ]
 
-    def _parse_pos_int_flag(flag_name: str, raw: str | None) -> int | None:
-        if raw is None:
-            return None
-        try:
-            val = int(raw)
-        except ValueError as exc:
-            raise ValidationError(
-                f"{recipe_label}: {flag_name} must be a positive int, got {raw!r}"
-            ) from exc
-        if val <= 0:
-            raise ValidationError(
-                f"{recipe_label}: {flag_name} must be a positive int, got {raw!r}"
-            )
-        return val
-
-    dp_val = (
-        _parse_pos_int_flag(
-            "--data-parallel-size", _flag_value(ordered, "--data-parallel-size")
-        )
-        or 1
+    ppu_count, dp_val, dp_local_val, _ = _compute_parallel_and_dp_local(
+        ordered,
+        server_env,
+        topo_nodes=int(eff_topology["nodes"]),
+        context=recipe_label,
     )
-    tp_val = (
-        _parse_pos_int_flag(
-            "--tensor-parallel-size", _flag_value(ordered, "--tensor-parallel-size")
-        )
-        or 1
-    )
-    pp_val = (
-        _parse_pos_int_flag(
-            "--pipeline-parallel-size", _flag_value(ordered, "--pipeline-parallel-size")
-        )
-        or 1
-    )
-    pcp_val = (
-        _parse_pos_int_flag(
-            "--prefill-context-parallel-size",
-            _flag_value(ordered, "--prefill-context-parallel-size"),
-        )
-        or 1
-    )
-    ppu_count = dp_val * tp_val * pp_val * pcp_val
 
     runtime_env: dict[str, str] = {}
     if needs_dev_mode:
@@ -1920,6 +2097,8 @@ def _resolve_recipe_from_doc(
         "server_env": server_env,
         "runtime_env": runtime_env,
         "ppu_count": ppu_count,
+        "dp_size": dp_val,
+        "dp_size_local": dp_local_val,
         "model_id": model_blk["model_id"],
         "hf_model_id": hf_model_id,
         "resolved_model": resolved_model,

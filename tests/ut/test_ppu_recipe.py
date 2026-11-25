@@ -84,7 +84,19 @@ def _sample_vllm_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pipeline-parallel-size", type=int)
     parser.add_argument("--prefill-context-parallel-size", type=int)
     parser.add_argument("--data-parallel-size", type=int)
-    parser.add_argument("--enable-expert-parallel", action="store_true")
+    parser.add_argument("--data-parallel-size-local", type=int)
+    parser.add_argument("--data-parallel-rank", type=int)
+    parser.add_argument("--data-parallel-backend", default="mp")
+    parser.add_argument(
+        "--data-parallel-external-lb", action=argparse.BooleanOptionalAction
+    )
+    parser.add_argument(
+        "--data-parallel-hybrid-lb", action=argparse.BooleanOptionalAction
+    )
+    parser.add_argument(
+        "--enable-expert-parallel", action=argparse.BooleanOptionalAction
+    )
+    parser.add_argument("--disable-expert-parallel", action="store_true")
     parser.add_argument("--all2all-backend")
     parser.add_argument("--nnodes", type=int)
     parser.add_argument("--node-rank", type=int)
@@ -3180,8 +3192,45 @@ def test_bf16_supported_across_hardware_and_respects_hardware_pins(
     qwen_doc = yaml.safe_load((RECIPES_DIR / "Qwen" / "Qwen3.8-27B.yaml").read_text())
     qwen_pol = yaml.safe_load((POLICY_DIR / "models" / "qwen3.8-27b.yaml").read_text())
 
-    # 1. Portable BF16 recipe with M890 and 810E presets + hardware_overrides passes
-    #    structure validation, parser checks, catalog expansion, and hardware-aware policies.
+    # 1a. Checked-in Qwen3.8-27B (unpinned BF16 without hardware_overrides) enumerates
+    #     both zhenwu_m890 and zhenwu_810e in catalog and parser validation; unpinned
+    #     presets also expand both chips without needing hardware_overrides.
+    qwen_entries = ppu_recipe.iter_recipe_catalog_entries(
+        RECIPES_DIR / "Qwen" / "Qwen3.8-27B.yaml", qwen_doc
+    )
+    assert [(e["variant"], e["preset"], e["hardware"]) for e in qwen_entries] == [
+        ("default", None, "zhenwu_m890"),
+        ("default", None, "zhenwu_810e"),
+    ]
+    no_override_bf16 = copy.deepcopy(qwen_doc)
+    no_override_bf16["presets"] = {
+        "prefill": {"args": ["--max-num-batched-tokens", "8192"]},
+        "decode": {
+            "hardware": "zhenwu_810e",
+            "args": ["--max-num-batched-tokens", "2048"],
+        },
+    }
+    no_override_path = tmp_path / "no_override_bf16.yaml"
+    no_override_path.write_text(
+        yaml.safe_dump(no_override_bf16, sort_keys=False), encoding="utf-8"
+    )
+    no_ov_report = ppu_recipe.validate_paths(
+        [no_override_path], vllm_parser_mode="required", parser=_sample_vllm_parser()
+    )
+    assert no_ov_report["checked_combinations"] == 5
+    assert [
+        (e["variant"], e["preset"], e["hardware"])
+        for e in ppu_recipe.iter_recipe_catalog_entries(no_override_path)
+    ] == [
+        ("default", None, "zhenwu_m890"),
+        ("default", None, "zhenwu_810e"),
+        ("default", "prefill", "zhenwu_m890"),
+        ("default", "prefill", "zhenwu_810e"),
+        ("default", "decode", "zhenwu_810e"),
+    ]
+
+    # 1b. Portable BF16 recipe with M890 and 810E presets + hardware_overrides passes
+    #     structure validation, parser checks, catalog expansion, and hardware-aware policies.
     small_bf16 = copy.deepcopy(qwen_doc)
     small_bf16["model"]["model_id"] = "Qwen/Qwen3-8B"
     small_bf16["ppu"]["hf_model_id"] = "Qwen/Qwen3-8B"
@@ -3782,3 +3831,176 @@ def test_vllm_recipe_rejects_missing_or_empty_variants(tmp_path: Path) -> None:
     )
     assert report["checked_combinations"] == 1
     assert report["parser_checked"] is True
+
+
+def test_single_node_dp_requires_all_ranks_local_and_admits_dp8_local8_control(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shutil.copytree(ROOT / "tests/ppu", tmp_path / "tests/ppu")
+    monkeypatch.setattr(ppu_e2e_select, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(ppu_recipe, "REPO_ROOT", tmp_path)
+
+    m3_rec_path = tmp_path / "tests/ppu/recipes/MiniMaxAI/MiniMax-M3.yaml"
+    m3_pol_path = tmp_path / "tests/ppu/policy/models/minimax-m3.yaml"
+    m3_doc_orig = yaml.safe_load(m3_rec_path.read_text(encoding="utf-8"))
+    m3_pol_doc = yaml.safe_load(m3_pol_path.read_text(encoding="utf-8"))
+    m3_pol_doc["tiers"]["fast_sanity"]["preset"] = "dp_ep_low_latency"
+    m3_pol_path.write_text(yaml.safe_dump(m3_pol_doc), encoding="utf-8")
+
+    # 1. Counterexample (P1 r4694520699): DP8 with --data-parallel-size-local 4 on single_node
+    #    fails recipe validation, policy resolution, automatic selection, and explicit selection.
+    bad_dpl4 = copy.deepcopy(m3_doc_orig)
+    bad_dpl4["presets"]["dp_ep_low_latency"]["args"] = [
+        *bad_dpl4["presets"]["dp_ep_low_latency"]["args"],
+        "--data-parallel-size-local",
+        "4",
+    ]
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"effective local DP size \(4\) to equal global --data-parallel-size \(8\)",
+    ):
+        ppu_recipe.validate_serving_recipe_structure(bad_dpl4, context="bad_dpl4")
+
+    m3_rec_path.write_text(yaml.safe_dump(bad_dpl4), encoding="utf-8")
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"effective local DP size \(4\) to equal global --data-parallel-size \(8\)",
+    ):
+        ppu_recipe.validate_paths(
+            [m3_rec_path], vllm_parser_mode="required", parser=_sample_vllm_parser()
+        )
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"effective local DP size \(4\) to equal global --data-parallel-size \(8\)",
+    ):
+        ppu_recipe.resolve_recipe(
+            m3_rec_path, policy_path=m3_pol_path, tier="fast_sanity"
+        )
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"effective local DP size \(4\) to equal global --data-parallel-size \(8\)",
+    ):
+        ppu_e2e_select.build_recipe_matrix("", "fast_sanity")
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"effective local DP size \(4\) to equal global --data-parallel-size \(8\)",
+    ):
+        ppu_e2e_select.build_recipe_matrix("minimax-m3", "fast_sanity")
+
+    # Additional partial-local-DP counterexamples on single_node (external rank & ray span)
+    for extra_args, extra_env, expected in (
+        (
+            ["--data-parallel-rank", "0"],
+            {},
+            r"effective local DP size \(1\) to equal global --data-parallel-size \(8\)",
+        ),
+        (
+            ["--data-parallel-external-lb"],
+            {},
+            r"--data-parallel-external-lb requires --data-parallel-rank",
+        ),
+        (
+            ["--data-parallel-size-local", "16"],
+            {},
+            r"--data-parallel-size-local \(16\) cannot exceed --data-parallel-size \(8\)",
+        ),
+        (
+            ["--data-parallel-backend", "ray"],
+            {"VLLM_RAY_DP_PACK_STRATEGY": "span"},
+            r"effective local DP size \(1\) to equal global --data-parallel-size \(8\)",
+        ),
+    ):
+        bad_extra = copy.deepcopy(m3_doc_orig)
+        bad_extra["presets"]["dp_ep_low_latency"]["args"] = [
+            *bad_extra["presets"]["dp_ep_low_latency"]["args"],
+            *extra_args,
+        ]
+        if extra_env:
+            bad_extra["presets"]["dp_ep_low_latency"]["env"] = {
+                **bad_extra["presets"]["dp_ep_low_latency"].get("env", {}),
+                **extra_env,
+            }
+        with pytest.raises(ppu_recipe.ValidationError, match=expected):
+            ppu_recipe.validate_serving_recipe_structure(bad_extra, context="bad_extra")
+
+    # 2. Positive control: DP8 with explicit --data-parallel-size-local 8 passes validation
+    #    and is admitted by both automatic and explicit single-node CI selection.
+    good_dpl8 = copy.deepcopy(m3_doc_orig)
+    good_dpl8["presets"]["dp_ep_low_latency"]["args"] = [
+        *good_dpl8["presets"]["dp_ep_low_latency"]["args"],
+        "--data-parallel-size-local",
+        "8",
+    ]
+    m3_rec_path.write_text(yaml.safe_dump(good_dpl8), encoding="utf-8")
+    report = ppu_recipe.validate_paths(
+        [m3_rec_path], vllm_parser_mode="required", parser=_sample_vllm_parser()
+    )
+    assert report["parser_checked"] is True
+    resolved_ctrl = ppu_recipe.resolve_recipe(
+        m3_rec_path, policy_path=m3_pol_path, tier="fast_sanity"
+    )
+    assert resolved_ctrl["ppu_count"] == 8
+    assert resolved_ctrl["dp_size"] == 8
+    assert resolved_ctrl["dp_size_local"] == 8
+
+    auto_item = next(
+        item
+        for item in ppu_e2e_select.build_recipe_matrix("", "fast_sanity")["include"]
+        if item["key"] == "minimax-m3"
+    )
+    explicit_items = ppu_e2e_select.build_recipe_matrix("minimax-m3", "fast_sanity")[
+        "include"
+    ]
+    assert auto_item["ppu_count"] == 8
+    assert auto_item["preset"] == "dp_ep_low_latency"
+    assert len(explicit_items) == 1 and explicit_items[0]["ppu_count"] == 8
+
+
+def test_multi_node_ep_requires_effective_expert_parallel(tmp_path: Path) -> None:
+    glm_path = RECIPES_DIR / "zai-org" / "GLM-5.3.yaml"
+    glm_doc = yaml.safe_load(glm_path.read_text(encoding="utf-8"))
+
+    # Positive control: checked-in GLM-5.3 decode_ep (DP32 + --enable-expert-parallel) passes
+    ctrl_report = ppu_recipe.validate_paths(
+        [glm_path], vllm_parser_mode="required", parser=_sample_vllm_parser()
+    )
+    assert ctrl_report["checked_combinations"] == 14
+    ctrl_ep = ppu_recipe.resolve_recipe(glm_path, preset="decode_ep")
+    assert ctrl_ep["ppu_count"] == 32
+    assert "--enable-expert-parallel" in ctrl_ep["flags"]
+
+    # Counterexample 1 (P2 r4694520719): removing --enable-expert-parallel from decode_ep fails
+    no_ep = copy.deepcopy(glm_doc)
+    no_ep["presets"]["decode_ep"]["args"] = [
+        tok
+        for tok in no_ep["presets"]["decode_ep"]["args"]
+        if tok != "--enable-expert-parallel"
+    ]
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match="multi_node_ep topology requires effective --enable-expert-parallel",
+    ):
+        ppu_recipe.validate_serving_recipe_structure(no_ep, context="no_ep")
+
+    no_ep_path = tmp_path / "glm_no_ep.yaml"
+    no_ep_path.write_text(yaml.safe_dump(no_ep), encoding="utf-8")
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match="multi_node_ep topology requires effective --enable-expert-parallel",
+    ):
+        ppu_recipe.validate_paths(
+            [no_ep_path], vllm_parser_mode="required", parser=_sample_vllm_parser()
+        )
+
+    # Counterexample 2: disabling EP via --no-enable-expert-parallel or --disable-expert-parallel fails
+    for neg_flag in ("--no-enable-expert-parallel", "--disable-expert-parallel"):
+        neg_ep = copy.deepcopy(glm_doc)
+        neg_ep["presets"]["decode_ep"]["args"] = [
+            *neg_ep["presets"]["decode_ep"]["args"],
+            neg_flag,
+        ]
+        with pytest.raises(
+            ppu_recipe.ValidationError,
+            match="multi_node_ep topology requires effective --enable-expert-parallel",
+        ):
+            ppu_recipe.validate_serving_recipe_structure(neg_ep, context=neg_flag)

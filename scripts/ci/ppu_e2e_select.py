@@ -177,6 +177,14 @@ def _recipe_entries(
                     f"which is not runnable on single-node {hardware!r} CI"
                 )
             continue
+        if int(resolved.get("dp_size_local", 1)) != int(resolved.get("dp_size", 1)):
+            if requested:
+                raise ValueError(
+                    f"recipe policy {slug!r} has effective local DP size "
+                    f"{resolved['dp_size_local']} != global DP size {resolved['dp_size']}, "
+                    f"which cannot become ready in a single-server CI launch"
+                )
+            continue
         if eff_max_devices is not None and int(resolved["ppu_count"]) > eff_max_devices:
             if requested:
                 raise ValueError(
