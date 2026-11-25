@@ -4355,6 +4355,70 @@ def test_vllm_dp_env_fallback_crossnode_tp_and_hybrid_headless_contract(
         == 4
     )
 
+    # Multi-node (nodes > 1) rejects --distributed-executor-backend ray / external_launcher /
+    # ExecutorWithExternalLauncher (matching pinned parallel.py:1199-1207), rejects 'uni' when
+    # replica world > 1 (DP2 x TP16), and accepts 'mp' or 'uni' when replica world == 1 (DP32).
+    for bad_mn_exec in (
+        "ray",
+        "external_launcher",
+        "vllm.v1.executor.uniproc_executor.ExecutorWithExternalLauncher",
+    ):
+        bad_mn_doc = copy.deepcopy(glm_orig)
+        bad_mn_doc["presets"]["decode_ep"]["args"] = [
+            *bad_mn_doc["presets"]["decode_ep"]["args"],
+            "--distributed-executor-backend",
+            bad_mn_exec,
+        ]
+        with pytest.raises(
+            ppu_recipe.ValidationError,
+            match=r"--distributed-executor-backend must be one of \['mp', 'uni'\] for nodes=4",
+        ):
+            ppu_recipe.validate_serving_recipe_structure(
+                bad_mn_doc, context=f"mn_{bad_mn_exec}"
+            )
+        tampered_mn = ppu_recipe.resolve_recipe(
+            ROOT / "tests/ppu/recipes/zai-org/GLM-5.3.yaml", preset="decode_ep"
+        )
+        tampered_mn["flags"] = [
+            *tampered_mn["flags"],
+            "--distributed-executor-backend",
+            bad_mn_exec,
+        ]
+        with pytest.raises(
+            ppu_recipe.ValidationError,
+            match=r"--distributed-executor-backend must be one of \['mp', 'uni'\] for nodes=4",
+        ):
+            ppu_recipe_runner._launch_resolved_server(
+                tampered_mn, log_path=tmp_path / "never_started_mn_exec.log"
+            )
+
+    bad_mn_uni_tp16 = copy.deepcopy(dp2_tp16)
+    bad_mn_uni_tp16["presets"]["decode_ep"]["args"] = [
+        *dp2_tp16["presets"]["decode_ep"]["args"],
+        "--distributed-executor-backend",
+        "uni",
+    ]
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match="--distributed-executor-backend 'uni' requires per-replica world size 1, got 16",
+    ):
+        ppu_recipe.validate_serving_recipe_structure(
+            bad_mn_uni_tp16, context="mn_uni_tp16"
+        )
+
+    for good_mn_exec in ("mp", "uni"):
+        good_mn_doc = copy.deepcopy(glm_orig)
+        good_mn_doc["presets"]["decode_ep"]["args"] = [
+            *good_mn_doc["presets"]["decode_ep"]["args"],
+            "--distributed-executor-backend",
+            good_mn_exec,
+        ]
+        glm_rec_path.write_text(yaml.safe_dump(good_mn_doc), encoding="utf-8")
+        assert (
+            ppu_recipe.resolve_recipe(glm_rec_path, preset="decode_ep")["ppu_count"]
+            == 32
+        )
+
     for bad_us_args in (
         ["--data_parallel_size", "2"],
         ["--distributed_executor_backend", "external_launcher"],

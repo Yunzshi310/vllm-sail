@@ -1494,7 +1494,7 @@ def _compute_parallel_and_dp_local(
 
     dist_exec_backend = _flag_value(entries, "--distributed-executor-backend")
     if dist_exec_backend is not None:
-        allowed_exec = {"mp", "ray", "uni"} if topo_nodes == 1 else {"mp", "ray"}
+        allowed_exec = {"mp", "ray", "uni"} if topo_nodes == 1 else {"mp", "uni"}
         if dist_exec_backend not in allowed_exec:
             raise ValidationError(
                 f"{context}: --distributed-executor-backend must be one of "
