@@ -1709,11 +1709,28 @@ def route_three_gears(
                     include_failed=force,
                 )
                 if rc_hit is None:
+                    noop_excluded = _collect_excluded_control_shas(
+                        state,
+                        tags=tags,
+                        release_branches=release_branches,
+                    )
+                    noop_controls = _collect_verified_control_shas(
+                        state,
+                        verified_pin=pin,
+                        tags=tags,
+                        release_branches=release_branches,
+                    )
+                    noop_override = (
+                        override_green
+                        if (override_green and override_green not in noop_excluded)
+                        else ""
+                    )
                     return {
                         "selected_gear": "rc_qualify",
                         "target_sha": "",
                         "rc_tag": "",
-                        "last_green_sha": override_green or last_ppu_green,
+                        "last_green_sha": noop_override
+                        or (noop_controls[0] if noop_controls else ""),
                         "fallback_green_shas": "",
                         "last_ppu_tested_sha": last_ppu_tested,
                         "run_cpu": False,
@@ -1722,6 +1739,13 @@ def route_three_gears(
                     }
                 rc_tag, target_sha = rc_hit
         clean_target = _require_sha1(target_sha, "rc_target_sha")
+        rc_excluded = _collect_excluded_control_shas(
+            state,
+            rc_ref=rc_tag,
+            target_sha=clean_target,
+            tags=tags,
+            release_branches=release_branches,
+        )
         verified_controls = _collect_verified_control_shas(
             state,
             verified_pin=pin,
@@ -1731,7 +1755,16 @@ def route_three_gears(
             release_branches=release_branches,
         )
         non_target_controls = [s for s in verified_controls if s != clean_target]
-        rc_green = override_green or _resolve_rc_last_green_sha(
+        effective_rc_override = (
+            override_green
+            if (
+                override_green
+                and override_green not in rc_excluded
+                and override_green != clean_target
+            )
+            else ""
+        )
+        rc_green = effective_rc_override or _resolve_rc_last_green_sha(
             rc_tag,
             target_sha=clean_target,
             tags=tags,
@@ -1762,12 +1795,23 @@ def route_three_gears(
             "ppu_skip_reason": "none",
         }
 
-    if override_green:
-        last_ppu_green = override_green
-        last_ppu_tested = override_green
-        state["last_ppu_status"] = "pass"
-
     if effective_gear == "daily_pin_bump":
+        bump_excluded = _collect_excluded_control_shas(
+            state,
+            tags=tags,
+            release_branches=release_branches,
+        )
+        bump_controls = _collect_verified_control_shas(
+            state,
+            verified_pin=pin,
+            tags=tags,
+            release_branches=release_branches,
+        )
+        bump_override = (
+            override_green
+            if (override_green and override_green not in bump_excluded)
+            else ""
+        )
         history = list(probe_history)
         if not history:
             history = list(state.get("probe_history") or [])
@@ -1797,7 +1841,8 @@ def route_three_gears(
             "selected_gear": "daily_pin_bump",
             "target_sha": bump_sha,
             "rc_tag": "",
-            "last_green_sha": last_ppu_green,
+            "last_green_sha": bump_override
+            or (bump_controls[0] if bump_controls else ""),
             "fallback_green_shas": "",
             "last_ppu_tested_sha": last_ppu_tested,
             "run_cpu": False,
@@ -1812,6 +1857,22 @@ def route_three_gears(
         if not main_sha:
             raise ValueError("git ls-remote output did not contain refs/heads/main")
         target_sha = _require_sha1(main_sha, "main_sha")
+
+    probe_excluded = _collect_excluded_control_shas(
+        state,
+        target_sha=target_sha,
+        tags=tags,
+        release_branches=release_branches,
+    )
+    effective_probe_override = (
+        override_green
+        if (override_green and override_green not in probe_excluded)
+        else ""
+    )
+    if effective_probe_override:
+        last_ppu_green = effective_probe_override
+        last_ppu_tested = effective_probe_override
+        state["last_ppu_status"] = "pass"
 
     # Skip checks ONLY when target_sha and the latest CPU/PPU outcomes are GREEN.
     run_cpu = bool(
@@ -1849,12 +1910,21 @@ def route_three_gears(
         state,
         verified_pin=pin,
         target_sha=target_sha,
+        tags=tags,
+        release_branches=release_branches,
     )
     non_target_probe_controls = [s for s in probe_controls if s != target_sha]
-    probe_green = override_green or (
-        non_target_probe_controls[0]
-        if non_target_probe_controls
-        else (probe_controls[0] if probe_controls else "")
+    probe_green = (
+        effective_probe_override
+        if (effective_probe_override and effective_probe_override != target_sha)
+        else (
+            non_target_probe_controls[0]
+            if non_target_probe_controls
+            else (
+                effective_probe_override
+                or (probe_controls[0] if probe_controls else "")
+            )
+        )
     )
     probe_fallbacks = [
         probe_green,

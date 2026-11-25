@@ -6392,3 +6392,47 @@ def test_review_6057527910_partial_rerun_cursor_exact_sha_rc_ancestry_and_infra_
     assert p12_cross_sbt["bisect"]["bisect_status"] == "converged"
     assert p12_cross_sbt["bisect"]["last_good_sha"] == main_green
     assert p12_cross_sbt["bisect"]["first_failing_sha"] == sha_a
+
+    # Manual `--last-green-sha` override on `route` (same-line, cross-line, and probe/daily_pin_bump)
+    # also filters through `_collect_excluded_control_shas` so revoked `sha_b` never re-enters `route`:
+    for gear_arg, ref_arg in (
+        ("rc_qualify", branch),
+        ("rc_qualify", branch_036),
+        ("probe", sha_c),
+        ("daily_pin_bump", ""),
+    ):
+        out_ovr = tmp_path / f"gh-ovr-{gear_arg}.txt"
+        out_ovr.unlink(missing_ok=True)
+        assert (
+            post_merge.main(
+                [
+                    "route",
+                    "--ls-remote-file",
+                    str(refs_file),
+                    "--verified-pin-file",
+                    str(pin_file),
+                    "--release-tag-file",
+                    str(baseline_tag),
+                    "--gear",
+                    gear_arg,
+                    "--upstream-ref",
+                    ref_arg,
+                    "--last-green-sha",
+                    sha_b,
+                    "--cursor-file",
+                    str(rc_b_revoked),
+                    "--github-output",
+                    str(out_ovr),
+                ]
+            )
+            == 0
+        )
+        ovr_kv = {
+            k: v
+            for k, _, v in (
+                ln.partition("=")
+                for ln in out_ovr.read_text(encoding="utf-8").splitlines()
+            )
+        }
+        assert ovr_kv["last_green_sha"] != sha_b
+        assert sha_b not in ovr_kv["fallback_green_shas"].split(",")

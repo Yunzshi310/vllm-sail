@@ -211,8 +211,11 @@ jobs:
           import json, os
           from pathlib import Path
           decision = json.loads(os.environ["ROUTE_JSON"])
-          if decision.get("selected_gear") == "probe":
-              override = os.environ["LAST_GREEN_OVERRIDE"].strip()
+          override = os.environ["LAST_GREEN_OVERRIDE"].strip()
+          if (
+              decision.get("selected_gear") == "probe"
+              and decision.get("last_green_sha") == override
+          ):
               p = Path("state/cursor.json")
               data = json.loads(p.read_text(encoding="utf-8")) if p.is_file() else {}
               data["last_ppu_green_sha"] = override
