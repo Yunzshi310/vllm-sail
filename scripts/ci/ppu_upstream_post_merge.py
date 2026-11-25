@@ -862,35 +862,30 @@ def _resolve_unique_rc_ref_for_sha(
     return str(info["branch"] or f"releases/v{maj}.{minr}.0")
 
 
-def _collect_verified_control_shas(
+def _match_rc_line_context(
     state: dict[str, Any] | None,
     *,
-    verified_pin: str = "",
     rc_ref: str = "",
     target_sha: str = "",
     tags: dict[str, str] | None = None,
     release_branches: dict[str, str] | None = None,
-) -> list[str]:
-    """Return ordered verified green SHAs (same-line RC greens, main greens, verified pin)."""
+) -> tuple[tuple[int, int] | None, int | None]:
+    """Identify ``(release_line, max_rc_num)`` from ``rc_ref`` or a uniquely matched ``target_sha``."""
     tags_map = tags or {}
     branches_map = release_branches or {}
     rc_branch_states = (state or {}).get("rc_branch_states") or {}
     rc_tag_states = (state or {}).get("rc_tag_states") or {}
-    tested_rc_tags = (state or {}).get("tested_rc_tags") or ()
 
-    line: tuple[int, int] | None = None
-    max_rc_num: int | None = None
     norm_ref = _normalize_rc_ref(rc_ref) if rc_ref else ""
     t_match = RC_TAG_RE.fullmatch(norm_ref) if norm_ref else None
     b_match = (
         RELEASE_BRANCH_RE.fullmatch(norm_ref) if (norm_ref and not t_match) else None
     )
     if t_match:
-        line = (int(t_match.group(1)), int(t_match.group(2)))
-        max_rc_num = int(t_match.group(3))
-    elif b_match:
-        line = (int(b_match.group(1)), int(b_match.group(2)))
-    elif target_sha and SHA1_RE.fullmatch(target_sha):
+        return (int(t_match.group(1)), int(t_match.group(2))), int(t_match.group(3))
+    if b_match:
+        return (int(b_match.group(1)), int(b_match.group(2))), None
+    if target_sha and SHA1_RE.fullmatch(target_sha):
         matched_lines: set[tuple[int, int]] = set()
         for br_name, br_sha in branches_map.items():
             bm = RELEASE_BRANCH_RE.fullmatch(br_name)
@@ -917,32 +912,49 @@ def _collect_verified_control_shas(
             if tm and isinstance(tg_ent, dict) and tg_ent.get("sha") == target_sha:
                 matched_lines.add((int(tm.group(1)), int(tm.group(2))))
         if len(matched_lines) == 1:
-            line = next(iter(matched_lines))
+            return next(iter(matched_lines)), None
+    return None, None
 
-    controls: list[str] = []
 
-    def _add(cand_sha: str) -> None:
-        s = cand_sha.strip()
-        if SHA1_RE.fullmatch(s) and s not in controls:
-            controls.append(s)
+def _collect_excluded_control_shas(
+    state: dict[str, Any] | None,
+    *,
+    rc_ref: str = "",
+    target_sha: str = "",
+    tags: dict[str, str] | None = None,
+    release_branches: dict[str, str] | None = None,
+) -> set[str]:
+    """Return all SHAs ineligible to act as a verified green control in the given context."""
+    tags_map = tags or {}
+    rc_branch_states = (state or {}).get("rc_branch_states") or {}
+    rc_tag_states = (state or {}).get("rc_tag_states") or {}
+    line, max_rc_num = _match_rc_line_context(
+        state,
+        rc_ref=rc_ref,
+        target_sha=target_sha,
+        tags=tags,
+        release_branches=release_branches,
+    )
+
+    excluded: set[str] = set()
+    line_passing: set[str] = set()
 
     if line is not None:
         major, minor = line
         branch_key = f"releases/v{major}.{minor}.0"
         br_entry = rc_branch_states.get(branch_key)
-        revoked_shas: set[str] = set()
-        newer_or_equal_rc_shas: set[str] = set()
+        line_revoked: set[str] = set()
         if isinstance(br_entry, dict):
             raw_rev = br_entry.get("revoked_shas")
             if isinstance(raw_rev, list):
                 for item in raw_rev:
                     s = str(item or "").strip()
                     if SHA1_RE.fullmatch(s):
-                        revoked_shas.add(s)
+                        line_revoked.add(s)
             if br_entry.get("status") != "pass":
                 br_bad = str(br_entry.get("sha") or "").strip()
                 if SHA1_RE.fullmatch(br_bad):
-                    revoked_shas.add(br_bad)
+                    line_revoked.add(br_bad)
         for tg_name, tg_entry in rc_tag_states.items():
             tm = RC_TAG_RE.fullmatch(tg_name)
             if (
@@ -952,13 +964,13 @@ def _collect_verified_control_shas(
             ):
                 tg_sha = str(tg_entry.get("sha") or "").strip()
                 if tg_entry.get("status") != "pass" and SHA1_RE.fullmatch(tg_sha):
-                    revoked_shas.add(tg_sha)
+                    line_revoked.add(tg_sha)
                 if (
                     max_rc_num is not None
                     and int(tm.group(3)) >= max_rc_num
                     and SHA1_RE.fullmatch(tg_sha)
                 ):
-                    newer_or_equal_rc_shas.add(tg_sha)
+                    excluded.add(tg_sha)
         if max_rc_num is not None:
             for tg_name, tg_sha in tags_map.items():
                 tm = RC_TAG_RE.fullmatch(tg_name)
@@ -968,23 +980,155 @@ def _collect_verified_control_shas(
                     and int(tm.group(3)) >= max_rc_num
                     and SHA1_RE.fullmatch(str(tg_sha or "").strip())
                 ):
-                    newer_or_equal_rc_shas.add(str(tg_sha).strip())
+                    excluded.add(str(tg_sha).strip())
+        excluded.update(line_revoked)
 
-        excluded = revoked_shas | newer_or_equal_rc_shas
+        if isinstance(br_entry, dict):
+            for item in br_entry.get("green_history") or ():
+                s = str(item or "").strip()
+                if SHA1_RE.fullmatch(s) and s not in excluded:
+                    line_passing.add(s)
+            lg = str(br_entry.get("last_green_sha") or "").strip()
+            if SHA1_RE.fullmatch(lg) and lg not in excluded:
+                line_passing.add(lg)
+            if br_entry.get("status") == "pass":
+                bs = str(br_entry.get("sha") or "").strip()
+                if SHA1_RE.fullmatch(bs) and bs not in excluded:
+                    line_passing.add(bs)
+        for tg_name, tg_entry in rc_tag_states.items():
+            tm = RC_TAG_RE.fullmatch(tg_name)
+            if (
+                tm
+                and (int(tm.group(1)), int(tm.group(2))) == line
+                and isinstance(tg_entry, dict)
+                and tg_entry.get("status") == "pass"
+            ):
+                ts = str(tg_entry.get("sha") or "").strip()
+                if SHA1_RE.fullmatch(ts) and ts not in excluded:
+                    line_passing.add(ts)
+    else:
+        any_rc_revoked: set[str] = set()
+        any_rc_passing: set[str] = set()
+        for br_ent in rc_branch_states.values():
+            if not isinstance(br_ent, dict):
+                continue
+            br_rev_local: set[str] = set()
+            for item in br_ent.get("revoked_shas") or ():
+                s = str(item or "").strip()
+                if SHA1_RE.fullmatch(s):
+                    br_rev_local.add(s)
+                    any_rc_revoked.add(s)
+            if br_ent.get("status") != "pass":
+                bs_bad = str(br_ent.get("sha") or "").strip()
+                if SHA1_RE.fullmatch(bs_bad):
+                    br_rev_local.add(bs_bad)
+                    any_rc_revoked.add(bs_bad)
+            for item in br_ent.get("green_history") or ():
+                s = str(item or "").strip()
+                if SHA1_RE.fullmatch(s) and s not in br_rev_local:
+                    any_rc_passing.add(s)
+            if br_ent.get("status") == "pass":
+                bs_ok = str(br_ent.get("sha") or "").strip()
+                if SHA1_RE.fullmatch(bs_ok) and bs_ok not in br_rev_local:
+                    any_rc_passing.add(bs_ok)
+        for tg_ent in rc_tag_states.values():
+            if not isinstance(tg_ent, dict):
+                continue
+            ts = str(tg_ent.get("sha") or "").strip()
+            if not SHA1_RE.fullmatch(ts):
+                continue
+            if tg_ent.get("status") == "pass":
+                any_rc_passing.add(ts)
+            else:
+                any_rc_revoked.add(ts)
+        excluded.update(any_rc_revoked - any_rc_passing)
+
+    if isinstance(state, dict):
+        cpu_checked = str(state.get("last_cpu_checked_sha") or "").strip()
+        cpu_st = str(state.get("last_cpu_status") or "pass").strip()
+        ppu_tested = str(state.get("last_ppu_tested_sha") or "").strip()
+        ppu_st = str(state.get("last_ppu_status") or "pass").strip()
+        if (
+            cpu_st != "pass"
+            and SHA1_RE.fullmatch(cpu_checked)
+            and cpu_checked not in line_passing
+        ):
+            excluded.add(cpu_checked)
+        if (
+            ppu_st != "pass"
+            and SHA1_RE.fullmatch(ppu_tested)
+            and ppu_tested not in line_passing
+        ):
+            excluded.add(ppu_tested)
+        for rec in state.get("probe_history") or ():
+            if not isinstance(rec, dict):
+                continue
+            up_sha = str(rec.get("upstream_sha") or "").strip()
+            if not SHA1_RE.fullmatch(up_sha) or up_sha in line_passing:
+                continue
+            if rec.get("cpu_status") in ("fail", "infra_error") or rec.get(
+                "ppu_status"
+            ) in ("fail", "infra_error"):
+                if not (
+                    up_sha == ppu_tested
+                    and ppu_st == "pass"
+                    and (up_sha != cpu_checked or cpu_st == "pass")
+                ):
+                    excluded.add(up_sha)
+
+    return excluded
+
+
+def _collect_verified_control_shas(
+    state: dict[str, Any] | None,
+    *,
+    verified_pin: str = "",
+    rc_ref: str = "",
+    target_sha: str = "",
+    tags: dict[str, str] | None = None,
+    release_branches: dict[str, str] | None = None,
+) -> list[str]:
+    """Return ordered verified green SHAs (same-line RC greens, main greens, verified pin)."""
+    tags_map = tags or {}
+    rc_branch_states = (state or {}).get("rc_branch_states") or {}
+    rc_tag_states = (state or {}).get("rc_tag_states") or {}
+    tested_rc_tags = (state or {}).get("tested_rc_tags") or ()
+    line, max_rc_num = _match_rc_line_context(
+        state,
+        rc_ref=rc_ref,
+        target_sha=target_sha,
+        tags=tags,
+        release_branches=release_branches,
+    )
+    excluded = _collect_excluded_control_shas(
+        state,
+        rc_ref=rc_ref,
+        target_sha=target_sha,
+        tags=tags,
+        release_branches=release_branches,
+    )
+
+    controls: list[str] = []
+
+    def _add(cand_sha: str) -> None:
+        s = cand_sha.strip()
+        if SHA1_RE.fullmatch(s) and s not in excluded and s not in controls:
+            controls.append(s)
+
+    if line is not None:
+        major, minor = line
+        branch_key = f"releases/v{major}.{minor}.0"
+        br_entry = rc_branch_states.get(branch_key)
         if isinstance(br_entry, dict):
             raw_hist = br_entry.get("green_history")
             if isinstance(raw_hist, list):
                 for item in raw_hist:
-                    s = str(item or "").strip()
-                    if s not in excluded:
-                        _add(s)
+                    _add(str(item or ""))
             br_green = str(br_entry.get("last_green_sha") or "").strip()
             if br_green and br_green not in excluded:
                 _add(br_green)
             elif br_entry.get("status") == "pass":
-                br_sha = str(br_entry.get("sha") or "").strip()
-                if br_sha not in excluded:
-                    _add(br_sha)
+                _add(str(br_entry.get("sha") or ""))
 
         passing_tags: list[tuple[int, str]] = []
         for tg_name, tg_entry in rc_tag_states.items():
@@ -1019,29 +1163,17 @@ def _collect_verified_control_shas(
             _add(tg_sha)
 
     if isinstance(state, dict):
-        ppu_tested = str(state.get("last_ppu_tested_sha") or "").strip()
         ppu_green = str(state.get("last_ppu_green_sha") or "").strip()
-        ppu_st = str(state.get("last_ppu_status") or "pass").strip()
-        revoked_main = (
-            ppu_green if (ppu_tested == ppu_green and ppu_st != "pass") else ""
-        )
-        if ppu_green and ppu_green != revoked_main:
+        if ppu_green:
             _add(ppu_green)
         for rec in state.get("probe_history") or ():
             if not isinstance(rec, dict):
                 continue
             up_sha = str(rec.get("upstream_sha") or "").strip()
-            if (
-                up_sha != revoked_main
-                and rec.get("cpu_status") == "pass"
-                and rec.get("ppu_status") == "pass"
-            ):
+            if rec.get("cpu_status") == "pass" and rec.get("ppu_status") == "pass":
                 _add(up_sha)
             rec_green = str(rec.get("last_ppu_green_sha") or "").strip()
-            if (
-                rec_green != revoked_main
-                and rec.get("last_ppu_result_status") == "pass"
-            ):
+            if rec.get("last_ppu_result_status") == "pass":
                 _add(rec_green)
 
     if verified_pin and SHA1_RE.fullmatch(verified_pin.strip()):
@@ -1064,7 +1196,7 @@ def _resolve_rc_last_green_sha(
     verified_pin: str = "",
     vllm_repo: Path | None = None,
 ) -> str:
-    """Return the newest verified ancestor RC/main SHA, falling back to ``fallback_green``."""
+    """Return the newest verified non-revoked ancestor RC/main SHA."""
     synthetic_state: dict[str, Any] = (
         dict(state)
         if isinstance(state, dict)
@@ -1078,6 +1210,13 @@ def _resolve_rc_last_green_sha(
             "probe_history": [],
         }
     )
+    excluded = _collect_excluded_control_shas(
+        synthetic_state,
+        rc_ref=rc_ref,
+        target_sha=target_sha,
+        tags=tags,
+        release_branches=release_branches,
+    )
     candidates = _collect_verified_control_shas(
         synthetic_state,
         verified_pin=verified_pin,
@@ -1086,7 +1225,11 @@ def _resolve_rc_last_green_sha(
         tags=tags,
         release_branches=release_branches,
     )
-    if SHA1_RE.fullmatch(fallback_green) and fallback_green not in candidates:
+    if (
+        SHA1_RE.fullmatch(fallback_green)
+        and fallback_green not in excluded
+        and fallback_green not in candidates
+    ):
         candidates.append(fallback_green)
 
     non_target = [cand for cand in candidates if cand != target_sha]
@@ -1096,6 +1239,7 @@ def _resolve_rc_last_green_sha(
             primary_green=non_target[0],
             red_sha=target_sha,
             fallback_greens=non_target[1:],
+            excluded_shas=excluded,
         )
         if rng:
             return chosen
@@ -1104,7 +1248,7 @@ def _resolve_rc_last_green_sha(
         return non_target[0]
     if candidates:
         return candidates[0]
-    return fallback_green
+    return ""
 
 
 def is_safe_ppu_skip_path(path: str) -> bool:
@@ -1777,15 +1921,21 @@ def route_three_gears(
         verified_pin=pin,
         target_sha=target_sha,
     )
+    non_target_probe_controls = [s for s in probe_controls if s != target_sha]
+    probe_green = override_green or (
+        non_target_probe_controls[0]
+        if non_target_probe_controls
+        else (probe_controls[0] if probe_controls else "")
+    )
     probe_fallbacks = [
-        last_ppu_green,
-        *(s for s in probe_controls if s not in (last_ppu_green, target_sha)),
+        probe_green,
+        *(s for s in non_target_probe_controls if s != probe_green),
     ]
     return {
         "selected_gear": "probe",
         "target_sha": target_sha,
         "rc_tag": "",
-        "last_green_sha": last_ppu_green,
+        "last_green_sha": probe_green,
         "fallback_green_shas": ",".join(
             s for s in probe_fallbacks if SHA1_RE.fullmatch(s)
         ),
@@ -2087,70 +2237,21 @@ def advance_cursor(
                     b_cur.pop("revoked_shas", None)
 
         if not rc_clean and SHA1_RE.fullmatch(target_sha):
-            cursor_lines: dict[tuple[int, int], list[tuple[int, str]]] = {}
-            for br_name, br_ent in updated["rc_branch_states"].items():
-                bm = RELEASE_BRANCH_RE.fullmatch(br_name)
-                if not bm or not isinstance(br_ent, dict):
-                    continue
-                hist_b = br_ent.get("green_history")
-                rev_b = br_ent.get("revoked_shas")
-                if (
-                    br_ent.get("sha") == target_sha
-                    or br_ent.get("last_green_sha") == target_sha
-                    or (isinstance(hist_b, list) and target_sha in hist_b)
-                    or (isinstance(rev_b, list) and target_sha in rev_b)
-                ):
-                    cursor_lines.setdefault((int(bm.group(1)), int(bm.group(2))), [])
-            for t_name, t_ent in updated["rc_tag_states"].items():
-                tm = RC_TAG_RE.fullmatch(t_name)
-                if tm and isinstance(t_ent, dict) and t_ent.get("sha") == target_sha:
-                    cursor_lines.setdefault(
-                        (int(tm.group(1)), int(tm.group(2))), []
-                    ).append((int(tm.group(3)), t_name))
-            if len(cursor_lines) == 1:
-                (only_maj, only_minr), matched_tags = next(iter(cursor_lines.items()))
-                if matched_tags:
-                    matched_tags.sort(key=lambda item: item[0])
-                    rc_clean = matched_tags[-1][1]
-                else:
-                    rc_clean = f"releases/v{only_maj}.{only_minr}.0"
-                tag_match = RC_TAG_RE.fullmatch(rc_clean)
-                branch_match = (
-                    RELEASE_BRANCH_RE.fullmatch(rc_clean) if not tag_match else None
-                )
-            elif len(cursor_lines) > 1:
-                if rc_passed:
-                    raise ValueError(
-                        f"ambiguous exact-SHA RC pass on {target_sha} across multiple release lines; pass --rc-tag"
-                    )
-                for amb_maj, amb_minr in sorted(cursor_lines):
-                    _revoke_line_sha(amb_maj, amb_minr, target_sha, rc_st)
-                    amb_br = f"releases/v{amb_maj}.{amb_minr}.0"
-                    if amb_br in updated["rc_branch_states"]:
-                        prev_rev_amb = _prior_revoked_list(amb_br)
-                        br_amb = dict(updated["rc_branch_states"][amb_br])
-                        if br_amb.get("sha") == target_sha and (
-                            br_amb.get("status") == "pass" or rc_st == "fail"
-                        ):
-                            br_amb["status"] = rc_st
-                        hist_amb = [
-                            s
-                            for s in _seed_branch_green_history(
-                                amb_br, amb_maj, amb_minr
-                            )
-                            if s != target_sha
-                        ][:20]
-                        br_amb.pop("last_green_sha", None)
-                        br_amb.pop("green_history", None)
-                        if hist_amb:
-                            br_amb["last_green_sha"] = hist_amb[0]
-                            br_amb["green_history"] = hist_amb
-                        br_amb["revoked_shas"] = [
-                            target_sha,
-                            *(s for s in prev_rev_amb if s != target_sha),
-                        ][:20]
-                        updated["rc_branch_states"][amb_br] = br_amb
-                return updated
+            rc_clean = _resolve_unique_rc_ref_for_sha(
+                target_sha,
+                tags={},
+                release_branches={},
+                release_baseline_tag="",
+                rc_branch_states=updated["rc_branch_states"],
+                rc_tag_states=updated["rc_tag_states"],
+                tested_rc_tags=updated["tested_rc_tags"],
+            )
+            tag_match = RC_TAG_RE.fullmatch(rc_clean) if rc_clean else None
+            branch_match = (
+                RELEASE_BRANCH_RE.fullmatch(rc_clean)
+                if (rc_clean and not tag_match)
+                else None
+            )
 
         if tag_match:
             major, minor, rc_num = (
@@ -4825,17 +4926,27 @@ def resolve_verified_bisect_control(
     primary_green: str,
     red_sha: str,
     fallback_greens: Sequence[str] = (),
+    excluded_shas: set[str] | frozenset[str] = frozenset(),
 ) -> tuple[str, list[str] | None]:
-    """Select the newest verified control SHA that is a strict first-parent ancestor of ``red_sha``."""
-    primary = _require_sha1(primary_green, "last_green_sha")
+    """Select the newest non-revoked verified control SHA that is a strict first-parent ancestor of ``red_sha``."""
+    primary = (
+        _require_sha1(primary_green, "last_green_sha") if primary_green.strip() else ""
+    )
     red = _require_sha1(red_sha, "red_sha")
     _ensure_commit_fetched(vllm_repo, red, depth=250)
 
     ordered: list[str] = []
     for raw in (primary, *fallback_greens):
         cand = str(raw or "").strip()
-        if SHA1_RE.fullmatch(cand) and cand not in ordered:
+        if (
+            SHA1_RE.fullmatch(cand)
+            and cand not in excluded_shas
+            and cand not in ordered
+        ):
             ordered.append(cand)
+
+    if not ordered:
+        return "", None
 
     for cand in ordered:
         if cand == red:
@@ -4845,9 +4956,10 @@ def resolve_verified_bisect_control(
         if rng:
             return cand, rng
 
-    if primary == red:
-        return primary, []
-    return primary, None
+    first_valid = ordered[0]
+    if first_valid == red:
+        return first_valid, []
+    return first_valid, None
 
 
 # ---------------------------------------------------------------------------
@@ -5092,6 +5204,7 @@ def run_source_only_build_triage(
     target = _require_sha1(target_sha, "target_sha")
     raw_green = last_green_sha.strip()
     primary_control = raw_green if SHA1_RE.fullmatch(raw_green) else pin
+    excluded_controls: set[str] = set()
     extra_controls: list[str] = [
         str(s).strip()
         for s in fallback_green_shas
@@ -5099,6 +5212,11 @@ def run_source_only_build_triage(
     ]
     if cursor is not None:
         sanitized_cur = _sanitize_cursor(cursor, verified_pin=pin)
+        excluded_controls = _collect_excluded_control_shas(
+            sanitized_cur,
+            rc_ref=rc_tag,
+            target_sha=target,
+        )
         for cand_s in _collect_verified_control_shas(
             sanitized_cur,
             verified_pin=pin,
@@ -5114,6 +5232,7 @@ def run_source_only_build_triage(
         primary_green=primary_control,
         red_sha=target,
         fallback_greens=extra_controls,
+        excluded_shas=excluded_controls,
     )
     output_dir.mkdir(parents=True, exist_ok=True)
     cpu_json_path = output_dir / "cpu-result.json"
@@ -5409,6 +5528,19 @@ def run_source_only_build_triage(
                     )
 
         # 1. Control-first mandatory wheel-build check on `control`.
+        if not control:
+            return _write_cpu_and_bisect(
+                cpu_status="infra_error",
+                stage="wheel_build",
+                target_sig="VLLM_TARGET_DEVICE=empty",
+                is_public=False,
+                bisect_status="unresolved_history",
+                first_failing="",
+                last_good="",
+                steps_executed=0,
+                probe_steps_on_range=0,
+                history=[],
+            )
         ctrl_outcome = _probe_wheel_only(control)
         if ctrl_outcome.status != "pass":
             return _write_cpu_and_bisect(
@@ -6043,7 +6175,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if args.command == "bisect":
-        green = _require_sha1(args.last_green_sha, "last_green_sha")
+        green = (
+            _require_sha1(args.last_green_sha, "last_green_sha")
+            if args.last_green_sha.strip()
+            else ""
+        )
         red = _require_sha1(args.red_sha, "red_sha")
         initial_red = None
         if args.initial_red_json and args.initial_red_json.is_file():
@@ -6066,6 +6202,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             for s in args.fallback_green_shas.split(",")
             if SHA1_RE.fullmatch(s.strip())
         ]
+        bisect_excluded: set[str] = set()
         bisect_pin = ""
         if args.verified_pin_file and args.verified_pin_file.is_file():
             bisect_pin = args.verified_pin_file.read_text(encoding="utf-8").strip()
@@ -6080,9 +6217,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             cur_pin = (
                 bisect_pin
                 if SHA1_RE.fullmatch(bisect_pin)
-                else str(raw_cur.get("last_ppu_green_sha") or green)
+                else str(raw_cur.get("last_ppu_green_sha") or green or red)
             )
             clean_cur = _sanitize_cursor(raw_cur, verified_pin=cur_pin)
+            bisect_excluded = _collect_excluded_control_shas(
+                clean_cur,
+                rc_ref=args.rc_tag,
+                target_sha=red,
+            )
             for cand_s in _collect_verified_control_shas(
                 clean_cur,
                 verified_pin=bisect_pin,
@@ -6093,12 +6235,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                     bisect_fallbacks.append(cand_s)
         elif SHA1_RE.fullmatch(bisect_pin) and bisect_pin not in bisect_fallbacks:
             bisect_fallbacks.append(bisect_pin)
+        if not green and not bisect_fallbacks:
+            raise ValueError("last_green_sha must be a 40-character lowercase hex SHA")
 
         green, commits = resolve_verified_bisect_control(
             args.vllm_repo,
             primary_green=green,
             red_sha=red,
             fallback_greens=bisect_fallbacks,
+            excluded_shas=bisect_excluded,
         )
         if not commits:
             fallback_outcome = initial_red or ProbeOutcome(
@@ -6401,6 +6546,30 @@ def main(argv: Sequence[str] | None = None) -> int:
                     fetch_remote=args.fetch_upstream_author,
                 )
 
+        prev_cursor = (
+            json.loads(args.cursor_in.read_text(encoding="utf-8"))
+            if args.cursor_in and args.cursor_in.is_file()
+            else None
+        )
+        effective_rc_tag = args.rc_tag
+        if (
+            args.gear == "rc_qualify"
+            and effective_status != "noop"
+            and not _normalize_rc_ref(effective_rc_tag)
+            and SHA1_RE.fullmatch(args.upstream_sha.strip())
+            and prev_cursor is not None
+        ):
+            clean_prev = _sanitize_cursor(prev_cursor, verified_pin=verified_pin)
+            effective_rc_tag = _resolve_unique_rc_ref_for_sha(
+                args.upstream_sha.strip(),
+                tags={},
+                release_branches={},
+                release_baseline_tag="",
+                rc_branch_states=clean_prev["rc_branch_states"],
+                rc_tag_states=clean_prev["rc_tag_states"],
+                tested_rc_tags=clean_prev["tested_rc_tags"],
+            )
+
         published = publish_sanitized_channels(
             gear=args.gear,
             status=effective_status,
@@ -6409,7 +6578,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             verified_pin=verified_pin,
             build_image=args.build_image,
             runtime_image=args.runtime_image,
-            rc_tag=args.rc_tag,
+            rc_tag=effective_rc_tag,
             cpu_status=effective_cpu_status,
             ppu_status=args.ppu_status,
             ppu_skip_reason=args.ppu_skip_reason,
@@ -6426,17 +6595,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         cursor_path = args.public_dir / "cursor.json"
         if args.gear in ("probe", "rc_qualify") and effective_status != "noop":
-            prev_cursor = (
-                json.loads(args.cursor_in.read_text(encoding="utf-8"))
-                if args.cursor_in and args.cursor_in.is_file()
-                else None
-            )
             next_cursor = advance_cursor(
                 prev_cursor,
                 verified_pin=verified_pin,
                 selected_gear=args.gear,
                 target_sha=args.upstream_sha,
-                rc_tag=args.rc_tag,
+                rc_tag=effective_rc_tag,
                 status=effective_status,
                 cpu_status=effective_cpu_status,
                 ppu_status=args.ppu_status,

@@ -6191,3 +6191,132 @@ def test_review_6057527910_partial_rerun_cursor_exact_sha_rc_ancestry_and_infra_
     )
     assert tag_fail_conflict["rc_tag_states"][rc1]["status"] == "fail"
     assert tag_fail_conflict["rc_branch_states"][branch]["status"] == "fail"
+
+    # --- 5. [R1 P1-1] Ambiguous empty --rc-tag publish fails closed for pass, fail, and infra_error ---
+    ambig_cursor_path = tmp_path / "ambig-cursor.json"
+    ambig_cursor_path.write_text(
+        json.dumps(
+            {
+                **json.loads(b_pass.read_text(encoding="utf-8")),
+                "rc_branch_states": {
+                    "releases/v0.35.0": {
+                        "sha": sha_b,
+                        "status": "pass",
+                        "last_green_sha": sha_b,
+                        "green_history": [sha_b, sha_a],
+                    },
+                    "releases/v0.36.0": {
+                        "sha": sha_b,
+                        "status": "pass",
+                        "last_green_sha": sha_b,
+                        "green_history": [sha_b],
+                    },
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    for ambig_st, ambig_stage in (
+        ("pass", "none"),
+        ("fail", "rc_model_sanity"),
+        ("fail", "wheel_build"),
+    ):
+        ambig_pub_dir = tmp_path / f"ambig-pub-{ambig_st}-{ambig_stage}"
+        with pytest.raises(ValueError, match="ambiguous"):
+            post_merge.main(
+                [
+                    "publish",
+                    "--gear",
+                    "rc_qualify",
+                    "--upstream-sha",
+                    sha_b,
+                    "--verified-pin-file",
+                    str(pin_file),
+                    "--sail-sha",
+                    sail_sha,
+                    "--public-dir",
+                    str(ambig_pub_dir),
+                    "--status",
+                    ambig_st,
+                    "--cpu-status",
+                    "not_run" if ambig_stage == "wheel_build" else "pass",
+                    "--ppu-status",
+                    "not_run" if ambig_stage == "wheel_build" else ambig_st,
+                    "--failure-stage",
+                    ambig_stage,
+                    "--rc-tag",
+                    "",
+                    "--cursor-in",
+                    str(ambig_cursor_path),
+                ]
+            )
+        assert not (ambig_pub_dir / "cursor.json").exists()
+        assert not (ambig_pub_dir / "public-summary.json").exists()
+
+    # --- 6. [R1 P1-2] Revoked RC SHA that previously passed on main never re-enters control chain ---
+    _git("update-ref", "refs/heads/main", sha_b)
+    main_b_pass = _cli_publish("p12-main-b-pass", None, "probe", sha_b)
+    rc_b_revoked = _cli_publish(
+        "p12-rc-b-revoked", main_b_pass, "rc_qualify", sha_b, branch, status="fail"
+    )
+    _snapshot(sha_c, {})
+    for routed_p12 in (
+        _cli_route(rc_b_revoked),
+        _cli_route(rc_b_revoked, vllm_repo_arg=repo),
+    ):
+        assert routed_p12["target_sha"] == sha_c
+        assert routed_p12["last_green_sha"] == pin
+        assert sha_b not in routed_p12["fallback_green_shas"].split(",")
+
+    # Downstream bisect & source-build-triage skip revoked `sha_b` even if passed as --last-green-sha:
+    p12_bisect_json = tmp_path / "p12-bisect.json"
+    p12_probe_cmd = (
+        f'test "$CANDIDATE_SHA" = "{pin}" || test "$CANDIDATE_SHA" = "{main_green}"'
+    )
+    assert (
+        post_merge.main(
+            [
+                "bisect",
+                "--vllm-repo",
+                str(repo),
+                "--last-green-sha",
+                sha_b,
+                "--cursor-file",
+                str(rc_b_revoked),
+                "--verified-pin-file",
+                str(pin_file),
+                "--red-sha",
+                sha_c,
+                "--probe-cmd",
+                p12_probe_cmd,
+                "--output-json",
+                str(p12_bisect_json),
+            ]
+        )
+        == 0
+    )
+    p12_bisect_res = json.loads(p12_bisect_json.read_text(encoding="utf-8"))
+    assert p12_bisect_res["bisect_status"] == "converged"
+    assert p12_bisect_res["last_good_sha"] == main_green
+    assert p12_bisect_res["first_failing_sha"] == sha_a
+    assert all(
+        not (step["role"] == "baseline_control" and step["sha"] == sha_b)
+        for step in p12_bisect_res["history"]
+    )
+
+    p12_sbt_dir = tmp_path / "p12-sbt"
+    p12_sbt = post_merge.run_source_only_build_triage(
+        vllm_repo=repo,
+        sail_root=REPO_ROOT,
+        target_sha=sha_c,
+        verified_pin=pin,
+        last_green_sha=sha_b,
+        cursor=json.loads(rc_b_revoked.read_text(encoding="utf-8")),
+        rc_tag=branch,
+        output_dir=p12_sbt_dir,
+        probe_cmd=sbt_probe_cmd,
+    )
+    assert p12_sbt["bisect"]["bisect_status"] == "converged"
+    assert p12_sbt["bisect"]["last_good_sha"] == main_green
+    assert p12_sbt["bisect"]["first_failing_sha"] == sha_a
