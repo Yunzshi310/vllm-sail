@@ -4991,6 +4991,7 @@ def test_rc_release_branch_priority_same_sha_dedup_cherrypick_bisect_and_cursor_
         "status": "fail",
         "last_green_sha": sha_cp1,
         "green_history": [sha_cp1, sha_rc0],
+        "revoked_shas": [sha_cp2_bad],
     }
 
     ls_cp3 = {**ls_cp1, "release_branches": {"releases/v0.35.0": sha_cp3_bad}}
@@ -5019,6 +5020,7 @@ def test_rc_release_branch_priority_same_sha_dedup_cherrypick_bisect_and_cursor_
         "status": "infra_error",
         "last_green_sha": sha_cp1,
         "green_history": [sha_cp1, sha_rc0],
+        "revoked_shas": [sha_cp3_bad, sha_cp2_bad],
     }
     for main_key in (
         "last_cpu_checked_sha",
@@ -5562,6 +5564,7 @@ def test_review_r2_sub1_symmetric_same_sha_multi_tag_and_cross_branch_recovery()
         "status": "fail",
         "last_green_sha": sha_a,
         "green_history": [sha_a],
+        "revoked_shas": [sha_d, sha_b],
     }
     route_conflicting = post_merge.route_three_gears(
         ls_remote_data={
@@ -5575,3 +5578,143 @@ def test_review_r2_sub1_symmetric_same_sha_multi_tag_and_cross_branch_recovery()
         cursor=conflicting_raw,
     )
     assert route_conflicting["last_green_sha"] == sha_a
+
+    # 4. SUB1 R1 Trigger 1: conflicting `rc1(B)=pass` + `branch(B)=fail/infra_error`, followed by
+    #    `advance_cursor(branch, C, fail)` and then `route(D)`: B must NEVER resurrect without passing retry!
+    for bad_st in ("fail", "infra_error"):
+        conflict_t1 = {
+            **base_cur,
+            "tested_rc_tags": ["v0.35.0rc1"],
+            "rc_tag_states": {"v0.35.0rc1": {"sha": sha_b, "status": "pass"}},
+            "rc_branch_states": {
+                "releases/v0.35.0": {
+                    "sha": sha_b,
+                    "status": bad_st,
+                    "last_green_sha": sha_b,
+                    "green_history": [sha_b],
+                }
+            },
+        }
+        after_c_fail = post_merge.advance_cursor(
+            conflict_t1,
+            verified_pin=VERIFIED_PIN,
+            selected_gear="rc_qualify",
+            target_sha=sha_c,
+            rc_tag="releases/v0.35.0",
+            status="fail",
+            cpu_status="pass",
+            ppu_status="fail",
+        )
+        assert after_c_fail["rc_tag_states"]["v0.35.0rc1"]["status"] == bad_st
+        assert "v0.35.0rc1" not in after_c_fail["tested_rc_tags"]
+        route_d = post_merge.route_three_gears(
+            ls_remote_data={
+                "main_sha": sha_main,
+                "tags": {"v0.35.0rc1": sha_b},
+                "release_branches": {"releases/v0.35.0": sha_d},
+            },
+            verified_pin=VERIFIED_PIN,
+            release_baseline_tag="v0.34.0",
+            requested_gear="auto",
+            cursor=after_c_fail,
+        )
+        assert route_d["last_green_sha"] == sha_main_green
+        bisect_t1 = post_merge.bisect_first_failing_sha(
+            last_green_sha=route_d["last_green_sha"],
+            red_sha=route_d["target_sha"],
+            commits=[sha_b, sha_c, sha_d],
+            probe_fn=lambda sha: (
+                post_merge.ProbeOutcome(status="pass")
+                if sha == sha_main_green
+                else post_merge.ProbeOutcome(
+                    status="fail",
+                    stage="plugin_registration",
+                    target_signature="ModelRegistry.register_model",
+                    is_public_plugin_interface=True,
+                )
+            ),
+            verify_baseline_first=True,
+        )
+        assert bisect_t1["bisect_status"] == "converged"
+        assert bisect_t1["first_failing_sha"] == sha_b
+
+    # Same Trigger 1 with legacy `tested_rc_tags=["v0.35.0rc1"]` and empty `rc_tag_states={}`:
+    # `revoked_shas` still prevents B from resurrecting after branch moves to C!
+    legacy_conflict_t1 = {
+        **base_cur,
+        "tested_rc_tags": ["v0.35.0rc1"],
+        "rc_tag_states": {},
+        "rc_branch_states": {"releases/v0.35.0": {"sha": sha_b, "status": "fail"}},
+    }
+    legacy_after_c_fail = post_merge.advance_cursor(
+        legacy_conflict_t1,
+        verified_pin=VERIFIED_PIN,
+        selected_gear="rc_qualify",
+        target_sha=sha_c,
+        rc_tag="releases/v0.35.0",
+        status="fail",
+        cpu_status="pass",
+        ppu_status="fail",
+    )
+    route_legacy_d = post_merge.route_three_gears(
+        ls_remote_data={
+            "main_sha": sha_main,
+            "tags": {"v0.35.0rc1": sha_b},
+            "release_branches": {"releases/v0.35.0": sha_d},
+        },
+        verified_pin=VERIFIED_PIN,
+        release_baseline_tag="v0.34.0",
+        requested_gear="auto",
+        cursor=legacy_after_c_fail,
+    )
+    assert route_legacy_d["last_green_sha"] == sha_main_green
+
+    # 5. SUB1 R1 Trigger 2: conflicting `rc1(B)=pass`, `rc2(B)=fail`, `branch={sha:D, status:fail, green_history:[B,A]}`
+    #    followed by genuine passing retry `advance_cursor(rc1, B, pass)` -> MUST promote B ahead of A!
+    conflict_t2 = {
+        **cur_a,
+        "tested_rc_tags": ["v0.35.0rc1"],
+        "rc_tag_states": {
+            "v0.35.0rc1": {"sha": sha_b, "status": "pass"},
+            "v0.35.0rc2": {"sha": sha_b, "status": "fail"},
+        },
+        "rc_branch_states": {
+            "releases/v0.35.0": {
+                "sha": sha_d,
+                "status": "fail",
+                "last_green_sha": sha_b,
+                "green_history": [sha_b, sha_a],
+            }
+        },
+    }
+    after_rc1_genuine_retry = post_merge.advance_cursor(
+        conflict_t2,
+        verified_pin=VERIFIED_PIN,
+        selected_gear="rc_qualify",
+        target_sha=sha_b,
+        rc_tag="v0.35.0rc1",
+        status="pass",
+        cpu_status="pass",
+        ppu_status="pass",
+    )
+    assert after_rc1_genuine_retry["rc_branch_states"]["releases/v0.35.0"][
+        "green_history"
+    ] == [sha_b, sha_a]
+    assert (
+        after_rc1_genuine_retry["rc_branch_states"]["releases/v0.35.0"][
+            "last_green_sha"
+        ]
+        == sha_b
+    )
+    route_after_t2 = post_merge.route_three_gears(
+        ls_remote_data={
+            "main_sha": sha_main,
+            "tags": {"v0.35.0rc1": sha_b, "v0.35.0rc2": sha_b},
+            "release_branches": {"releases/v0.35.0": sha_c},
+        },
+        verified_pin=VERIFIED_PIN,
+        release_baseline_tag="v0.34.0",
+        requested_gear="auto",
+        cursor=after_rc1_genuine_retry,
+    )
+    assert route_after_t2["last_green_sha"] == sha_b

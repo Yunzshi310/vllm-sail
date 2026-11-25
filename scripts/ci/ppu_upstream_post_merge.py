@@ -724,12 +724,23 @@ def select_newest_rc_target(
         if covered_by_tag:
             continue
 
+        br_revoked_set: set[str] = set()
+        if isinstance(prior_br, dict):
+            raw_rev = prior_br.get("revoked_shas")
+            if isinstance(raw_rev, list):
+                br_revoked_set.update(
+                    str(x).strip()
+                    for x in raw_rev
+                    if SHA1_RE.fullmatch(str(x or "").strip())
+                )
+
         for t_name in tested:
             t_match = RC_TAG_RE.fullmatch(t_name)
             if (
                 t_match
                 and (int(t_match.group(1)), int(t_match.group(2))) == (major, minor)
                 and tags.get(t_name) == tip_sha
+                and (not include_failed or tip_sha not in br_revoked_set)
             ):
                 covered_by_tag = True
                 break
@@ -784,10 +795,17 @@ def _resolve_rc_last_green_sha(
     branch_key = f"releases/v{major}.{minor}.0"
     br_entry = rc_branch_states.get(branch_key)
     revoked_shas: set[str] = set()
-    if isinstance(br_entry, dict) and br_entry.get("status") != "pass":
-        br_bad = str(br_entry.get("sha") or "").strip()
-        if SHA1_RE.fullmatch(br_bad):
-            revoked_shas.add(br_bad)
+    if isinstance(br_entry, dict):
+        raw_rev = br_entry.get("revoked_shas")
+        if isinstance(raw_rev, list):
+            for item in raw_rev:
+                s = str(item or "").strip()
+                if SHA1_RE.fullmatch(s):
+                    revoked_shas.add(s)
+        if br_entry.get("status") != "pass":
+            br_bad = str(br_entry.get("sha") or "").strip()
+            if SHA1_RE.fullmatch(br_bad):
+                revoked_shas.add(br_bad)
     for tg_name, tg_entry in rc_tag_states.items():
         tm = RC_TAG_RE.fullmatch(tg_name)
         if (
@@ -1035,18 +1053,6 @@ def _sanitize_cursor(
         if br_st not in ("pass", "fail", "infra_error"):
             raise ValueError(f"invalid rc_branch_states status: {br_st!r}")
         br_clean = raw_branch.strip()
-        br_match = RELEASE_BRANCH_RE.fullmatch(br_clean)
-        assert br_match is not None
-        br_line = (int(br_match.group(1)), int(br_match.group(2)))
-        line_revoked: set[str] = {br_sha} if br_st != "pass" else set()
-        for t_name, t_entry in clean_rc_states.items():
-            tm = RC_TAG_RE.fullmatch(t_name)
-            if (
-                tm
-                and (int(tm.group(1)), int(tm.group(2))) == br_line
-                and t_entry.get("status") != "pass"
-            ):
-                line_revoked.add(t_entry["sha"])
         hist: list[str] = []
         raw_hist_val = raw_entry.get("green_history")
         if raw_hist_val is not None:
@@ -1060,6 +1066,19 @@ def _sanitize_cursor(
                 s = _require_sha1(item, f"rc_branch_states.green_history[{idx}]")
                 if s not in hist:
                     hist.append(s)
+        revoked_list: list[str] = []
+        raw_rev_val = raw_entry.get("revoked_shas")
+        if raw_rev_val is not None:
+            if not isinstance(raw_rev_val, list):
+                raise ValueError("rc_branch_states.revoked_shas must be a list")
+            for idx, item in enumerate(raw_rev_val):
+                if not isinstance(item, str):
+                    raise ValueError(
+                        f"rc_branch_states.revoked_shas[{idx}] must be a 40-character lowercase hex SHA"
+                    )
+                rs = _require_sha1(item, f"rc_branch_states.revoked_shas[{idx}]")
+                if rs not in revoked_list:
+                    revoked_list.append(rs)
         raw_green = raw_entry.get("last_green_sha")
         if raw_green is not None and raw_green != "":
             if not isinstance(raw_green, str):
@@ -1071,14 +1090,84 @@ def _sanitize_cursor(
                 hist.insert(0, green_clean)
         elif br_st == "pass" and br_sha not in hist:
             hist.insert(0, br_sha)
-        if line_revoked:
-            hist = [s for s in hist if s not in line_revoked]
-        hist = hist[:20]
         entry_clean: dict[str, Any] = {"sha": br_sha, "status": br_st}
         if hist:
             entry_clean["last_green_sha"] = hist[0]
             entry_clean["green_history"] = hist
+        if revoked_list:
+            entry_clean["revoked_shas"] = revoked_list[:20]
         clean_branch_states[br_clean] = entry_clean
+
+    # Enforce cross-entry fail-closed SHA verdict per release line (`fail` > `infra_error` > `pass`).
+    all_rc_lines: set[tuple[int, int]] = set()
+    for t_name in clean_rc_states:
+        tm = RC_TAG_RE.fullmatch(t_name)
+        if tm:
+            all_rc_lines.add((int(tm.group(1)), int(tm.group(2))))
+    for b_name in clean_branch_states:
+        bm = RELEASE_BRANCH_RE.fullmatch(b_name)
+        if bm:
+            all_rc_lines.add((int(bm.group(1)), int(bm.group(2))))
+
+    def _record_bad_sha(
+        bad_map: dict[str, str], order_list: list[str], bad_sha: str, st: str
+    ) -> None:
+        if bad_sha not in order_list:
+            order_list.append(bad_sha)
+        if st == "fail" or bad_sha not in bad_map:
+            bad_map[bad_sha] = "fail" if st == "fail" else "infra_error"
+
+    for maj, minr in sorted(all_rc_lines):
+        b_key = f"releases/v{maj}.{minr}.0"
+        b_ent = clean_branch_states.get(b_key)
+        bad_by_sha: dict[str, str] = {}
+        bad_order: list[str] = []
+
+        if isinstance(b_ent, dict):
+            if b_ent["status"] != "pass":
+                _record_bad_sha(bad_by_sha, bad_order, b_ent["sha"], b_ent["status"])
+            for rs in b_ent.get("revoked_shas") or ():
+                _record_bad_sha(bad_by_sha, bad_order, rs, "fail")
+        for t_name, t_ent in clean_rc_states.items():
+            tm = RC_TAG_RE.fullmatch(t_name)
+            if (
+                tm
+                and (int(tm.group(1)), int(tm.group(2))) == (maj, minr)
+                and t_ent["status"] != "pass"
+            ):
+                _record_bad_sha(bad_by_sha, bad_order, t_ent["sha"], t_ent["status"])
+        if not bad_by_sha:
+            continue
+        for t_name, t_ent in clean_rc_states.items():
+            tm = RC_TAG_RE.fullmatch(t_name)
+            if (
+                tm
+                and (int(tm.group(1)), int(tm.group(2))) == (maj, minr)
+                and t_ent["sha"] in bad_by_sha
+            ):
+                worst = bad_by_sha[t_ent["sha"]]
+                if t_ent["status"] == "pass" or worst == "fail":
+                    t_ent["status"] = worst
+        if isinstance(b_ent, dict):
+            if b_ent["sha"] in bad_by_sha:
+                worst_b = bad_by_sha[b_ent["sha"]]
+                if b_ent["status"] == "pass" or worst_b == "fail":
+                    b_ent["status"] = worst_b
+            rem_hist = [
+                s for s in (b_ent.get("green_history") or ()) if s not in bad_by_sha
+            ][:20]
+            b_ent.pop("last_green_sha", None)
+            b_ent.pop("green_history", None)
+            if rem_hist:
+                b_ent["last_green_sha"] = rem_hist[0]
+                b_ent["green_history"] = rem_hist
+            b_ent["revoked_shas"] = bad_order[:20]
+
+    tested_rcs = [
+        t
+        for t in tested_rcs
+        if t not in clean_rc_states or clean_rc_states[t]["status"] == "pass"
+    ]
 
     raw_fps = cursor.get("patch_fingerprints") or {}
     if not isinstance(raw_fps, dict):
@@ -1613,19 +1702,39 @@ def advance_cursor(
             br_key: str, maj: int, minr: int, *, exclude_tag: str = ""
         ) -> list[str]:
             prior = updated["rc_branch_states"].get(br_key) or {}
+            prior_rev = {
+                str(x).strip()
+                for x in (prior.get("revoked_shas") or ())
+                if SHA1_RE.fullmatch(str(x or "").strip())
+            }
+            if prior.get("status") not in (None, "pass"):
+                ps_bad = str(prior.get("sha") or "").strip()
+                if SHA1_RE.fullmatch(ps_bad):
+                    prior_rev.add(ps_bad)
+            for t_name, t_entry in updated["rc_tag_states"].items():
+                tm = RC_TAG_RE.fullmatch(t_name)
+                if (
+                    tm
+                    and (int(tm.group(1)), int(tm.group(2))) == (maj, minr)
+                    and isinstance(t_entry, dict)
+                    and t_entry.get("status") != "pass"
+                ):
+                    ts_bad = str(t_entry.get("sha") or "").strip()
+                    if SHA1_RE.fullmatch(ts_bad):
+                        prior_rev.add(ts_bad)
             seeded: list[str] = []
             raw_h = prior.get("green_history")
             if isinstance(raw_h, list):
                 for item in raw_h:
                     s = str(item or "").strip()
-                    if SHA1_RE.fullmatch(s) and s not in seeded:
+                    if SHA1_RE.fullmatch(s) and s not in prior_rev and s not in seeded:
                         seeded.append(s)
             lg = str(prior.get("last_green_sha") or "").strip()
-            if SHA1_RE.fullmatch(lg) and lg not in seeded:
+            if SHA1_RE.fullmatch(lg) and lg not in prior_rev and lg not in seeded:
                 seeded.append(lg)
             if prior.get("status") == "pass":
                 ps = str(prior.get("sha") or "").strip()
-                if SHA1_RE.fullmatch(ps) and ps not in seeded:
+                if SHA1_RE.fullmatch(ps) and ps not in prior_rev and ps not in seeded:
                     seeded.append(ps)
             tag_greens: list[tuple[int, str]] = []
             for t_name, t_entry in updated["rc_tag_states"].items():
@@ -1639,13 +1748,26 @@ def advance_cursor(
                     and t_entry.get("status") == "pass"
                 ):
                     ts = str(t_entry.get("sha") or "").strip()
-                    if SHA1_RE.fullmatch(ts):
+                    if SHA1_RE.fullmatch(ts) and ts not in prior_rev:
                         tag_greens.append((int(tm.group(3)), ts))
             tag_greens.sort(key=lambda item: item[0], reverse=True)
             for _, ts in tag_greens:
                 if ts not in seeded:
                     seeded.append(ts)
             return seeded
+
+        def _prior_revoked_list(br_key: str) -> list[str]:
+            prior = updated["rc_branch_states"].get(br_key) or {}
+            out: list[str] = []
+            for item in prior.get("revoked_shas") or ():
+                s = str(item or "").strip()
+                if SHA1_RE.fullmatch(s) and s not in out:
+                    out.append(s)
+            if prior.get("status") not in (None, "pass"):
+                ps = str(prior.get("sha") or "").strip()
+                if SHA1_RE.fullmatch(ps) and ps not in out:
+                    out.insert(0, ps)
+            return out
 
         def _revoke_line_sha(maj: int, minr: int, bad_sha: str, bad_st: str) -> None:
             demoted: set[str] = set()
@@ -1656,9 +1778,9 @@ def advance_cursor(
                     and (int(tm.group(1)), int(tm.group(2))) == (maj, minr)
                     and isinstance(t_entry, dict)
                     and t_entry.get("sha") == bad_sha
-                    and t_entry.get("status") == "pass"
                 ):
-                    t_entry["status"] = bad_st
+                    if t_entry.get("status") == "pass" or bad_st == "fail":
+                        t_entry["status"] = bad_st
                     demoted.add(t_name)
             if demoted:
                 updated["tested_rc_tags"] = [
@@ -1678,11 +1800,15 @@ def advance_cursor(
                     if t_name not in updated["tested_rc_tags"]:
                         updated["tested_rc_tags"].append(t_name)
             br_k = f"releases/v{maj}.{minr}.0"
-            if (
-                br_k in updated["rc_branch_states"]
-                and updated["rc_branch_states"][br_k].get("sha") == good_sha
-            ):
-                updated["rc_branch_states"][br_k]["status"] = "pass"
+            if br_k in updated["rc_branch_states"]:
+                b_cur = updated["rc_branch_states"][br_k]
+                if b_cur.get("sha") == good_sha:
+                    b_cur["status"] = "pass"
+                rem_rev = [s for s in _prior_revoked_list(br_k) if s != good_sha][:20]
+                if rem_rev:
+                    b_cur["revoked_shas"] = rem_rev
+                else:
+                    b_cur.pop("revoked_shas", None)
 
         if tag_match:
             major, minor, rc_num = (
@@ -1770,6 +1896,7 @@ def advance_cursor(
                     ]
                 _revoke_line_sha(major, minor, target_sha, rc_st)
                 if branch_key in updated["rc_branch_states"]:
+                    prev_rev = _prior_revoked_list(branch_key)
                     br_cur = dict(updated["rc_branch_states"][branch_key])
                     if (
                         br_cur.get("sha") == target_sha
@@ -1786,23 +1913,33 @@ def advance_cursor(
                     if hist:
                         br_cur["last_green_sha"] = hist[0]
                         br_cur["green_history"] = hist
+                    br_cur["revoked_shas"] = [
+                        target_sha,
+                        *(s for s in prev_rev if s != target_sha),
+                    ][:20]
                     updated["rc_branch_states"][branch_key] = br_cur
         elif branch_match:
             major, minor = int(branch_match.group(1)), int(branch_match.group(2))
             if rc_passed:
-                seeded_before = _seed_branch_green_history(rc_clean, major, minor)
+                prev_rev = _prior_revoked_list(rc_clean)
+                seeded_before = [
+                    s
+                    for s in _seed_branch_green_history(rc_clean, major, minor)
+                    if s != target_sha
+                ]
                 _restore_line_sha(major, minor, target_sha)
-                hist = [
-                    target_sha,
-                    *(s for s in seeded_before if s != target_sha),
-                ][:20]
+                hist = [target_sha, *seeded_before][:20]
+                rem_rev = [s for s in prev_rev if s != target_sha][:20]
                 br_entry: dict[str, Any] = {
                     "sha": target_sha,
                     "status": "pass",
                     "last_green_sha": hist[0],
                     "green_history": hist,
                 }
+                if rem_rev:
+                    br_entry["revoked_shas"] = rem_rev
             else:
+                prev_rev = _prior_revoked_list(rc_clean)
                 _revoke_line_sha(major, minor, target_sha, rc_st)
                 hist = [
                     s
@@ -1812,6 +1949,10 @@ def advance_cursor(
                 br_entry = {
                     "sha": target_sha,
                     "status": rc_st,
+                    "revoked_shas": [
+                        target_sha,
+                        *(s for s in prev_rev if s != target_sha),
+                    ][:20],
                 }
                 if hist:
                     br_entry["last_green_sha"] = hist[0]
