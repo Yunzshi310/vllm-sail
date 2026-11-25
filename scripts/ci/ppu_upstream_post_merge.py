@@ -786,14 +786,7 @@ def _resolve_rc_last_green_sha(
     revoked_shas: set[str] = set()
     if isinstance(br_entry, dict) and br_entry.get("status") != "pass":
         br_bad = str(br_entry.get("sha") or "").strip()
-        if SHA1_RE.fullmatch(br_bad) and not any(
-            (tm := RC_TAG_RE.fullmatch(tn))
-            and (int(tm.group(1)), int(tm.group(2))) == line
-            and isinstance(te, dict)
-            and te.get("sha") == br_bad
-            and te.get("status") == "pass"
-            for tn, te in rc_tag_states.items()
-        ):
+        if SHA1_RE.fullmatch(br_bad):
             revoked_shas.add(br_bad)
     for tg_name, tg_entry in rc_tag_states.items():
         tm = RC_TAG_RE.fullmatch(tg_name)
@@ -804,11 +797,7 @@ def _resolve_rc_last_green_sha(
             and tg_entry.get("status") != "pass"
         ):
             tg_bad = str(tg_entry.get("sha") or "").strip()
-            if SHA1_RE.fullmatch(tg_bad) and not (
-                isinstance(br_entry, dict)
-                and br_entry.get("sha") == tg_bad
-                and br_entry.get("status") == "pass"
-            ):
+            if SHA1_RE.fullmatch(tg_bad):
                 revoked_shas.add(tg_bad)
 
     candidates: list[str] = []
@@ -1046,6 +1035,18 @@ def _sanitize_cursor(
         if br_st not in ("pass", "fail", "infra_error"):
             raise ValueError(f"invalid rc_branch_states status: {br_st!r}")
         br_clean = raw_branch.strip()
+        br_match = RELEASE_BRANCH_RE.fullmatch(br_clean)
+        assert br_match is not None
+        br_line = (int(br_match.group(1)), int(br_match.group(2)))
+        line_revoked: set[str] = {br_sha} if br_st != "pass" else set()
+        for t_name, t_entry in clean_rc_states.items():
+            tm = RC_TAG_RE.fullmatch(t_name)
+            if (
+                tm
+                and (int(tm.group(1)), int(tm.group(2))) == br_line
+                and t_entry.get("status") != "pass"
+            ):
+                line_revoked.add(t_entry["sha"])
         hist: list[str] = []
         raw_hist_val = raw_entry.get("green_history")
         if raw_hist_val is not None:
@@ -1070,8 +1071,8 @@ def _sanitize_cursor(
                 hist.insert(0, green_clean)
         elif br_st == "pass" and br_sha not in hist:
             hist.insert(0, br_sha)
-        if br_st != "pass":
-            hist = [s for s in hist if s != br_sha]
+        if line_revoked:
+            hist = [s for s in hist if s not in line_revoked]
         hist = hist[:20]
         entry_clean: dict[str, Any] = {"sha": br_sha, "status": br_st}
         if hist:
@@ -1664,6 +1665,25 @@ def advance_cursor(
                     t for t in updated["tested_rc_tags"] if t not in demoted
                 ]
 
+        def _restore_line_sha(maj: int, minr: int, good_sha: str) -> None:
+            for t_name, t_entry in updated["rc_tag_states"].items():
+                tm = RC_TAG_RE.fullmatch(t_name)
+                if (
+                    tm
+                    and (int(tm.group(1)), int(tm.group(2))) == (maj, minr)
+                    and isinstance(t_entry, dict)
+                    and t_entry.get("sha") == good_sha
+                ):
+                    t_entry["status"] = "pass"
+                    if t_name not in updated["tested_rc_tags"]:
+                        updated["tested_rc_tags"].append(t_name)
+            br_k = f"releases/v{maj}.{minr}.0"
+            if (
+                br_k in updated["rc_branch_states"]
+                and updated["rc_branch_states"][br_k].get("sha") == good_sha
+            ):
+                updated["rc_branch_states"][br_k]["status"] = "pass"
+
         if tag_match:
             major, minor, rc_num = (
                 int(tag_match.group(1)),
@@ -1676,6 +1696,19 @@ def advance_cursor(
                 and prior_tag.get("status") == "pass"
                 and prior_tag.get("sha") == target_sha
             )
+            same_sha_max_rc_num = max(
+                (
+                    rc_num,
+                    *(
+                        int(m.group(3))
+                        for t_name, t_entry in updated["rc_tag_states"].items()
+                        if (m := RC_TAG_RE.fullmatch(t_name))
+                        and (int(m.group(1)), int(m.group(2))) == (major, minor)
+                        and isinstance(t_entry, dict)
+                        and t_entry.get("sha") == target_sha
+                    ),
+                )
+            )
             prev_max_passing_rc_num = max(
                 (
                     int(m.group(3))
@@ -1683,7 +1716,9 @@ def advance_cursor(
                         *(
                             k
                             for k, v in updated["rc_tag_states"].items()
-                            if isinstance(v, dict) and v.get("status") == "pass"
+                            if isinstance(v, dict)
+                            and v.get("status") == "pass"
+                            and v.get("sha") != target_sha
                         ),
                         *updated["tested_rc_tags"],
                     )
@@ -1693,29 +1728,37 @@ def advance_cursor(
                 ),
                 default=-1,
             )
+            branch_key = f"releases/v{major}.{minor}.0"
+            seeded_before = (
+                _seed_branch_green_history(
+                    branch_key, major, minor, exclude_tag=rc_clean
+                )
+                if branch_key in updated["rc_branch_states"]
+                else []
+            )
             updated["rc_tag_states"][rc_clean] = {
                 "sha": target_sha,
                 "status": rc_st,
             }
             updated["rc_tag_states"] = dict(sorted(updated["rc_tag_states"].items()))
-            branch_key = f"releases/v{major}.{minor}.0"
             if rc_passed:
                 if rc_clean not in updated["tested_rc_tags"]:
                     updated["tested_rc_tags"].append(rc_clean)
+                _restore_line_sha(major, minor, target_sha)
                 if branch_key in updated["rc_branch_states"]:
                     br_cur = dict(updated["rc_branch_states"][branch_key])
-                    hist = _seed_branch_green_history(
-                        branch_key, major, minor, exclude_tag=rc_clean
-                    )
-                    if br_cur.get("sha") == target_sha:
-                        br_cur["status"] = "pass"
                     if (
                         not was_already_passing_same_sha
-                        and rc_num >= prev_max_passing_rc_num
+                        and same_sha_max_rc_num >= prev_max_passing_rc_num
                     ):
-                        hist = [target_sha, *(s for s in hist if s != target_sha)][:20]
-                    elif target_sha not in hist:
-                        hist = [*hist, target_sha][:20]
+                        hist = [
+                            target_sha,
+                            *(s for s in seeded_before if s != target_sha),
+                        ][:20]
+                    elif target_sha in seeded_before:
+                        hist = seeded_before[:20]
+                    else:
+                        hist = [*seeded_before, target_sha][:20]
                     if hist:
                         br_cur["last_green_sha"] = hist[0]
                         br_cur["green_history"] = hist
@@ -1747,13 +1790,11 @@ def advance_cursor(
         elif branch_match:
             major, minor = int(branch_match.group(1)), int(branch_match.group(2))
             if rc_passed:
+                seeded_before = _seed_branch_green_history(rc_clean, major, minor)
+                _restore_line_sha(major, minor, target_sha)
                 hist = [
                     target_sha,
-                    *(
-                        s
-                        for s in _seed_branch_green_history(rc_clean, major, minor)
-                        if s != target_sha
-                    ),
+                    *(s for s in seeded_before if s != target_sha),
                 ][:20]
                 br_entry: dict[str, Any] = {
                     "sha": target_sha,

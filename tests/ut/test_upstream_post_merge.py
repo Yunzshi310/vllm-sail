@@ -5394,3 +5394,184 @@ def test_review_r1_rc_green_baseline_retry_promotion_and_rerun_revocation_bisect
         cursor=c_only_a_revoked,
     )
     assert route_after_full_revoke["last_green_sha"] == sha_main_green
+
+
+def test_review_r2_sub1_symmetric_same_sha_multi_tag_and_cross_branch_recovery():
+    sha_main = _sha(1020)
+    sha_main_green = _sha(1021)
+    sha_a = _sha(1022)
+    sha_b = _sha(1023)
+    sha_c = _sha(1024)
+    sha_d = _sha(1025)
+
+    base_cur = post_merge.advance_cursor(
+        None,
+        verified_pin=VERIFIED_PIN,
+        selected_gear="probe",
+        target_sha=sha_main_green,
+        status="pass",
+        cpu_status="pass",
+        ppu_status="pass",
+    )
+    cur_a = post_merge.advance_cursor(
+        base_cur,
+        verified_pin=VERIFIED_PIN,
+        selected_gear="rc_qualify",
+        target_sha=sha_a,
+        rc_tag="releases/v0.35.0",
+        status="pass",
+        cpu_status="pass",
+        ppu_status="pass",
+    )
+
+    # 1. R2 Counterexample 1:
+    #    branch(A) pass -> rc1(B) pass -> rc2(B) pass -> rc1(B) fail -> rc1(B) retry pass -> route branch(C)
+    cur_rc1_p = post_merge.advance_cursor(
+        cur_a,
+        verified_pin=VERIFIED_PIN,
+        selected_gear="rc_qualify",
+        target_sha=sha_b,
+        rc_tag="v0.35.0rc1",
+        status="pass",
+        cpu_status="pass",
+        ppu_status="pass",
+    )
+    cur_rc2_p = post_merge.advance_cursor(
+        cur_rc1_p,
+        verified_pin=VERIFIED_PIN,
+        selected_gear="rc_qualify",
+        target_sha=sha_b,
+        rc_tag="v0.35.0rc2",
+        status="pass",
+        cpu_status="pass",
+        ppu_status="pass",
+    )
+    cur_rc1_f = post_merge.advance_cursor(
+        cur_rc2_p,
+        verified_pin=VERIFIED_PIN,
+        selected_gear="rc_qualify",
+        target_sha=sha_b,
+        rc_tag="v0.35.0rc1",
+        status="fail",
+        cpu_status="pass",
+        ppu_status="fail",
+    )
+    assert cur_rc1_f["rc_tag_states"]["v0.35.0rc2"]["status"] == "fail"
+    assert cur_rc1_f["rc_branch_states"]["releases/v0.35.0"]["last_green_sha"] == sha_a
+
+    cur_rc1_retry_p = post_merge.advance_cursor(
+        cur_rc1_f,
+        verified_pin=VERIFIED_PIN,
+        selected_gear="rc_qualify",
+        target_sha=sha_b,
+        rc_tag="v0.35.0rc1",
+        status="pass",
+        cpu_status="pass",
+        ppu_status="pass",
+    )
+    assert cur_rc1_retry_p["rc_tag_states"]["v0.35.0rc1"]["status"] == "pass"
+    assert cur_rc1_retry_p["rc_tag_states"]["v0.35.0rc2"]["status"] == "pass"
+    assert "v0.35.0rc1" in cur_rc1_retry_p["tested_rc_tags"]
+    assert "v0.35.0rc2" in cur_rc1_retry_p["tested_rc_tags"]
+    assert (
+        cur_rc1_retry_p["rc_branch_states"]["releases/v0.35.0"]["last_green_sha"]
+        == sha_b
+    )
+
+    route_multi_tag = post_merge.route_three_gears(
+        ls_remote_data={
+            "main_sha": sha_main,
+            "tags": {"v0.35.0rc1": sha_b, "v0.35.0rc2": sha_b},
+            "release_branches": {"releases/v0.35.0": sha_c},
+        },
+        verified_pin=VERIFIED_PIN,
+        release_baseline_tag="v0.34.0",
+        requested_gear="auto",
+        cursor=cur_rc1_retry_p,
+    )
+    assert route_multi_tag["selected_gear"] == "rc_qualify"
+    assert route_multi_tag["last_green_sha"] == sha_b
+
+    # 2. R2 Counterexample 2:
+    #    branch(A) pass -> rc1(B) fail -> branch(B) pass -> branch(D) fail -> route branch(C)
+    cur_tag_fail = post_merge.advance_cursor(
+        cur_a,
+        verified_pin=VERIFIED_PIN,
+        selected_gear="rc_qualify",
+        target_sha=sha_b,
+        rc_tag="v0.35.0rc1",
+        status="fail",
+        cpu_status="pass",
+        ppu_status="fail",
+    )
+    cur_br_recover = post_merge.advance_cursor(
+        cur_tag_fail,
+        verified_pin=VERIFIED_PIN,
+        selected_gear="rc_qualify",
+        target_sha=sha_b,
+        rc_tag="releases/v0.35.0",
+        status="pass",
+        cpu_status="pass",
+        ppu_status="pass",
+    )
+    assert cur_br_recover["rc_tag_states"]["v0.35.0rc1"]["status"] == "pass"
+    assert "v0.35.0rc1" in cur_br_recover["tested_rc_tags"]
+    cur_br_d_fail = post_merge.advance_cursor(
+        cur_br_recover,
+        verified_pin=VERIFIED_PIN,
+        selected_gear="rc_qualify",
+        target_sha=sha_d,
+        rc_tag="releases/v0.35.0",
+        status="fail",
+        cpu_status="pass",
+        ppu_status="fail",
+    )
+    route_after_cross = post_merge.route_three_gears(
+        ls_remote_data={
+            "main_sha": sha_main,
+            "tags": {"v0.35.0rc1": sha_b},
+            "release_branches": {"releases/v0.35.0": sha_c},
+        },
+        verified_pin=VERIFIED_PIN,
+        release_baseline_tag="v0.34.0",
+        requested_gear="auto",
+        cursor=cur_br_d_fail,
+    )
+    assert route_after_cross["last_green_sha"] == sha_b
+    assert cur_br_d_fail["last_ppu_green_sha"] == sha_main_green
+
+    # 3. Hand-crafted conflicting raw cursor (`rc1(B)=fail` alongside `last_green_sha=B, green_history=[B, A]`):
+    #    both `_sanitize_cursor` and `route_three_gears` fail closed consistently to `A`!
+    conflicting_raw = {
+        **cur_a,
+        "rc_tag_states": {"v0.35.0rc1": {"sha": sha_b, "status": "fail"}},
+        "rc_branch_states": {
+            "releases/v0.35.0": {
+                "sha": sha_d,
+                "status": "fail",
+                "last_green_sha": sha_b,
+                "green_history": [sha_b, sha_a],
+            }
+        },
+    }
+    clean_conflicting = post_merge._sanitize_cursor(
+        conflicting_raw, verified_pin=VERIFIED_PIN
+    )
+    assert clean_conflicting["rc_branch_states"]["releases/v0.35.0"] == {
+        "sha": sha_d,
+        "status": "fail",
+        "last_green_sha": sha_a,
+        "green_history": [sha_a],
+    }
+    route_conflicting = post_merge.route_three_gears(
+        ls_remote_data={
+            "main_sha": sha_main,
+            "tags": {"v0.35.0rc1": sha_b},
+            "release_branches": {"releases/v0.35.0": sha_c},
+        },
+        verified_pin=VERIFIED_PIN,
+        release_baseline_tag="v0.34.0",
+        requested_gear="auto",
+        cursor=conflicting_raw,
+    )
+    assert route_conflicting["last_green_sha"] == sha_a
