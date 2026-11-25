@@ -1441,8 +1441,12 @@ def _compute_parallel_and_dp_local(
     *,
     topo_nodes: int,
     context: str,
+    base_env: Mapping[str, str] | None = None,
 ) -> tuple[int, int, int, int | None]:
     """Return ``(ppu_count, dp_size, dp_size_local, dpl_explicit)`` matching pinned vLLM."""
+    effective_env: dict[str, str] = dict(os.environ if base_env is None else base_env)
+    effective_env.update({k: str(v) for k, v in server_env.items()})
+
     dp_val = (
         _parse_pos_int_flag(
             "--data-parallel-size",
@@ -1487,8 +1491,10 @@ def _compute_parallel_and_dp_local(
             f"{context}: --data-parallel-size-local ({dpl_explicit}) "
             f"cannot exceed --data-parallel-size ({dp_val})"
         )
+    dpl_val: int | None = dpl_explicit
 
     dp_rank_raw = _flag_value(entries, "--data-parallel-rank")
+    dp_rank_val: int | None = None
     if dp_rank_raw is not None:
         try:
             dp_rank_val = int(dp_rank_raw)
@@ -1506,19 +1512,14 @@ def _compute_parallel_and_dp_local(
         raise ValidationError(
             f"{context}: --data-parallel-backend must be 'mp' or 'ray', got {dp_backend!r}"
         )
-    if topo_nodes > 1 and dp_backend != "mp":
-        raise ValidationError(
-            f"{context}: multi-node topology (nodes={topo_nodes}) requires "
-            f"--data-parallel-backend mp, got {dp_backend!r}"
-        )
 
-    ext_lb = _effective_bool_flag(
+    ext_lb_flag = _effective_bool_flag(
         entries,
         "--data-parallel-external-lb",
         ("--no-data-parallel-external-lb",),
         default=False,
         context=context,
-    ) or (dp_rank_raw is not None)
+    )
     hybrid_lb = _effective_bool_flag(
         entries,
         "--data-parallel-hybrid-lb",
@@ -1526,37 +1527,65 @@ def _compute_parallel_and_dp_local(
         default=False,
         context=context,
     )
-    if ext_lb and hybrid_lb:
+    headless = any(flag == "--headless" for flag, _, _ in entries)
+    if headless and hybrid_lb:
+        raise ValidationError(
+            f"{context}: --data-parallel-hybrid-lb is not applicable in --headless mode"
+        )
+    if hybrid_lb and ext_lb_flag:
         raise ValidationError(
             f"{context}: --data-parallel-hybrid-lb and --data-parallel-external-lb "
             f"cannot both be enabled"
         )
+    if topo_nodes > 1 and dp_backend != "mp":
+        raise ValidationError(
+            f"{context}: multi-node topology (nodes={topo_nodes}) requires "
+            f"--data-parallel-backend mp, got {dp_backend!r}"
+        )
 
+    if topo_nodes > 1:
+        if ppu_count % topo_nodes != 0:
+            raise ValidationError(
+                f"{context}: topology.nodes ({topo_nodes}) must evenly divide effective "
+                f"vLLM world size ({ppu_count})"
+            )
+        world_within_dp = tp_val * pp_val * pcp_val
+        local_world = ppu_count // topo_nodes
+        inferred_dp_rank = 0
+        if dp_val > 1 and ext_lb_flag:
+            if dp_rank_val is None:
+                if topo_nodes % dp_val != 0:
+                    raise ValidationError(
+                        f"{context}: --node-rank cannot unambiguously identify external "
+                        f"data-parallel ranks when --nnodes ({topo_nodes}) is not divisible "
+                        f"by --data-parallel-size ({dp_val})"
+                    )
+                dp_rank_val = inferred_dp_rank
+        elif dpl_val is None:
+            dpl_val = max(local_world // world_within_dp, 1)
+
+    ext_lb = ext_lb_flag or (dp_rank_val is not None)
     if ext_lb:
-        if topo_nodes == 1 and dp_rank_raw is None:
+        if dp_rank_val is None:
             raise ValidationError(
                 f"{context}: --data-parallel-external-lb requires --data-parallel-rank when nodes=1"
             )
-        if dpl_explicit not in (None, 1):
+        if dpl_val not in (None, 1):
             raise ValidationError(
                 f"{context}: external data-parallel mode requires --data-parallel-size-local 1 "
-                f"or omitted, got {dpl_explicit}"
+                f"or omitted, got {dpl_val}"
             )
         dp_local_val = 1
-    elif dpl_explicit is not None:
-        dp_local_val = dpl_explicit
+    elif dpl_val is not None:
+        dp_local_val = dpl_val
     else:
         if hybrid_lb:
             raise ValidationError(
                 f"{context}: --data-parallel-hybrid-lb requires --data-parallel-size-local"
             )
-        if topo_nodes > 1:
-            world_within_dp = tp_val * pp_val * pcp_val
-            local_world = max(ppu_count // topo_nodes, 1)
-            dp_local_val = max(local_world // world_within_dp, 1)
-        elif (
+        if (
             dp_backend == "ray"
-            and str(server_env.get("VLLM_RAY_DP_PACK_STRATEGY", "")) == "span"
+            and effective_env.get("VLLM_RAY_DP_PACK_STRATEGY", "") == "span"
         ):
             dp_local_val = 1
         else:
@@ -1565,7 +1594,10 @@ def _compute_parallel_and_dp_local(
 
 
 def _validate_resolved_topology_and_placeholders(
-    resolved: Mapping[str, Any], *, context: str
+    resolved: Mapping[str, Any],
+    *,
+    context: str,
+    base_env: Mapping[str, str] | None = None,
 ) -> tuple[list[str], dict[str, str]]:
     """Validate topology/placeholder invariants and return dummy-substituted flags/env."""
     flags = list(resolved["flags"])
@@ -1579,7 +1611,11 @@ def _validate_resolved_topology_and_placeholders(
     entries = _parse_flag_entries(flags)
     flag_names = {name for name, _, _ in entries}
     calc_ppu_count, dp_val, dp_local_val, dpl_explicit = _compute_parallel_and_dp_local(
-        entries, server_env, topo_nodes=topo_nodes, context=context
+        entries,
+        server_env,
+        topo_nodes=topo_nodes,
+        context=context,
+        base_env=base_env,
     )
     ppu_count = max(int(resolved["ppu_count"]), calc_ppu_count)
 

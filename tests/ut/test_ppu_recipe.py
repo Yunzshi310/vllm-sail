@@ -3955,6 +3955,83 @@ def test_single_node_dp_requires_all_ranks_local_and_admits_dp8_local8_control(
     assert auto_item["preset"] == "dp_ep_low_latency"
     assert len(explicit_items) == 1 and explicit_items[0]["ppu_count"] == 8
 
+    # 3. Inherited os.environ VLLM_RAY_DP_PACK_STRATEGY=span with --data-parallel-backend ray
+    #    and omitted --data-parallel-size-local is consistently rejected across validation,
+    #    resolve_recipe, automatic/explicit selector, and _launch_resolved_server, whereas
+    #    overriding VLLM_RAY_DP_PACK_STRATEGY=fill in recipe env passes.
+    ray_doc = copy.deepcopy(m3_doc_orig)
+    ray_doc["presets"]["dp_ep_low_latency"]["args"] = [
+        *ray_doc["presets"]["dp_ep_low_latency"]["args"],
+        "--data-parallel-backend",
+        "ray",
+    ]
+    m3_rec_path.write_text(yaml.safe_dump(ray_doc), encoding="utf-8")
+    pre_resolved_ray = ppu_recipe.resolve_recipe(
+        m3_rec_path, policy_path=m3_pol_path, tier="fast_sanity"
+    )
+    assert pre_resolved_ray["dp_size_local"] == 8
+
+    monkeypatch.setenv("VLLM_RAY_DP_PACK_STRATEGY", "span")
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"effective local DP size \(1\) to equal global --data-parallel-size \(8\)",
+    ):
+        ppu_recipe.validate_serving_recipe_structure(ray_doc, context="ray_env_span")
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"effective local DP size \(1\) to equal global --data-parallel-size \(8\)",
+    ):
+        ppu_recipe.resolve_recipe(
+            m3_rec_path, policy_path=m3_pol_path, tier="fast_sanity"
+        )
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"effective local DP size \(1\) to equal global --data-parallel-size \(8\)",
+    ):
+        ppu_e2e_select.build_recipe_matrix("", "fast_sanity")
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"effective local DP size \(1\) to equal global --data-parallel-size \(8\)",
+    ):
+        ppu_e2e_select.build_recipe_matrix("minimax-m3", "fast_sanity")
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"effective local DP size \(1\) to equal global --data-parallel-size \(8\)",
+    ):
+        ppu_recipe_runner._launch_resolved_server(
+            pre_resolved_ray, log_path=tmp_path / "never_launched.log"
+        )
+
+    ray_fill = copy.deepcopy(ray_doc)
+    ray_fill["presets"]["dp_ep_low_latency"]["env"] = {
+        **ray_fill["presets"]["dp_ep_low_latency"].get("env", {}),
+        "VLLM_RAY_DP_PACK_STRATEGY": "fill",
+    }
+    m3_rec_path.write_text(yaml.safe_dump(ray_fill), encoding="utf-8")
+    resolved_fill = ppu_recipe.resolve_recipe(
+        m3_rec_path, policy_path=m3_pol_path, tier="fast_sanity"
+    )
+    assert resolved_fill["dp_size_local"] == 8
+    monkeypatch.delenv("VLLM_RAY_DP_PACK_STRATEGY")
+
+    # 4. Multi-node DP32+EP with --data-parallel-hybrid-lb and omitted --data-parallel-size-local
+    #    infers local DP = 8 per node first (matching pinned vllm arg_utils.py:2476-2520) and passes.
+    glm_path = tmp_path / "tests/ppu/recipes/zai-org/GLM-5.3.yaml"
+    glm_hybrid = yaml.safe_load(glm_path.read_text(encoding="utf-8"))
+    glm_hybrid["presets"]["decode_ep"]["args"] = [
+        *glm_hybrid["presets"]["decode_ep"]["args"],
+        "--data-parallel-hybrid-lb",
+    ]
+    glm_path.write_text(yaml.safe_dump(glm_hybrid), encoding="utf-8")
+    glm_hybrid_report = ppu_recipe.validate_paths(
+        [glm_path], vllm_parser_mode="required", parser=_sample_vllm_parser()
+    )
+    assert glm_hybrid_report["checked_combinations"] == 14
+    glm_hybrid_ep = ppu_recipe.resolve_recipe(glm_path, preset="decode_ep")
+    assert glm_hybrid_ep["ppu_count"] == 32
+    assert glm_hybrid_ep["dp_size"] == 32
+    assert glm_hybrid_ep["dp_size_local"] == 8
+
 
 def test_multi_node_ep_requires_effective_expert_parallel(tmp_path: Path) -> None:
     glm_path = RECIPES_DIR / "zai-org" / "GLM-5.3.yaml"
