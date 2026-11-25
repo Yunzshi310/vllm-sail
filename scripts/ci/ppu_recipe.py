@@ -1644,6 +1644,13 @@ def _resolve_recipe_from_doc(
     if policy is not None:
         if tier is None:
             raise ValidationError("--tier is required when --policy is supplied")
+        policy_model_id = policy.get("model_id")
+        recipe_model_id = recipe["model"]["model_id"]
+        if policy_model_id != recipe_model_id:
+            raise ValidationError(
+                f"{policy_label or recipe_label}: policy model_id {policy_model_id!r} "
+                f"does not match recipe model.model_id {recipe_model_id!r}"
+            )
         tiers = policy.get("tiers", {})
         if tier not in tiers:
             raise ValidationError(f"{policy_label}: tier {tier!r} not found")
@@ -2619,6 +2626,8 @@ def validate_policy_structure(
     if "tiers" not in policy and "stages" not in policy:
         raise ValidationError(f"{context}: policy must define 'tiers' or 'stages'")
 
+    if not isinstance(policy["model_id"], str) or not policy["model_id"].strip():
+        raise ValidationError(f"{context}.model_id must be non-empty string")
     if "variant" in policy and (
         not isinstance(policy["variant"], str) or not policy["variant"].strip()
     ):
@@ -2635,6 +2644,21 @@ def validate_policy_structure(
                 f"{context}: referenced recipe not found: {policy['recipe']}"
             )
         rec_doc = _load_yaml(recipe_path)
+        recipe_model_blk = rec_doc.get("model")
+        recipe_model_id = (
+            recipe_model_blk.get("model_id")
+            if isinstance(recipe_model_blk, Mapping)
+            else None
+        )
+        if not isinstance(recipe_model_id, str) or not recipe_model_id.strip():
+            raise ValidationError(
+                f"{context}: referenced recipe {policy['recipe']} is missing model.model_id"
+            )
+        if policy["model_id"] != recipe_model_id:
+            raise ValidationError(
+                f"{context}: policy model_id {policy['model_id']!r} does not match "
+                f"recipe {policy['recipe']} model.model_id {recipe_model_id!r}"
+            )
         variants_blk = rec_doc.get("variants", {})
         if policy_variant not in variants_blk:
             raise ValidationError(

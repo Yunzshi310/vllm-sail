@@ -3288,6 +3288,68 @@ def test_bf16_supported_across_hardware_and_respects_hardware_pins(
     ):
         ppu_recipe.resolve_recipe(pinned_path, hardware="zhenwu_810e")
 
+    # 3. Policy model_id mismatch against recipe canonical model.model_id fails closed
+    #    across validate_policy_structure, validate_paths, resolve_recipe, and selector
+    #    (while variant hf_model_id overrides like fp8_channel keep working).
+    spoof_pol = copy.deepcopy(qwen_pol)
+    spoof_pol["model_id"] = "zai-org/GLM-5.3"
+    spoof_pol_path = tmp_path / "tests/ppu/policy/models/spoof-glm-on-qwen.yaml"
+    spoof_pol_path.write_text(yaml.safe_dump(spoof_pol), encoding="utf-8")
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match="policy model_id 'zai-org/GLM-5.3' does not match recipe .* model.model_id 'Qwen/Qwen3.8-27B'",
+    ):
+        ppu_recipe.validate_policy_structure(
+            spoof_pol, context="spoof_pol", base_dir=tmp_path
+        )
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match="policy model_id 'zai-org/GLM-5.3' does not match recipe .* model.model_id 'Qwen/Qwen3.8-27B'",
+    ):
+        ppu_recipe.resolve_recipe(
+            tmp_path / "tests/ppu/recipes/Qwen/Qwen3.8-27B.yaml",
+            policy_path=spoof_pol_path,
+            tier="fast_sanity",
+        )
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match="policy model_id 'zai-org/GLM-5.3' does not match recipe model.model_id 'Qwen/Qwen3.8-27B'",
+    ):
+        ppu_recipe._resolve_recipe_from_doc(
+            qwen_doc,
+            recipe_label="qwen_doc",
+            policy=spoof_pol,
+            policy_label="spoof_pol",
+            tier="fast_sanity",
+        )
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match="policy model_id 'zai-org/GLM-5.3' does not match recipe",
+    ):
+        ppu_e2e_select.build_recipe_matrix("", "fast_sanity")
+    spoof_pol_path.unlink()
+
+    # Positive control: policy using canonical model_id with a variant overriding hf_model_id passes
+    glm_fp8_pol = yaml.safe_load((POLICY_DIR / "models" / "glm-5.3.yaml").read_text())
+    glm_fp8_pol["variant"] = "fp8_channel"
+    glm_fp8_pol["tiers"] = {"fast_sanity": glm_fp8_pol["tiers"]["fast_sanity"]}
+    glm_fp8_pol.pop("replaces_legacy_cases", None)
+    ppu_recipe.validate_policy_structure(
+        glm_fp8_pol, context="glm_fp8_variant_control", base_dir=tmp_path
+    )
+    glm_fp8_pol_path = tmp_path / "tests/ppu/policy/models/glm-5.3-fp8-ctrl.yaml"
+    glm_fp8_pol_path.write_text(yaml.safe_dump(glm_fp8_pol), encoding="utf-8")
+    glm_fp8_res = ppu_recipe.resolve_recipe(
+        tmp_path / "tests/ppu/recipes/zai-org/GLM-5.3.yaml",
+        policy_path=glm_fp8_pol_path,
+        tier="fast_sanity",
+    )
+    assert glm_fp8_res["model_id"] == "zai-org/GLM-5.3"
+    assert (
+        glm_fp8_res["hf_model_id"]
+        == "T-HEAD/GLM-5.3-Quant-W-FP8-PerChannel-A-FP8-PerChannel"
+    )
+
 
 def test_topology_flag_invariant_blocks_multinode_and_disagg_bypass(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
