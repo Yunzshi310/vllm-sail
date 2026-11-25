@@ -1442,12 +1442,12 @@ def _compute_parallel_and_dp_local(
     topo_nodes: int,
     context: str,
     base_env: Mapping[str, str] | None = None,
-) -> tuple[int, int, int, int | None]:
-    """Return ``(ppu_count, dp_size, dp_size_local, dpl_explicit)`` matching pinned vLLM."""
+) -> tuple[int, int, int, int | None, int]:
+    """Return ``(ppu_count, dp_size, dp_size_local, dpl_explicit, world_within_dp)`` matching pinned vLLM."""
     effective_env: dict[str, str] = dict(os.environ if base_env is None else base_env)
     effective_env.update({k: str(v) for k, v in server_env.items()})
 
-    dp_val = (
+    cli_dp_val = (
         _parse_pos_int_flag(
             "--data-parallel-size",
             _flag_value(entries, "--data-parallel-size"),
@@ -1479,17 +1479,24 @@ def _compute_parallel_and_dp_local(
         )
         or 1
     )
-    ppu_count = dp_val * tp_val * pp_val * pcp_val
+    world_within_dp = tp_val * pp_val * pcp_val
+    cli_world = cli_dp_val * world_within_dp
+
+    dist_exec_backend = _flag_value(entries, "--distributed-executor-backend")
+    if topo_nodes == 1 and dist_exec_backend == "external_launcher":
+        raise ValidationError(
+            f"{context}: single-node launch cannot use --distributed-executor-backend external_launcher"
+        )
 
     dpl_explicit = _parse_pos_int_flag(
         "--data-parallel-size-local",
         _flag_value(entries, "--data-parallel-size-local"),
         context=context,
     )
-    if dpl_explicit is not None and dpl_explicit > dp_val:
+    if dpl_explicit is not None and dpl_explicit > cli_dp_val:
         raise ValidationError(
             f"{context}: --data-parallel-size-local ({dpl_explicit}) "
-            f"cannot exceed --data-parallel-size ({dp_val})"
+            f"cannot exceed --data-parallel-size ({cli_dp_val})"
         )
     dpl_val: int | None = dpl_explicit
 
@@ -1502,9 +1509,9 @@ def _compute_parallel_and_dp_local(
             raise ValidationError(
                 f"{context}: --data-parallel-rank must be an integer, got {dp_rank_raw!r}"
             ) from exc
-        if not 0 <= dp_rank_val < dp_val:
+        if not 0 <= dp_rank_val < cli_dp_val:
             raise ValidationError(
-                f"{context}: --data-parallel-rank must be in [0, {dp_val - 1}], got {dp_rank_val}"
+                f"{context}: --data-parallel-rank must be in [0, {cli_dp_val - 1}], got {dp_rank_val}"
             )
 
     dp_backend = _flag_value(entries, "--data-parallel-backend") or "mp"
@@ -1544,21 +1551,20 @@ def _compute_parallel_and_dp_local(
         )
 
     if topo_nodes > 1:
-        if ppu_count % topo_nodes != 0:
+        if cli_world % topo_nodes != 0:
             raise ValidationError(
                 f"{context}: topology.nodes ({topo_nodes}) must evenly divide effective "
-                f"vLLM world size ({ppu_count})"
+                f"vLLM world size ({cli_world})"
             )
-        world_within_dp = tp_val * pp_val * pcp_val
-        local_world = ppu_count // topo_nodes
+        local_world = cli_world // topo_nodes
         inferred_dp_rank = 0
-        if dp_val > 1 and ext_lb_flag:
+        if cli_dp_val > 1 and ext_lb_flag:
             if dp_rank_val is None:
-                if topo_nodes % dp_val != 0:
+                if topo_nodes % cli_dp_val != 0:
                     raise ValidationError(
                         f"{context}: --node-rank cannot unambiguously identify external "
                         f"data-parallel ranks when --nnodes ({topo_nodes}) is not divisible "
-                        f"by --data-parallel-size ({dp_val})"
+                        f"by --data-parallel-size ({cli_dp_val})"
                     )
                 dp_rank_val = inferred_dp_rank
         elif dpl_val is None:
@@ -1576,8 +1582,12 @@ def _compute_parallel_and_dp_local(
                 f"or omitted, got {dpl_val}"
             )
         dp_local_val = 1
+        hybrid_lb = False
     elif dpl_val is not None:
         dp_local_val = dpl_val
+        if hybrid_lb and dp_local_val == 1:
+            ext_lb = True
+            hybrid_lb = False
     else:
         if hybrid_lb:
             raise ValidationError(
@@ -1589,8 +1599,86 @@ def _compute_parallel_and_dp_local(
         ):
             dp_local_val = 1
         else:
-            dp_local_val = dp_val
-    return ppu_count, dp_val, dp_local_val, dpl_explicit
+            dp_local_val = cli_dp_val
+
+    if cli_dp_val <= 1 and ext_lb:
+        raise ValidationError(
+            f"{context}: data_parallel_external_lb can only be set when data_parallel_size > 1"
+        )
+
+    # Validate VLLM_DP_* env vars and apply ParallelConfig.__post_init__ fallback when CLI DP == 1
+    env_dp_size = 1
+    if "VLLM_DP_SIZE" in effective_env:
+        env_dp_size = (
+            _parse_pos_int_flag(
+                "VLLM_DP_SIZE", effective_env["VLLM_DP_SIZE"], context=context
+            )
+            or 1
+        )
+    env_dp_rank = 0
+    if "VLLM_DP_RANK" in effective_env:
+        try:
+            env_dp_rank = int(effective_env["VLLM_DP_RANK"])
+        except ValueError as exc:
+            raise ValidationError(
+                f"{context}: VLLM_DP_RANK must be an integer, got {effective_env['VLLM_DP_RANK']!r}"
+            ) from exc
+    if "VLLM_DP_RANK_LOCAL" in effective_env:
+        try:
+            int(effective_env["VLLM_DP_RANK_LOCAL"])
+        except ValueError as exc:
+            raise ValidationError(
+                f"{context}: VLLM_DP_RANK_LOCAL must be an integer, got "
+                f"{effective_env['VLLM_DP_RANK_LOCAL']!r}"
+            ) from exc
+    if "VLLM_DP_MASTER_PORT" in effective_env:
+        try:
+            env_dp_port = int(effective_env["VLLM_DP_MASTER_PORT"])
+        except ValueError as exc:
+            raise ValidationError(
+                f"{context}: VLLM_DP_MASTER_PORT must be an integer, got "
+                f"{effective_env['VLLM_DP_MASTER_PORT']!r}"
+            ) from exc
+        if not 0 <= env_dp_port <= 65535:
+            raise ValidationError(
+                f"{context}: VLLM_DP_MASTER_PORT must be in [0, 65535], got {env_dp_port}"
+            )
+
+    if cli_dp_val > 1:
+        if "VLLM_DP_SIZE" in server_env and env_dp_size != cli_dp_val:
+            raise ValidationError(
+                f"{context}: recipe env VLLM_DP_SIZE ({env_dp_size}) conflicts with "
+                f"--data-parallel-size ({cli_dp_val})"
+            )
+        dp_val = cli_dp_val
+    else:
+        dp_val = env_dp_size
+        if not 0 <= env_dp_rank < dp_val:
+            raise ValidationError(
+                f"{context}: VLLM_DP_RANK must be in [0, {dp_val - 1}], got {env_dp_rank}"
+            )
+
+    ppu_count = dp_val * world_within_dp
+    if topo_nodes > 1:
+        if ppu_count % topo_nodes != 0:
+            raise ValidationError(
+                f"{context}: topology.nodes ({topo_nodes}) must evenly divide effective "
+                f"vLLM world size ({ppu_count})"
+            )
+        if not ext_lb:
+            dp_node_size = dp_val // dp_local_val
+            if dp_val % dp_local_val != 0 or topo_nodes % dp_node_size != 0:
+                raise ValidationError(
+                    f"{context}: topology.nodes ({topo_nodes}) must be divisible by "
+                    f"data-parallel node groups ({dp_val} / {dp_local_val})"
+                )
+            nnodes_within_dp = topo_nodes // dp_node_size
+            if world_within_dp % nnodes_within_dp != 0:
+                raise ValidationError(
+                    f"{context}: per-replica world size ({world_within_dp}) must be divisible "
+                    f"by nodes per DP replica ({nnodes_within_dp})"
+                )
+    return ppu_count, dp_val, dp_local_val, dpl_explicit, world_within_dp
 
 
 def _validate_resolved_topology_and_placeholders(
@@ -1610,7 +1698,13 @@ def _validate_resolved_topology_and_placeholders(
 
     entries = _parse_flag_entries(flags)
     flag_names = {name for name, _, _ in entries}
-    calc_ppu_count, dp_val, dp_local_val, dpl_explicit = _compute_parallel_and_dp_local(
+    (
+        calc_ppu_count,
+        dp_val,
+        dp_local_val,
+        dpl_explicit,
+        world_within_dp,
+    ) = _compute_parallel_and_dp_local(
         entries,
         server_env,
         topo_nodes=topo_nodes,
@@ -1619,6 +1713,11 @@ def _validate_resolved_topology_and_placeholders(
     )
     ppu_count = max(int(resolved["ppu_count"]), calc_ppu_count)
 
+    if topo_nodes == 1 and dp_local_val != dp_val:
+        raise ValidationError(
+            f"{context}: single-node launch requires effective local DP size "
+            f"({dp_local_val}) to equal global DP size ({dp_val})"
+        )
     if ppu_count > topo_capacity:
         raise ValidationError(
             f"{context}: resolved parallelism requires {ppu_count} devices, "
@@ -1667,11 +1766,6 @@ def _validate_resolved_topology_and_placeholders(
                 f"{context}: single_node topology must not set multi-node flag(s): "
                 f"{', '.join(bad_mn)}"
             )
-        if dp_local_val != dp_val:
-            raise ValidationError(
-                f"{context}: single-node launch requires effective local DP size "
-                f"({dp_local_val}) to equal global --data-parallel-size ({dp_val})"
-            )
         if "--kv-transfer-config" in flag_names:
             raise ValidationError(
                 f"{context}: single_node topology must not set --kv-transfer-config; "
@@ -1706,10 +1800,12 @@ def _validate_resolved_topology_and_placeholders(
             raise ValidationError(
                 f"{context}: multi_node_ep topology requires effective --enable-expert-parallel"
             )
-        if dpl_explicit is not None and dpl_explicit * topo_nodes != dp_val:
+        inferred_multi_dpl = max((ppu_count // topo_nodes) // world_within_dp, 1)
+        if dpl_explicit is not None and dpl_explicit != inferred_multi_dpl:
             raise ValidationError(
-                f"{context}: multi_node_ep --data-parallel-size-local ({dpl_explicit}) * "
-                f"topology.nodes ({topo_nodes}) must equal --data-parallel-size ({dp_val})"
+                f"{context}: multi_node_ep --data-parallel-size-local ({dpl_explicit}) "
+                f"must match per-node DP layout ({inferred_multi_dpl}) for {topo_nodes} nodes "
+                f"(DP={dp_val}, replica world={world_within_dp})"
             )
     elif topo_kind == "pd_disagg":
         kv_raw = _flag_value(entries, "--kv-transfer-config")
@@ -1828,11 +1924,6 @@ def _validate_resolved_topology_and_placeholders(
                 raise ValidationError(
                     f"{context}: single-node pd_disagg topology must not set multi-node flag(s): "
                     f"{', '.join(bad_mn)}"
-                )
-            if dp_local_val != dp_val:
-                raise ValidationError(
-                    f"{context}: single-node pd_disagg role requires effective local DP size "
-                    f"({dp_local_val}) to equal global --data-parallel-size ({dp_val})"
                 )
         else:
             missing_mn = sorted(MULTI_NODE_REQUIRED_PLACEHOLDERS - placeholders)
@@ -2096,7 +2187,7 @@ def _resolve_recipe_from_doc(
         *flags_only,
     ]
 
-    ppu_count, dp_val, dp_local_val, _ = _compute_parallel_and_dp_local(
+    ppu_count, dp_val, dp_local_val, _, _ = _compute_parallel_and_dp_local(
         ordered,
         server_env,
         topo_nodes=int(eff_topology["nodes"]),

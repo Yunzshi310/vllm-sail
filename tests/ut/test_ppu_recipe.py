@@ -87,6 +87,8 @@ def _sample_vllm_parser() -> argparse.ArgumentParser:
     parser.add_argument("--data-parallel-size-local", type=int)
     parser.add_argument("--data-parallel-rank", type=int)
     parser.add_argument("--data-parallel-backend", default="mp")
+    parser.add_argument("--distributed-executor-backend")
+    parser.add_argument("--headless", action="store_true")
     parser.add_argument(
         "--data-parallel-external-lb", action=argparse.BooleanOptionalAction
     )
@@ -3857,33 +3859,33 @@ def test_single_node_dp_requires_all_ranks_local_and_admits_dp8_local8_control(
     ]
     with pytest.raises(
         ppu_recipe.ValidationError,
-        match=r"effective local DP size \(4\) to equal global --data-parallel-size \(8\)",
+        match=r"effective local DP size \(4\) to equal global DP size \(8\)",
     ):
         ppu_recipe.validate_serving_recipe_structure(bad_dpl4, context="bad_dpl4")
 
     m3_rec_path.write_text(yaml.safe_dump(bad_dpl4), encoding="utf-8")
     with pytest.raises(
         ppu_recipe.ValidationError,
-        match=r"effective local DP size \(4\) to equal global --data-parallel-size \(8\)",
+        match=r"effective local DP size \(4\) to equal global DP size \(8\)",
     ):
         ppu_recipe.validate_paths(
             [m3_rec_path], vllm_parser_mode="required", parser=_sample_vllm_parser()
         )
     with pytest.raises(
         ppu_recipe.ValidationError,
-        match=r"effective local DP size \(4\) to equal global --data-parallel-size \(8\)",
+        match=r"effective local DP size \(4\) to equal global DP size \(8\)",
     ):
         ppu_recipe.resolve_recipe(
             m3_rec_path, policy_path=m3_pol_path, tier="fast_sanity"
         )
     with pytest.raises(
         ppu_recipe.ValidationError,
-        match=r"effective local DP size \(4\) to equal global --data-parallel-size \(8\)",
+        match=r"effective local DP size \(4\) to equal global DP size \(8\)",
     ):
         ppu_e2e_select.build_recipe_matrix("", "fast_sanity")
     with pytest.raises(
         ppu_recipe.ValidationError,
-        match=r"effective local DP size \(4\) to equal global --data-parallel-size \(8\)",
+        match=r"effective local DP size \(4\) to equal global DP size \(8\)",
     ):
         ppu_e2e_select.build_recipe_matrix("minimax-m3", "fast_sanity")
 
@@ -3892,7 +3894,7 @@ def test_single_node_dp_requires_all_ranks_local_and_admits_dp8_local8_control(
         (
             ["--data-parallel-rank", "0"],
             {},
-            r"effective local DP size \(1\) to equal global --data-parallel-size \(8\)",
+            r"effective local DP size \(1\) to equal global DP size \(8\)",
         ),
         (
             ["--data-parallel-external-lb"],
@@ -3907,7 +3909,7 @@ def test_single_node_dp_requires_all_ranks_local_and_admits_dp8_local8_control(
         (
             ["--data-parallel-backend", "ray"],
             {"VLLM_RAY_DP_PACK_STRATEGY": "span"},
-            r"effective local DP size \(1\) to equal global --data-parallel-size \(8\)",
+            r"effective local DP size \(1\) to equal global DP size \(8\)",
         ),
     ):
         bad_extra = copy.deepcopy(m3_doc_orig)
@@ -3974,29 +3976,29 @@ def test_single_node_dp_requires_all_ranks_local_and_admits_dp8_local8_control(
     monkeypatch.setenv("VLLM_RAY_DP_PACK_STRATEGY", "span")
     with pytest.raises(
         ppu_recipe.ValidationError,
-        match=r"effective local DP size \(1\) to equal global --data-parallel-size \(8\)",
+        match=r"effective local DP size \(1\) to equal global DP size \(8\)",
     ):
         ppu_recipe.validate_serving_recipe_structure(ray_doc, context="ray_env_span")
     with pytest.raises(
         ppu_recipe.ValidationError,
-        match=r"effective local DP size \(1\) to equal global --data-parallel-size \(8\)",
+        match=r"effective local DP size \(1\) to equal global DP size \(8\)",
     ):
         ppu_recipe.resolve_recipe(
             m3_rec_path, policy_path=m3_pol_path, tier="fast_sanity"
         )
     with pytest.raises(
         ppu_recipe.ValidationError,
-        match=r"effective local DP size \(1\) to equal global --data-parallel-size \(8\)",
+        match=r"effective local DP size \(1\) to equal global DP size \(8\)",
     ):
         ppu_e2e_select.build_recipe_matrix("", "fast_sanity")
     with pytest.raises(
         ppu_recipe.ValidationError,
-        match=r"effective local DP size \(1\) to equal global --data-parallel-size \(8\)",
+        match=r"effective local DP size \(1\) to equal global DP size \(8\)",
     ):
         ppu_e2e_select.build_recipe_matrix("minimax-m3", "fast_sanity")
     with pytest.raises(
         ppu_recipe.ValidationError,
-        match=r"effective local DP size \(1\) to equal global --data-parallel-size \(8\)",
+        match=r"effective local DP size \(1\) to equal global DP size \(8\)",
     ):
         ppu_recipe_runner._launch_resolved_server(
             pre_resolved_ray, log_path=tmp_path / "never_launched.log"
@@ -4081,3 +4083,170 @@ def test_multi_node_ep_requires_effective_expert_parallel(tmp_path: Path) -> Non
             match="multi_node_ep topology requires effective --enable-expert-parallel",
         ):
             ppu_recipe.validate_serving_recipe_structure(neg_ep, context=neg_flag)
+
+
+def test_vllm_dp_env_fallback_crossnode_tp_and_hybrid_headless_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shutil.copytree(ROOT / "tests/ppu", tmp_path / "tests/ppu")
+    monkeypatch.setattr(ppu_e2e_select, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(ppu_recipe, "REPO_ROOT", tmp_path)
+
+    glm_rec_path = tmp_path / "tests/ppu/recipes/zai-org/GLM-5.3.yaml"
+    glm_pol_path = tmp_path / "tests/ppu/policy/models/glm-5.3.yaml"
+    glm_orig = yaml.safe_load(glm_rec_path.read_text(encoding="utf-8"))
+
+    # 1. P1 (r4695877063): GLM-5.3 TP4 prefill with no --data-parallel-size flag and
+    #    VLLM_DP_SIZE=2 (in preset env or inherited os.environ) activates ParallelConfig
+    #    env fallback (global DP=2, local DP=1) and must be rejected everywhere.
+    bad_env_dp2 = copy.deepcopy(glm_orig)
+    bad_env_dp2["presets"]["prefill"]["env"] = {
+        **bad_env_dp2["presets"]["prefill"].get("env", {}),
+        "VLLM_DP_SIZE": "2",
+    }
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"effective local DP size \(1\) to equal global DP size \(2\)",
+    ):
+        ppu_recipe.validate_serving_recipe_structure(bad_env_dp2, context="env_dp2")
+
+    glm_rec_path.write_text(yaml.safe_dump(bad_env_dp2), encoding="utf-8")
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"effective local DP size \(1\) to equal global DP size \(2\)",
+    ):
+        ppu_recipe.validate_paths(
+            [glm_rec_path], vllm_parser_mode="required", parser=_sample_vllm_parser()
+        )
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"effective local DP size \(1\) to equal global DP size \(2\)",
+    ):
+        ppu_recipe.resolve_recipe(
+            glm_rec_path, policy_path=glm_pol_path, tier="fast_sanity"
+        )
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"effective local DP size \(1\) to equal global DP size \(2\)",
+    ):
+        ppu_e2e_select.build_recipe_matrix("", "fast_sanity")
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"effective local DP size \(1\) to equal global DP size \(2\)",
+    ):
+        ppu_e2e_select.build_recipe_matrix("glm-5.3", "fast_sanity")
+
+    # Inherited os.environ VLLM_DP_SIZE=2 on clean recipe is also rejected across
+    # resolve_recipe, selector, and _launch_resolved_server.
+    glm_rec_path.write_text(yaml.safe_dump(glm_orig), encoding="utf-8")
+    clean_resolved = ppu_recipe.resolve_recipe(
+        glm_rec_path, policy_path=glm_pol_path, tier="fast_sanity"
+    )
+    monkeypatch.setenv("VLLM_DP_SIZE", "2")
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"effective local DP size \(1\) to equal global DP size \(2\)",
+    ):
+        ppu_recipe.resolve_recipe(
+            glm_rec_path, policy_path=glm_pol_path, tier="fast_sanity"
+        )
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"effective local DP size \(1\) to equal global DP size \(2\)",
+    ):
+        ppu_e2e_select.build_recipe_matrix("glm-5.3", "fast_sanity")
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"effective local DP size \(1\) to equal global DP size \(2\)",
+    ):
+        ppu_recipe_runner._launch_resolved_server(
+            clean_resolved, log_path=tmp_path / "never_started.log"
+        )
+    monkeypatch.delenv("VLLM_DP_SIZE")
+
+    # Conflicting recipe VLLM_DP_SIZE alongside CLI --data-parallel-size > 1 fails closed
+    conflict_dp = copy.deepcopy(glm_orig)
+    conflict_dp["presets"]["pd_decode"]["env"] = {
+        **conflict_dp["presets"]["pd_decode"]["env"],
+        "VLLM_DP_SIZE": "2",
+    }
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"recipe env VLLM_DP_SIZE \(2\) conflicts with --data-parallel-size \(8\)",
+    ):
+        ppu_recipe.validate_serving_recipe_structure(
+            conflict_dp, context="conflict_env_dp"
+        )
+
+    # Positive control: GLM-5.3 TP4 prefill with VLLM_DP_SIZE=1 agrees on DP=1 / local DP=1 (4 cards)
+    good_env_dp1 = copy.deepcopy(glm_orig)
+    good_env_dp1["presets"]["prefill"]["env"] = {
+        **good_env_dp1["presets"]["prefill"].get("env", {}),
+        "VLLM_DP_SIZE": "1",
+    }
+    glm_rec_path.write_text(yaml.safe_dump(good_env_dp1), encoding="utf-8")
+    res_dp1 = ppu_recipe.resolve_recipe(
+        glm_rec_path, policy_path=glm_pol_path, tier="fast_sanity"
+    )
+    assert res_dp1["ppu_count"] == 4
+    assert res_dp1["dp_size"] == 1
+    assert res_dp1["dp_size_local"] == 1
+    sel_dp1 = ppu_e2e_select.build_recipe_matrix("glm-5.3", "fast_sanity")["include"]
+    assert len(sel_dp1) == 1 and sel_dp1[0]["ppu_count"] == 4
+
+    # 2. P2 (r4695877083): 4x8 multi_node_ep with DP2 x TP16 (each TP16 replica spans 2 nodes)
+    #    resolves to 32 devices and local DP=1 both when omitted and when explicitly set to 1.
+    for explicit_dpl in (None, "1"):
+        dp2_tp16 = copy.deepcopy(glm_orig)
+        ep_args = [
+            tok
+            for tok in dp2_tp16["presets"]["decode_ep"]["args"]
+            if tok not in {"--data-parallel-size", "32"}
+        ]
+        ep_args.extend(["--data-parallel-size", "2", "--tensor-parallel-size", "16"])
+        if explicit_dpl is not None:
+            ep_args.extend(["--data-parallel-size-local", explicit_dpl])
+        dp2_tp16["presets"]["decode_ep"]["args"] = ep_args
+        glm_rec_path.write_text(yaml.safe_dump(dp2_tp16), encoding="utf-8")
+        rep = ppu_recipe.validate_paths(
+            [glm_rec_path], vllm_parser_mode="required", parser=_sample_vllm_parser()
+        )
+        assert rep["checked_combinations"] == 14
+        res_ep = ppu_recipe.resolve_recipe(glm_rec_path, preset="decode_ep")
+        assert res_ep["ppu_count"] == 32
+        assert res_ep["dp_size"] == 2
+        assert res_ep["dp_size_local"] == 1
+
+    bad_dp2_tp16_dpl2 = copy.deepcopy(dp2_tp16)
+    bad_dp2_tp16_dpl2["presets"]["decode_ep"]["args"] = [
+        *dp2_tp16["presets"]["decode_ep"]["args"][:-2],
+        "--data-parallel-size-local",
+        "2",
+    ]
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"multi_node_ep --data-parallel-size-local \(2\) must match per-node DP layout \(1\)",
+    ):
+        ppu_recipe.validate_serving_recipe_structure(
+            bad_dp2_tp16_dpl2, context="bad_dp2_tp16_dpl2"
+        )
+
+    # 3. P2 (r4695877100): AUTHORING.md qualifies --headless vs --data-parallel-hybrid-lb,
+    #    and combining --data-parallel-hybrid-lb with --headless is rejected.
+    authoring_text = (ROOT / "tests/ppu/AUTHORING.md").read_text(encoding="utf-8")
+    assert "--data-parallel-hybrid-lb" in authoring_text
+    assert "without `--headless`" in authoring_text
+
+    bad_hybrid_headless = copy.deepcopy(glm_orig)
+    bad_hybrid_headless["presets"]["decode_ep"]["args"] = [
+        *bad_hybrid_headless["presets"]["decode_ep"]["args"],
+        "--data-parallel-hybrid-lb",
+        "--headless",
+    ]
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match="--data-parallel-hybrid-lb is not applicable in --headless mode",
+    ):
+        ppu_recipe.validate_serving_recipe_structure(
+            bad_hybrid_headless, context="hybrid_headless"
+        )
