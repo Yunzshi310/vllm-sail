@@ -6747,7 +6747,9 @@ new AsyncFunction("github", "context", "core", "require", script)(
                 capture_output=True,
                 cwd=work,
                 env={
-                    **os.environ,
+                    **{
+                        k: v for k, v in os.environ.items() if k != "GITHUB_RUN_ATTEMPT"
+                    },
                     "CURSOR_DISCOVERY_RETRY_MS": "2",
                     **(extra_env or {}),
                 },
@@ -7234,18 +7236,23 @@ const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
             }
             if attempt_jobs is not None:
                 inp["attemptJobs"] = attempt_jobs
-            proc = subprocess.run(
-                [node_bin, str(harness)],
-                input=json.dumps(inp),
-                cwd=str(tmp_path),
-                env={
-                    **os.environ,
+            js_env = {k: v for k, v in os.environ.items() if k != "GITHUB_RUN_ATTEMPT"}
+            if run_attempt > 0:
+                js_env["GITHUB_RUN_ATTEMPT"] = str(run_attempt)
+            js_env.update(
+                {
                     "CURSOR_DISCOVERY_RETRY_MS": "0",
                     "ROUTE_PRIOR_CURSOR_ARTIFACT": prior,
                     "SELECTED_GEAR": gear,
                     "RUN_CPU": "true",
                     "RUN_PPU": "true",
-                },
+                }
+            )
+            proc = subprocess.run(
+                [node_bin, str(harness)],
+                input=json.dumps(inp),
+                cwd=str(tmp_path),
+                env=js_env,
                 text=True,
                 capture_output=True,
                 check=True,
