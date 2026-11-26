@@ -161,6 +161,28 @@ _MASTER_ADDR_ALLOWED_FLAGS = frozenset({"--master-addr", "--data-parallel-addres
 _MASTER_ADDR_ALLOWED_ENV = frozenset({"VLLM_DP_MASTER_IP"})
 _MASTER_PORT_ALLOWED_FLAGS = frozenset({"--master-port", "--data-parallel-rpc-port"})
 _MASTER_PORT_ALLOWED_ENV = frozenset({"VLLM_DP_MASTER_PORT"})
+_PINNED_VLLM_KV_CONNECTORS = frozenset(
+    {
+        "DecodeBenchConnector",
+        "ExampleConnector",
+        "ExampleHiddenStatesConnector",
+        "FlexKVConnectorV1",
+        "HF3FSKVConnector",
+        "HiSparseConnector",
+        "LMCacheConnectorV1",
+        "LMCacheMPConnector",
+        "MoRIIOConnector",
+        "MooncakeConnector",
+        "MooncakeStoreConnector",
+        "MultiConnector",
+        "NixlConnector",
+        "NixlPullConnector",
+        "NixlPushConnector",
+        "OffloadingConnector",
+        "SimpleCPUOffloadConnector",
+        "UMBPStoreConnector",
+    }
+)
 PD_DISAGG_PREFILL_REQUIRED_PLACEHOLDERS = frozenset({"kv_ip", "kv_port", "ib_devices"})
 PD_DISAGG_DECODE_REQUIRED_PLACEHOLDERS = frozenset({"kv_ip", "ib_devices"})
 PD_DISAGG_REQUIRED_PLACEHOLDERS = PD_DISAGG_PREFILL_REQUIRED_PLACEHOLDERS
@@ -1787,6 +1809,23 @@ def _compute_single_node_parallel_dp_and_frontend(
             raise ValidationError(
                 f"{context}: --grpc and --grpc-port are mutually exclusive"
             )
+        raise ValidationError(
+            f"{context}: --grpc-port requires VLLM_USE_RUST_FRONTEND=1 vllm serve "
+            f"(unsupported in ppu-serving/v1 recipes)"
+        )
+
+    auto_tool_choice = _effective_bool_flag(
+        entries,
+        "--enable-auto-tool-choice",
+        ("--disable-auto-tool-choice", "--no-enable-auto-tool-choice"),
+        default=False,
+        context=context,
+    )
+    tool_call_parser = _flag_value(entries, "--tool-call-parser")
+    if auto_tool_choice and (tool_call_parser is None or not tool_call_parser.strip()):
+        raise ValidationError(
+            f"{context}: --enable-auto-tool-choice requires --tool-call-parser"
+        )
 
     asc_present = any(flag == "--api-server-count" for flag, _, _ in entries)
     asc_raw = _flag_value(entries, "--api-server-count")
@@ -2085,28 +2124,31 @@ def _compute_parallel_and_dp_local(
     return res[:6]
 
 
-def _canonical_kv_connector_spec(
-    flags: Sequence[str],
+def _canonical_kv_connector_dict_spec(
+    kv_obj: Mapping[str, Any],
     server_env: Mapping[str, Any],
     *,
     context: str,
-) -> tuple[str, ...]:
-    """Return canonical KV transfer connector/protocol tuple matching KVConnectorFactory."""
-    entries = _parse_flag_entries(list(flags))
-    kv_raw = _flag_value(entries, "--kv-transfer-config")
-    if kv_raw is None:
-        raise ValidationError(
-            f"{context}: pd_disagg preset requires --kv-transfer-config"
-        )
-    kv_obj = json.loads(kv_raw)
+) -> tuple[Any, ...]:
     connector = kv_obj.get("kv_connector")
-    if not isinstance(connector, str) or not connector.strip():
+    if not isinstance(connector, str) or not connector:
         raise ValidationError(
             f"{context}: --kv-transfer-config requires non-empty kv_connector"
         )
-    connector = connector.strip()
-    module_path_raw = kv_obj.get("kv_connector_module_path")
-    module_path = module_path_raw.strip() if isinstance(module_path_raw, str) else ""
+    if connector != connector.strip():
+        raise ValidationError(
+            f"{context}: kv_connector must not contain leading/trailing whitespace: {connector!r}"
+        )
+    module_path = kv_obj.get("kv_connector_module_path")
+    if module_path is not None:
+        if not isinstance(module_path, str) or not module_path:
+            raise ValidationError(
+                f"{context}: kv_connector_module_path cannot be an empty string"
+            )
+        if module_path != module_path.strip():
+            raise ValidationError(
+                f"{context}: kv_connector_module_path must not contain leading/trailing whitespace: {module_path!r}"
+            )
     extra = kv_obj.get("kv_connector_extra_config")
     if extra is not None and not isinstance(extra, dict):
         raise ValidationError(
@@ -2116,41 +2158,75 @@ def _canonical_kv_connector_spec(
 
     if module_path:
         return ("custom", module_path, connector)
+    if connector not in _PINNED_VLLM_KV_CONNECTORS:
+        raise ValidationError(
+            f"{context}: unsupported builtin kv_connector {connector!r} "
+            f"(set kv_connector_module_path for external connectors)"
+        )
     if connector == "NixlConnector":
-        mode_raw = extra.get("transfer_mode", "pull")
-        if not isinstance(mode_raw, str) or mode_raw.strip().lower() not in {
-            "pull",
-            "push",
-        }:
+        mode = extra.get("transfer_mode", "pull")
+        if type(mode) is not str or mode not in ("pull", "push"):
             raise ValidationError(
-                f"{context}: NixlConnector transfer_mode must be 'pull' or 'push', got {mode_raw!r}"
+                f"{context}: Invalid NixlConnector transfer_mode: {mode!r} "
+                f"(expected exact 'pull' or 'push')"
             )
-        target_cls = (
-            "NixlPullConnector"
-            if mode_raw.strip().lower() == "pull"
-            else "NixlPushConnector"
-        )
-        return ("builtin", target_cls)
+        return ("builtin", f"Nixl{mode.capitalize()}Connector")
     if connector == "MooncakeConnector":
-        extra_proto = extra.get("mooncake_protocol")
-        env_proto = server_env.get("MOONCAKE_PROTOCOL")
-        norm_extra = (
-            extra_proto.strip().lower()
-            if isinstance(extra_proto, str) and extra_proto.strip()
-            else None
-        )
-        norm_env = (
-            str(env_proto).strip().lower()
-            if env_proto is not None and str(env_proto).strip()
-            else None
-        )
-        if norm_extra is not None and norm_env is not None and norm_extra != norm_env:
+        protocol = extra.get("mooncake_protocol", "rdma")
+        if (
+            type(protocol) is not str
+            or not protocol
+            or protocol != protocol.strip()
+            or protocol != protocol.lower()
+        ):
             raise ValidationError(
-                f"{context}: MooncakeConnector mooncake_protocol ({norm_extra!r}) conflicts "
-                f"with env MOONCAKE_PROTOCOL ({norm_env!r})"
+                f"{context}: MooncakeConnector mooncake_protocol must be a non-empty "
+                f"lowercase string without whitespace, got {protocol!r}"
             )
-        return ("builtin", "MooncakeConnector", norm_extra or norm_env or "rdma")
+        env_proto = server_env.get("MOONCAKE_PROTOCOL")
+        if env_proto is not None and str(env_proto) != protocol:
+            raise ValidationError(
+                f"{context}: MooncakeConnector effective mooncake_protocol ({protocol!r}) "
+                f"conflicts with env MOONCAKE_PROTOCOL ({env_proto!r}); MooncakeConnector "
+                f"reads kv_connector_extra_config.mooncake_protocol (default 'rdma')"
+            )
+        return ("builtin", "MooncakeConnector", protocol)
+    if connector == "MultiConnector":
+        children = extra.get("connectors")
+        if not isinstance(children, list) or not children:
+            raise ValidationError(
+                f"{context}: MultiConnector requires non-empty kv_connector_extra_config.connectors list"
+            )
+        child_specs = []
+        for idx, child in enumerate(children):
+            if not isinstance(child, dict):
+                raise ValidationError(
+                    f"{context}: MultiConnector connectors[{idx}] must be a JSON object"
+                )
+            child_specs.append(
+                _canonical_kv_connector_dict_spec(
+                    child, server_env, context=f"{context}.connectors[{idx}]"
+                )
+            )
+        return ("builtin", "MultiConnector", tuple(child_specs))
     return ("builtin", connector)
+
+
+def _canonical_kv_connector_spec(
+    flags: Sequence[str],
+    server_env: Mapping[str, Any],
+    *,
+    context: str,
+) -> tuple[Any, ...]:
+    """Return canonical KV transfer connector/protocol tuple matching KVConnectorFactory."""
+    entries = _parse_flag_entries(list(flags))
+    kv_raw = _flag_value(entries, "--kv-transfer-config")
+    if kv_raw is None:
+        raise ValidationError(
+            f"{context}: pd_disagg preset requires --kv-transfer-config"
+        )
+    kv_obj = json.loads(kv_raw)
+    return _canonical_kv_connector_dict_spec(kv_obj, server_env, context=context)
 
 
 def _validate_resolved_topology_and_placeholders(

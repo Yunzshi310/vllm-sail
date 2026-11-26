@@ -4663,15 +4663,29 @@ def test_pr462_p1_selector_and_runner_require_http_frontend_mode(
                 res_non_http, log_path=tmp_path / "server.log"
             )
 
-    # Negative count or --headless + positive --api-server-count rejected statically
+    # Negative count, invalid --grpc-port (requires Rust frontend), or missing tool-call-parser rejected statically
     for bad_args, err_match in (
         (["--api-server-count", "-1"], "--api-server-count must be >= 0"),
         (["--api-server-count", "bad"], "--api-server-count must be an integer"),
+        (["--grpc-port", "9986"], "--grpc-port requires VLLM_USE_RUST_FRONTEND=1"),
+        (
+            ["--grpc", "--grpc-port", "9986"],
+            "--grpc and --grpc-port are mutually exclusive",
+        ),
     ):
         bad_doc = copy.deepcopy(orig_recipe)
         bad_doc["presets"]["decode"]["args"].extend(bad_args)
         with pytest.raises(ppu_recipe.ValidationError, match=err_match):
             ppu_recipe.validate_serving_recipe_structure(bad_doc, context="bad_asc")
+        rec_path.write_text(yaml.safe_dump(bad_doc, sort_keys=False), encoding="utf-8")
+        with pytest.raises(ppu_recipe.ValidationError, match=err_match):
+            ppu_e2e_select.build_recipe_matrix("glm-5.3-decode", "fast_sanity")
+        tampered = copy.deepcopy(res_http)
+        tampered["flags"] = [*tampered["flags"], *bad_args]
+        with pytest.raises(ppu_recipe.ValidationError, match=err_match):
+            ppu_recipe_runner._launch_resolved_server(
+                tampered, log_path=tmp_path / "never_started_grpc_port.log"
+            )
 
 
 def test_pr462_p2_multinode_validates_consuming_rendezvous_and_node_rank_flags(
@@ -4900,6 +4914,37 @@ def test_pr462_p2_rejects_mismatched_paired_pd_connectors(tmp_path: Path) -> Non
             proto_doc, context="proto_mismatch"
         )
 
+    # R1 P1-B1: omitting mooncake_protocol on decode defaults to 'rdma' in upstream MooncakeConnector
+    # even when MOONCAKE_PROTOCOL=tcp is set in env; must fail closed rather than falling back to env
+    env_only_fallback_doc = copy.deepcopy(orig_recipe)
+    for slot in ("pd_prefill", "pd_decode"):
+        env_only_fallback_doc["presets"][slot]["env"]["MOONCAKE_PROTOCOL"] = "tcp"
+    p_args = env_only_fallback_doc["presets"]["pd_prefill"]["args"]
+    p_idx = p_args.index("--kv-transfer-config") + 1
+    p_cfg = json.loads(p_args[p_idx])
+    p_cfg["kv_connector_extra_config"]["mooncake_protocol"] = "tcp"
+    p_args[p_idx] = json.dumps(p_cfg, separators=(",", ":"))
+    d_args = env_only_fallback_doc["presets"]["pd_decode"]["args"]
+    d_idx = d_args.index("--kv-transfer-config") + 1
+    d_cfg = json.loads(d_args[d_idx])
+    d_cfg["kv_connector_extra_config"].pop("mooncake_protocol", None)
+    d_args[d_idx] = json.dumps(d_cfg, separators=(",", ":"))
+    with pytest.raises(
+        ppu_recipe.ValidationError, match="conflicts with env MOONCAKE_PROTOCOL"
+    ):
+        ppu_recipe.validate_serving_recipe_structure(
+            env_only_fallback_doc, context="mooncake_no_env_fallback"
+        )
+    no_env_proto_doc = copy.deepcopy(env_only_fallback_doc)
+    for slot in ("pd_prefill", "pd_decode"):
+        no_env_proto_doc["presets"][slot]["env"].pop("MOONCAKE_PROTOCOL", None)
+    with pytest.raises(
+        ppu_recipe.ValidationError, match="incompatible KV transfer connector"
+    ):
+        ppu_recipe.validate_serving_recipe_structure(
+            no_env_proto_doc, context="mooncake_default_rdma_vs_tcp"
+        )
+
     # Positive control: NixlConnector (default transfer_mode=pull) paired with NixlPullConnector passes
     nixl_doc = copy.deepcopy(orig_recipe)
     for slot, role_name in (
@@ -4923,6 +4968,21 @@ def test_pr462_p2_rejects_mismatched_paired_pd_connectors(tmp_path: Path) -> Non
                 "{kv_port}"
             )
     ppu_recipe.validate_serving_recipe_structure(nixl_doc, context="nixl_pair_ok")
+
+    # R1 P1-B2: non-canonical NixlConnector transfer_mode ('PULL' / ' pull ') rejected matching KVConnectorFactory
+    for bad_mode in ("PULL", " pull "):
+        bad_nixl = copy.deepcopy(nixl_doc)
+        bn_args = bad_nixl["presets"]["pd_prefill"]["args"]
+        bn_idx = bn_args.index("--kv-transfer-config") + 1
+        bn_cfg = json.loads(bn_args[bn_idx])
+        bn_cfg["kv_connector_extra_config"]["transfer_mode"] = bad_mode
+        bn_args[bn_idx] = json.dumps(bn_cfg, separators=(",", ":"))
+        with pytest.raises(
+            ppu_recipe.ValidationError, match="Invalid NixlConnector transfer_mode"
+        ):
+            ppu_recipe.validate_serving_recipe_structure(
+                bad_nixl, context=f"bad_nixl_{bad_mode}"
+            )
 
 
 def test_pr462_p2_glm53_catalog_variants_use_public_or_mainline_checkpoints() -> None:
