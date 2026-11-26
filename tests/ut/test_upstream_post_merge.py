@@ -7866,6 +7866,121 @@ const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
         sha_a,
     ]
 
+    # [R2 sub1 B3] Multi-step flip-flops, mixed tag/branch sequences, and tip recovery after old green rerun:
+    def _rc_step(
+        cur_in: dict,
+        sha_val: str,
+        ref_val: str,
+        ok: bool,
+    ) -> dict:
+        out = post_merge.advance_cursor(
+            json.loads(json.dumps(cur_in)),
+            verified_pin=pin,
+            selected_gear="rc_qualify",
+            target_sha=sha_val,
+            rc_tag=ref_val,
+            status="pass" if ok else "fail",
+            cpu_status="pass",
+            ppu_status="pass" if ok else "fail",
+        )
+        return post_merge._sanitize_cursor(
+            json.loads(json.dumps(out)), verified_pin=pin
+        )
+
+    # (a) Repeated flip-flop: `A pass -> B fail -> C pass -> B pass -> B fail -> B pass` keeps `C`,
+    #     and only rolls back to `B` if `C` itself subsequently fails:
+    cur_b3_bfail2 = _rc_step(cur_b3_bpass, sha_b, branch, False)
+    assert cur_b3_bfail2["rc_branch_states"][branch]["last_green_sha"] == sha_c
+    assert cur_b3_bfail2["rc_branch_states"][branch]["green_history"] == [sha_c, sha_a]
+    cur_b3_bpass2 = _rc_step(cur_b3_bfail2, sha_b, branch, True)
+    assert cur_b3_bpass2["rc_branch_states"][branch]["last_green_sha"] == sha_c
+    assert cur_b3_bpass2["rc_branch_states"][branch]["green_history"] == [
+        sha_c,
+        sha_b,
+        sha_a,
+    ]
+    assert (
+        post_merge.route_three_gears(
+            ls_remote_data={"main_sha": sha_d, "release_branches": {branch: sha_d}},
+            verified_pin=pin,
+            release_baseline_tag="v0.34.0",
+            requested_gear="auto",
+            cursor=cur_b3_bpass2,
+        )["last_green_sha"]
+        == sha_c
+    )
+    cur_b3_cfail = _rc_step(cur_b3_bpass2, sha_c, branch, False)
+    assert cur_b3_cfail["rc_branch_states"][branch]["last_green_sha"] == sha_b
+
+    # (b) Mixed branch & tag sequences (in every combination):
+    #     1) `A branch pass -> B branch fail -> C tag pass -> B branch pass -> B branch fail -> B branch pass`
+    m1 = _rc_step(cur_a, sha_a, branch, True)
+    m1 = _rc_step(m1, sha_b, branch, False)
+    m1 = _rc_step(m1, sha_c, "v0.35.0rc1", True)
+    assert m1["rc_branch_states"][branch]["last_green_sha"] == sha_c
+    m1 = _rc_step(m1, sha_b, branch, True)
+    assert m1["rc_branch_states"][branch]["last_green_sha"] == sha_c
+    m1 = _rc_step(m1, sha_b, branch, False)
+    assert m1["rc_branch_states"][branch]["last_green_sha"] == sha_c
+    m1 = _rc_step(m1, sha_b, branch, True)
+    assert m1["rc_branch_states"][branch]["last_green_sha"] == sha_c
+
+    #     2) `v0.35.0rc0(B) tag fail -> v0.35.0rc1(C) tag pass -> B branch pass` (empty initial branch state)
+    m2 = _rc_step(cur_a, sha_b, "v0.35.0rc0", False)
+    m2 = _rc_step(m2, sha_c, "v0.35.0rc1", True)
+    m2 = _rc_step(m2, sha_b, branch, True)
+    assert m2["rc_branch_states"][branch]["last_green_sha"] == sha_c
+    assert m2["rc_branch_states"][branch]["green_history"] == [sha_c, sha_b]
+
+    #     3) `A branch pass -> B branch fail -> C branch pass -> v0.35.0rc0(B) tag pass`
+    m3 = _rc_step(cur_a, sha_a, branch, True)
+    m3 = _rc_step(m3, sha_b, branch, False)
+    m3 = _rc_step(m3, sha_c, branch, True)
+    m3 = _rc_step(m3, sha_b, "v0.35.0rc0", True)
+    assert m3["rc_branch_states"][branch]["last_green_sha"] == sha_c
+
+    #     4) Retag (`v0.35.0rc1(B) fail -> v0.35.0rc1(C) pass`) followed by manual SHA B pass:
+    m4 = _rc_step(cur_a, sha_b, "v0.35.0rc1", False)
+    m4 = _rc_step(m4, sha_c, "v0.35.0rc1", True)
+    m4 = _rc_step(m4, sha_b, "", True)
+    assert m4["rc_branch_states"][branch]["last_green_sha"] == sha_c
+
+    # (c) Tip recovery after old green rerun (`A pass -> B fail -> old A rerun pass -> tip B recovery pass`
+    #     and `A pass -> B fail -> old A fail -> old A pass -> tip B recovery pass`):
+    rec1 = _rc_step(cur_a, sha_a, branch, True)
+    rec1 = _rc_step(rec1, sha_b, branch, False)
+    rec1 = _rc_step(rec1, sha_a, branch, True)
+    assert rec1["rc_branch_states"][branch]["sha"] == sha_b
+    assert rec1["rc_branch_states"][branch]["status"] == "fail"
+    assert rec1["rc_branch_states"][branch]["last_green_sha"] == sha_a
+    rec1 = _rc_step(rec1, sha_b, branch, True)
+    assert rec1["rc_branch_states"][branch]["sha"] == sha_b
+    assert rec1["rc_branch_states"][branch]["status"] == "pass"
+    assert rec1["rc_branch_states"][branch]["last_green_sha"] == sha_b
+    assert rec1["rc_branch_states"][branch]["green_history"] == [sha_b, sha_a]
+
+    rec2 = _rc_step(cur_a, sha_a, branch, True)
+    rec2 = _rc_step(rec2, sha_b, branch, False)
+    rec2 = _rc_step(rec2, sha_a, branch, False)
+    rec2 = _rc_step(rec2, sha_a, branch, True)
+    rec2 = _rc_step(rec2, sha_b, branch, True)
+    assert rec2["rc_branch_states"][branch]["sha"] == sha_b
+    assert rec2["rc_branch_states"][branch]["status"] == "pass"
+    assert rec2["rc_branch_states"][branch]["last_green_sha"] == sha_b
+    assert rec2["rc_branch_states"][branch]["green_history"] == [sha_b, sha_a]
+
+    for bad_line_order in (
+        "not-a-dict",
+        {"releases/v0.35.0": [sha_a]},
+        {"v0.35.0": "not-a-list"},
+        {"v0.35.0": ["bad-sha"]},
+    ):
+        with pytest.raises(ValueError):
+            post_merge._sanitize_cursor(
+                {**cur_a, "rc_line_commit_order": bad_line_order},
+                verified_pin=pin,
+            )
+
     # [R1 B2] `daily-pin-bump` JS writer aborts if `heads/main` moved after `prep`:
     if node_bin:
         daily_writer_js = next(
