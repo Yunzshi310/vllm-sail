@@ -781,6 +781,12 @@ def test_build_leaf_preserves_retry_identity_and_image_output():
     }
     assert "if" not in build
     assert "needs" not in build
+    image_id = next(
+        step for step in build["steps"] if step.get("id") == "build-image-id"
+    )
+    assert image_id["env"] == {"CONTAINER_ID": "${{ job.container.id }}"}
+    assert image_id["continue-on-error"] is True
+    assert build["steps"].index(image_id) < build["steps"].index(checkouts(build)[0])
     caller = workflow("ppu-build-and-test.yaml")["jobs"]["build"]
     assert caller["uses"] == "./.github/workflows/_ppu-build.yaml"
     role = next(step for step in build["steps"] if step.get("id") == "donor-checkout")
@@ -802,8 +808,9 @@ def test_build_leaf_preserves_retry_identity_and_image_output():
         for step in build["steps"]
         if step.get("uses") == "actions/download-artifact@v4"
     ]
-    assert len(downloads) == 3
-    for slot, download in enumerate(downloads, 1):
+    assert len(downloads) == 4
+    for slot, download in zip((1, 2, 3, "upstream"), downloads, strict=True):
+        assert download["id"] == f"donor-{slot}"
         assert download["if"] == (
             f"steps.donors.outputs.run_{slot} != '' && steps.donors.outputs.artifact_{slot} != ''"
         )
@@ -821,11 +828,16 @@ def test_build_leaf_preserves_retry_identity_and_image_output():
         if step.get("name") == "Build or repackage wheels"
     )
     assert (
+        package["env"]["VLLM_SAIL_BUILD_IMAGE_ID"]
+        == "${{ steps.build-image-id.outputs.image_id }}"
+    )
+    assert (
         package["env"]["VLLM_SAIL_NATIVE_REUSE_ROOT"]
         == "${{ runner.temp }}/ppu-native-donors"
     )
-    for slot in range(1, 4):
-        assert package["env"][f"SOURCE_{slot}"] == (
+    assert downloads[-1]["name"] == "Download upstream vLLM wheel donor"
+    for slot in (1, 2, 3, "upstream"):
+        assert package["env"][f"SOURCE_{str(slot).upper()}"] == (
             f"${{{{ steps.donor-{slot}.outcome == 'success' && steps.donors.outputs.source_{slot} || '' }}}}"
         )
 
