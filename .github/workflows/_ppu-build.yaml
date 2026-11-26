@@ -8,7 +8,7 @@ on:
         type: string
         default: ""
       build_image:
-        description: Digest-pinned SDK image (blank uses the default stack image)
+        description: Build image override (blank uses the default CI image)
         type: string
         default: ""
       vllm_ref:
@@ -27,6 +27,11 @@ on:
         description: Diagnostics mode (blank retains full logs; public redacts console and artifacts)
         type: string
         default: ""
+    secrets:
+      ci_registry_username:
+        required: false
+      ci_registry_token:
+        required: false
     outputs:
       image:
         description: Build image recorded for downstream tests
@@ -65,13 +70,57 @@ jobs:
       branch: ${{ steps.source.outputs.branch }}
       tag: ${{ steps.source.outputs.tag }}
     container:
-      image: ${{ inputs.build_image || 'download.t-head.cn/docker_release/pytorch@sha256:a33a67832f7ec442c481421e94255518dd67e464406f8e610c15d2b594b21f80' }}
+      image: >-
+        ${{ inputs.build_image ||
+        (github.event_name == 'pull_request' && 'download.t-head.cn/docker_release/pytorch@sha256:a33a67832f7ec442c481421e94255518dd67e464406f8e610c15d2b594b21f80') ||
+        'download.t-head.cn/docker_test/vllm:v0.34.0-20261126-e48a294' }}
+      credentials:
+        username: >-
+          ${{ github.repository == 'vllm-project/vllm-sail' &&
+          (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') &&
+          (inputs.build_image == '' || inputs.build_image == 'download.t-head.cn/docker_test/vllm:v0.34.0-20261126-e48a294') &&
+          secrets.ci_registry_username || '' }}
+        password: >-
+          ${{ github.repository == 'vllm-project/vllm-sail' &&
+          (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') &&
+          (inputs.build_image == '' || inputs.build_image == 'download.t-head.cn/docker_test/vllm:v0.34.0-20261126-e48a294') &&
+          secrets.ci_registry_token || '' }}
     env:
-      VLLM_SAIL_BUILD_IMAGE: ${{ inputs.build_image || 'download.t-head.cn/docker_release/pytorch@sha256:a33a67832f7ec442c481421e94255518dd67e464406f8e610c15d2b594b21f80' }}
+      VLLM_SAIL_BUILD_IMAGE: >-
+        ${{ inputs.build_image ||
+        (github.event_name == 'pull_request' && 'download.t-head.cn/docker_release/pytorch@sha256:a33a67832f7ec442c481421e94255518dd67e464406f8e610c15d2b594b21f80') ||
+        'download.t-head.cn/docker_test/vllm:v0.34.0-20261126-e48a294' }}
       VLLM_REF: ${{ inputs.vllm_ref }}
       PYTORCH_SAIL_ARCH: ${{ inputs.pytorch_sail_arch || 'ppu_15;ppu_10' }}
       ARTIFACT_DIR: ${{ github.workspace }}/artifacts
     steps:
+      - name: Record actual image ID for a tagged build image
+        id: build-image-id
+        if: ${{ !contains(env.VLLM_SAIL_BUILD_IMAGE, '@') }}
+        continue-on-error: true
+        shell: bash
+        env:
+          CONTAINER_ID: ${{ job.container.id }}
+        run: |
+          set -euo pipefail
+          [[ "$CONTAINER_ID" =~ ^[0-9a-f]{64}$ ]]
+          # The hosted runner mounts its Docker socket into the job container.
+          # Inspect the running container by ID; a tag may have moved since pull.
+          curl --fail --silent --show-error --max-time 10 --noproxy '*' \
+            --unix-socket /var/run/docker.sock --get \
+            --data-urlencode "filters={\"id\":[\"$CONTAINER_ID\"]}" \
+            http://localhost/containers/json | python3 -c '
+          import json, os, re, sys
+
+          (container,) = json.load(sys.stdin)
+          image_id = container["ImageID"]
+          if container["Id"] != os.environ["CONTAINER_ID"] or not re.fullmatch(
+              r"sha256:[0-9a-f]{64}", image_id
+          ):
+              sys.exit("Docker did not report an immutable ID for the job image")
+          print(f"image_id={image_id}")
+          ' >> "$GITHUB_OUTPUT"
+
       - name: Disable internal GitHub mirror rewrite
         shell: bash
         run: |
@@ -191,15 +240,34 @@ jobs:
           github-token: ${{ github.token }}
           run-id: ${{ steps.donors.outputs.run_3 }}
 
+      - name: Download upstream vLLM wheel donor
+        id: donor-upstream
+        if: steps.donors.outputs.run_upstream != '' && steps.donors.outputs.artifact_upstream != ''
+        timeout-minutes: 3
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ steps.donors.outputs.artifact_upstream }}
+          path: ${{ runner.temp }}/ppu-native-donors/upstream
+          merge-multiple: true
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.donors.outputs.run_upstream }}
+
       - name: Build or repackage wheels
         shell: bash
         env:
+          # Hosted runners reach the upstream Rust distribution directly.
+          RUSTUP_DIST_SERVER: https://static.rust-lang.org
+          RUSTUP_UPDATE_ROOT: https://static.rust-lang.org/rustup
           VLLM_SAIL_NATIVE_REUSE_ROOT: ${{ runner.temp }}/ppu-native-donors
           SOURCE_1: ${{ steps.donor-1.outcome == 'success' && steps.donors.outputs.source_1 || '' }}
           SOURCE_2: ${{ steps.donor-2.outcome == 'success' && steps.donors.outputs.source_2 || '' }}
           SOURCE_3: ${{ steps.donor-3.outcome == 'success' && steps.donors.outputs.source_3 || '' }}
           VLLM_SAIL_SANITIZE_PUBLIC_BUILD: ${{ inputs.diagnostics_mode == 'public' && '1' || '0' }}
+          SOURCE_UPSTREAM: ${{ steps.donor-upstream.outcome == 'success' && steps.donors.outputs.source_upstream || '' }}
+          VLLM_SAIL_BUILD_IMAGE_ID: ${{ steps.build-image-id.outputs.image_id }}
         run: |
+          set -euo pipefail
           verified="$(tr -d '[:space:]' < .github/vllm-main-verified.commit)"
           if [ -n "${VLLM_REF:-}" ] && [ "${VLLM_REF}" != "${verified}" ]; then
             export VLLM_SAIL_CANDIDATE_UPSTREAM_COMMIT="${VLLM_REF}"
@@ -212,6 +280,10 @@ jobs:
               printf '%s\n' "$source" > "$VLLM_SAIL_NATIVE_REUSE_ROOT/$slot.source"
             fi
           done
+          if [[ "$SOURCE_UPSTREAM" =~ ^[0-9a-f]{40}$ ]]; then
+            mkdir -p "${VLLM_SAIL_NATIVE_REUSE_ROOT}"
+            printf '%s\n' "$SOURCE_UPSTREAM" > "$VLLM_SAIL_NATIVE_REUSE_ROOT/upstream.source"
+          fi
           # Older checkouts still understand the single-donor input.
           if [ -n "${VLLM_SAIL_NATIVE_REUSE_ROOT:-}" ] && [ -f "$VLLM_SAIL_NATIVE_REUSE_ROOT/1.source" ]; then
             export VLLM_SAIL_NATIVE_REUSE_DIR="$VLLM_SAIL_NATIVE_REUSE_ROOT/1"

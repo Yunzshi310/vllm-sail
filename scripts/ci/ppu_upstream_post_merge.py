@@ -5782,7 +5782,7 @@ def sanitize_build_manifest_file(
         if re.fullmatch(r"[A-Za-z0-9_;.-]{1,64}", arch):
             out_lines.append(f"pytorch_sail_arch={arch}")
         reuse = raw_fields.get("reuse_mode", "")
-        if reuse in ("native", "sail-native", "full"):
+        if reuse in ("native", "sail-native", "vllm-only", "full"):
             out_lines.append(f"reuse_mode={reuse}")
         out_lines.append(
             f"build_image_digest={extract_image_digest(raw_fields.get('build_image', ''))}"

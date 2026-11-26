@@ -419,6 +419,8 @@ jobs:
       actions: read
     with:
       pr_head_sha: ${{ github.sha }}
+      # Candidate wheels and the canary's CPU/PPU checks share this SDK.
+      build_image: download.t-head.cn/docker_release/pytorch@sha256:a33a67832f7ec442c481421e94255518dd67e464406f8e610c15d2b594b21f80
       vllm_ref: ${{ needs.route.outputs.target_sha }}
       resolve_native_donors: true
       diagnostics_mode: public
