@@ -259,7 +259,8 @@ def test_gate2_candidate_sha_passthrough_and_sail_native_so_reuse_without_mutati
         f'WORK_DIR="{work_dir}"\n'
         f'MANIFEST="{manifest_file}"\n'
         f'VLLM_WHEEL_DIR="{vllm_wheel_out}"\n'
-        f'VLLM_SAIL_BUILD_IMAGE="{build_img}"\n'
+        f'build_image="{build_img}"\n'
+        'vllm_fingerprint=""\n'
         'PYTORCH_SAIL_ARCH="ppu_15;ppu_10"\n'
         f'VLLM_REF="{candidate_sha}"\n'
         f'CANDIDATE_VLLM_COMMIT="{candidate_sha}"\n'
@@ -6873,7 +6874,7 @@ new AsyncFunction("github", "context", "core", "require", script)(
             "latest_canary_run_id": "13",
             "latest_cursor_artifact": "upstream-post-merge-cursor-13-1",
         }
-        # Normal partial rerun with no intervening external run keeps `has_newer_external_cursor == "false"`:
+        # A rerun whose route already loaded the latest cursor needs no replacement.
         p_same_ext = _run_js(
             latest_script,
             [
@@ -6882,7 +6883,7 @@ new AsyncFunction("github", "context", "core", "require", script)(
             ],
             run_id=12,
             extra_env={
-                "ROUTE_PRIOR_CURSOR_ARTIFACT": "upstream-post-merge-cursor-11-1"
+                "ROUTE_PRIOR_CURSOR_ARTIFACT": "upstream-post-merge-cursor-12-1"
             },
         )
         assert p_same_ext.returncode == 0

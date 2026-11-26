@@ -267,7 +267,7 @@ jobs:
           SOURCE_UPSTREAM: ${{ steps.donor-upstream.outcome == 'success' && steps.donors.outputs.source_upstream || '' }}
           VLLM_SAIL_BUILD_IMAGE_ID: ${{ steps.build-image-id.outputs.image_id }}
         run: |
-          set -euo pipefail
+          set -eu
           verified="$(tr -d '[:space:]' < .github/vllm-main-verified.commit)"
           if [ -n "${VLLM_REF:-}" ] && [ "${VLLM_REF}" != "${verified}" ]; then
             export VLLM_SAIL_CANDIDATE_UPSTREAM_COMMIT="${VLLM_REF}"
@@ -280,9 +280,10 @@ jobs:
               printf '%s\n' "$source" > "$VLLM_SAIL_NATIVE_REUSE_ROOT/$slot.source"
             fi
           done
-          if [[ "$SOURCE_UPSTREAM" =~ ^[0-9a-f]{40}$ ]]; then
+          source="${SOURCE_UPSTREAM:-}"
+          if printf '%s' "$source" | grep -Eq '^[0-9a-f]{40}$'; then
             mkdir -p "${VLLM_SAIL_NATIVE_REUSE_ROOT}"
-            printf '%s\n' "$SOURCE_UPSTREAM" > "$VLLM_SAIL_NATIVE_REUSE_ROOT/upstream.source"
+            printf '%s\n' "$source" > "$VLLM_SAIL_NATIVE_REUSE_ROOT/upstream.source"
           fi
           # Older checkouts still understand the single-donor input.
           if [ -n "${VLLM_SAIL_NATIVE_REUSE_ROOT:-}" ] && [ -f "$VLLM_SAIL_NATIVE_REUSE_ROOT/1.source" ]; then
