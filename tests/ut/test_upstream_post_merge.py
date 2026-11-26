@@ -7971,8 +7971,14 @@ const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
 
     for bad_line_order in (
         "not-a-dict",
+        [],
+        False,
+        0,
+        "",
         {"releases/v0.35.0": [sha_a]},
         {"v0.35.0": "not-a-list"},
+        {"v0.35.0": {}},
+        {"v0.35.0": False},
         {"v0.35.0": ["bad-sha"]},
     ):
         with pytest.raises(ValueError):
@@ -7980,6 +7986,84 @@ const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
                 {**cur_a, "rc_line_commit_order": bad_line_order},
                 verified_pin=pin,
             )
+
+    for bad_root_cursor in ([], "", False, 0):
+        with pytest.raises(ValueError):
+            post_merge._sanitize_cursor(bad_root_cursor, verified_pin=pin)  # type: ignore[arg-type]
+
+    # (d) [sub1 R1] Partial `rc_line_commit_order` (`[C, B]` with older `A` in `green_history: [C, A]`)
+    #     preserves anchored order `[C, B, A]` instead of prepending `A` ahead of `C`:
+    partial_order_raw = {
+        **cur_a,
+        "rc_branch_states": {
+            branch: {
+                "sha": sha_c,
+                "status": "pass",
+                "last_green_sha": sha_c,
+                "green_history": [sha_c, sha_a],
+                "revoked_shas": [sha_b],
+                "superseded_shas": [sha_b],
+            }
+        },
+        "rc_line_commit_order": {"v0.35.0": [sha_c, sha_b]},
+    }
+    partial_sanitized = post_merge._sanitize_cursor(partial_order_raw, verified_pin=pin)
+    assert partial_sanitized["rc_line_commit_order"]["v0.35.0"] == [
+        sha_c,
+        sha_b,
+        sha_a,
+    ]
+    partial_after_b = _rc_step(partial_sanitized, sha_b, branch, True)
+    assert partial_after_b["rc_branch_states"][branch]["last_green_sha"] == sha_c
+    assert partial_after_b["rc_branch_states"][branch]["green_history"] == [
+        sha_c,
+        sha_b,
+        sha_a,
+    ]
+    assert (
+        post_merge.route_three_gears(
+            ls_remote_data={"main_sha": sha_d, "release_branches": {branch: sha_d}},
+            verified_pin=pin,
+            release_baseline_tag="v0.34.0",
+            requested_gear="auto",
+            cursor=partial_after_b,
+            vllm_repo=repo,
+        )["last_green_sha"]
+        == sha_c
+    )
+
+    # (e) [sub1 R1] Stale `last_green_sha=A, green_history=[A]` with passing tip `sha=C` and
+    #     `rc_line_commit_order=[C, B, A]` canonicalizes `green_history=[C, A]` and routes `C` on real Git DAG:
+    stale_green_raw = {
+        **cur_a,
+        "rc_branch_states": {
+            branch: {
+                "sha": sha_c,
+                "status": "pass",
+                "last_green_sha": sha_a,
+                "green_history": [sha_a],
+                "revoked_shas": [sha_b],
+            }
+        },
+        "rc_line_commit_order": {"v0.35.0": [sha_c, sha_b, sha_a]},
+    }
+    stale_sanitized = post_merge._sanitize_cursor(stale_green_raw, verified_pin=pin)
+    assert stale_sanitized["rc_branch_states"][branch]["last_green_sha"] == sha_c
+    assert stale_sanitized["rc_branch_states"][branch]["green_history"] == [
+        sha_c,
+        sha_a,
+    ]
+    assert (
+        post_merge.route_three_gears(
+            ls_remote_data={"main_sha": sha_d, "release_branches": {branch: sha_d}},
+            verified_pin=pin,
+            release_baseline_tag="v0.34.0",
+            requested_gear="auto",
+            cursor=stale_green_raw,
+            vllm_repo=repo,
+        )["last_green_sha"]
+        == sha_c
+    )
 
     # [R1 B2] `daily-pin-bump` JS writer aborts if `heads/main` moved after `prep`:
     if node_bin:

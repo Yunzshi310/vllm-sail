@@ -1130,6 +1130,41 @@ def _collect_excluded_control_shas(
     return excluded
 
 
+def _merge_commit_orders(
+    base_order: Sequence[str], snap_order: Sequence[str]
+) -> list[str]:
+    """Merge ``snap_order`` into ``base_order`` preserving all anchored relative positions."""
+    clean_base: list[str] = []
+    for raw_b in base_order:
+        sb = str(raw_b or "").strip()
+        if SHA1_RE.fullmatch(sb) and sb not in clean_base:
+            clean_base.append(sb)
+    clean_snap: list[str] = []
+    for raw_s in snap_order:
+        ss = str(raw_s or "").strip()
+        if SHA1_RE.fullmatch(ss) and ss not in clean_snap:
+            clean_snap.append(ss)
+    if not clean_base:
+        return clean_snap
+    merged = list(clean_base)
+    for idx, item in enumerate(clean_snap):
+        if item in merged:
+            continue
+        if idx > 0:
+            prev_item = clean_snap[idx - 1]
+            merged.insert(merged.index(prev_item) + 1, item)
+        else:
+            next_anchor = next(
+                (later for later in clean_snap[1:] if later in merged),
+                None,
+            )
+            if next_anchor is not None:
+                merged.insert(merged.index(next_anchor), item)
+            else:
+                merged.insert(0, item)
+    return merged
+
+
 def _collect_verified_control_shas(
     state: dict[str, Any] | None,
     *,
@@ -1167,17 +1202,25 @@ def _collect_verified_control_shas(
     if line is not None:
         major, minor = line
         branch_key = f"releases/v{major}.{minor}.0"
+        line_key = f"v{major}.{minor}.0"
+        line_candidates: list[str] = []
+
+        def _add_line_cand(cand_sha: str) -> None:
+            s = cand_sha.strip()
+            if SHA1_RE.fullmatch(s) and s not in excluded and s not in line_candidates:
+                line_candidates.append(s)
+
         br_entry = rc_branch_states.get(branch_key)
         if isinstance(br_entry, dict):
             raw_hist = br_entry.get("green_history")
             if isinstance(raw_hist, list):
                 for item in raw_hist:
-                    _add(str(item or ""))
+                    _add_line_cand(str(item or ""))
             br_green = str(br_entry.get("last_green_sha") or "").strip()
             if br_green and br_green not in excluded:
-                _add(br_green)
-            elif br_entry.get("status") == "pass":
-                _add(str(br_entry.get("sha") or ""))
+                _add_line_cand(br_green)
+            if br_entry.get("status") == "pass":
+                _add_line_cand(str(br_entry.get("sha") or ""))
 
         passing_tags: list[tuple[int, str]] = []
         for tg_name, tg_entry in rc_tag_states.items():
@@ -1198,7 +1241,23 @@ def _collect_verified_control_shas(
                     passing_tags.append((rc_num, tg_sha))
         passing_tags.sort(key=lambda item: item[0], reverse=True)
         for _, tg_sha in passing_tags:
-            _add(tg_sha)
+            _add_line_cand(tg_sha)
+
+        raw_line_orders = (state or {}).get("rc_line_commit_order")
+        line_order = (
+            raw_line_orders.get(line_key)
+            if isinstance(raw_line_orders, dict)
+            and isinstance(raw_line_orders.get(line_key), list)
+            else None
+        )
+        if line_order:
+            cand_set = set(line_candidates)
+            for ord_sha in line_order:
+                s_ord = str(ord_sha or "").strip()
+                if s_ord in cand_set:
+                    _add(s_ord)
+        for lc in line_candidates:
+            _add(lc)
 
     if isinstance(state, dict):
         ppu_green = str(state.get("last_ppu_green_sha") or "").strip()
@@ -1393,6 +1452,8 @@ def _sanitize_cursor(
 ) -> dict[str, Any]:
     """Validate and canonicalize cursor state, failing closed on malformed fields."""
     pin = _require_sha1(verified_pin, "verified_pin")
+    if cursor is not None and not isinstance(cursor, dict):
+        raise ValueError("cursor must be a JSON object")
     if not cursor:
         return {
             "schema": 1,
@@ -1408,8 +1469,6 @@ def _sanitize_cursor(
             "patch_fingerprints": {},
             "probe_history": [],
         }
-    if not isinstance(cursor, dict):
-        raise ValueError("cursor must be a JSON object")
 
     def _sha_field(key: str) -> str:
         raw = cursor.get(key)
@@ -1419,7 +1478,9 @@ def _sanitize_cursor(
             raise ValueError(f"{key} must be a 40-character lowercase hex SHA")
         return _require_sha1(raw, key)
 
-    raw_rcs = cursor.get("tested_rc_tags") or []
+    raw_rcs = cursor.get("tested_rc_tags")
+    if raw_rcs is None:
+        raw_rcs = []
     if not isinstance(raw_rcs, list):
         raise ValueError("tested_rc_tags must be a list")
     tested_rcs: list[str] = []
@@ -1430,7 +1491,9 @@ def _sanitize_cursor(
         if tag_clean not in tested_rcs:
             tested_rcs.append(tag_clean)
 
-    raw_rc_states = cursor.get("rc_tag_states") or {}
+    raw_rc_states = cursor.get("rc_tag_states")
+    if raw_rc_states is None:
+        raw_rc_states = {}
     if not isinstance(raw_rc_states, dict):
         raise ValueError("rc_tag_states must be an object")
     clean_rc_states: dict[str, dict[str, str]] = {}
@@ -1448,7 +1511,9 @@ def _sanitize_cursor(
         if rc_st == "pass" and tag_clean not in tested_rcs:
             tested_rcs.append(tag_clean)
 
-    raw_branch_states = cursor.get("rc_branch_states") or {}
+    raw_branch_states = cursor.get("rc_branch_states")
+    if raw_branch_states is None:
+        raw_branch_states = {}
     if not isinstance(raw_branch_states, dict):
         raise ValueError("rc_branch_states must be an object")
     clean_branch_states: dict[str, dict[str, Any]] = {}
@@ -1514,7 +1579,7 @@ def _sanitize_cursor(
             green_clean = _require_sha1(raw_green, "rc_branch_states.last_green_sha")
             if green_clean not in hist:
                 hist.insert(0, green_clean)
-        elif br_st == "pass" and br_sha not in hist:
+        if br_st == "pass" and br_sha not in hist:
             hist.insert(0, br_sha)
         entry_clean: dict[str, Any] = {"sha": br_sha, "status": br_st}
         if hist:
@@ -1644,7 +1709,9 @@ def _sanitize_cursor(
         if t not in clean_rc_states or clean_rc_states[t]["status"] == "pass"
     ]
 
-    raw_rc_sha_states = cursor.get("rc_sha_states") or {}
+    raw_rc_sha_states = cursor.get("rc_sha_states")
+    if raw_rc_sha_states is None:
+        raw_rc_sha_states = {}
     if not isinstance(raw_rc_sha_states, dict):
         raise ValueError("rc_sha_states must be an object")
     clean_rc_sha_states: dict[str, str] = {}
@@ -1659,7 +1726,9 @@ def _sanitize_cursor(
             raise ValueError(f"invalid rc_sha_states status: {raw_v!r}")
         clean_rc_sha_states[sha_k] = st_v
 
-    raw_rc_line_revs = cursor.get("rc_line_revoked_shas") or {}
+    raw_rc_line_revs = cursor.get("rc_line_revoked_shas")
+    if raw_rc_line_revs is None:
+        raw_rc_line_revs = {}
     if not isinstance(raw_rc_line_revs, dict):
         raise ValueError("rc_line_revoked_shas must be an object")
     clean_rc_line_revs: dict[str, list[str]] = {}
@@ -1685,7 +1754,9 @@ def _sanitize_cursor(
         if lv_clean:
             clean_rc_line_revs[lk_clean] = lv_clean
 
-    raw_rc_line_order = cursor.get("rc_line_commit_order") or {}
+    raw_rc_line_order = cursor.get("rc_line_commit_order")
+    if raw_rc_line_order is None:
+        raw_rc_line_order = {}
     if not isinstance(raw_rc_line_order, dict):
         raise ValueError("rc_line_commit_order must be an object")
     clean_rc_line_order: dict[str, list[str]] = {}
@@ -1708,15 +1779,81 @@ def _sanitize_cursor(
             s = _require_sha1(item, f"rc_line_commit_order[{ok_clean!r}][{idx}]")
             if s not in ov_clean:
                 ov_clean.append(s)
-        if ov_clean:
-            snap_list = list(pre_strip_line_snapshots.get(ok_clean) or [])
-            for rev_s in clean_rc_line_revs.get(ok_clean) or ():
-                if rev_s not in snap_list:
-                    snap_list.append(rev_s)
-            missing_from_order = [s for s in snap_list if s not in ov_clean]
-            clean_rc_line_order[ok_clean] = [*missing_from_order, *ov_clean]
+        snap_list = list(pre_strip_line_snapshots.get(ok_clean) or [])
+        for rev_s in clean_rc_line_revs.get(ok_clean) or ():
+            if rev_s not in snap_list:
+                snap_list.append(rev_s)
+        merged_line_order = _merge_commit_orders(ov_clean, snap_list)
+        if merged_line_order:
+            clean_rc_line_order[ok_clean] = merged_line_order
 
-    raw_shared_failed = cursor.get("shared_cpu_failed_shas") or []
+    # Re-derive canonical branch `green_history` and `last_green_sha` from authoritative
+    # line commit order + unrevoked passing commits so stale histories cannot hide newer greens.
+    for maj, minr in sorted(all_rc_lines):
+        b_key = f"releases/v{maj}.{minr}.0"
+        l_key = f"v{maj}.{minr}.0"
+        b_ent = clean_branch_states.get(b_key)
+        if not isinstance(b_ent, dict):
+            continue
+        line_excluded = set(b_ent.get("revoked_shas") or ()) | set(
+            clean_rc_line_revs.get(l_key) or ()
+        )
+        if b_ent["status"] != "pass":
+            line_excluded.add(b_ent["sha"])
+        for t_name, t_ent in clean_rc_states.items():
+            tm = RC_TAG_RE.fullmatch(t_name)
+            if (
+                tm
+                and (int(tm.group(1)), int(tm.group(2))) == (maj, minr)
+                and t_ent["status"] != "pass"
+            ):
+                line_excluded.add(t_ent["sha"])
+        line_greens: list[str] = []
+        for s_g in b_ent.get("green_history") or ():
+            if s_g not in line_excluded and s_g not in line_greens:
+                line_greens.append(s_g)
+        lg_cur = str(b_ent.get("last_green_sha") or "").strip()
+        if (
+            SHA1_RE.fullmatch(lg_cur)
+            and lg_cur not in line_excluded
+            and lg_cur not in line_greens
+        ):
+            line_greens.append(lg_cur)
+        if (
+            b_ent["status"] == "pass"
+            and b_ent["sha"] not in line_excluded
+            and b_ent["sha"] not in line_greens
+        ):
+            line_greens.append(b_ent["sha"])
+        if l_key in clean_rc_line_order:
+            for t_name, t_ent in clean_rc_states.items():
+                tm = RC_TAG_RE.fullmatch(t_name)
+                if (
+                    tm
+                    and (int(tm.group(1)), int(tm.group(2))) == (maj, minr)
+                    and t_ent["status"] == "pass"
+                    and t_ent["sha"] not in line_excluded
+                    and t_ent["sha"] not in line_greens
+                ):
+                    line_greens.append(t_ent["sha"])
+            eff_ord = clean_rc_line_order[l_key]
+            green_set = set(line_greens)
+            canon_hist = [s_o for s_o in eff_ord if s_o in green_set]
+            for extra_g in line_greens:
+                if extra_g not in canon_hist:
+                    canon_hist.append(extra_g)
+        else:
+            canon_hist = line_greens
+        canon_hist = canon_hist[:20]
+        b_ent.pop("last_green_sha", None)
+        b_ent.pop("green_history", None)
+        if canon_hist:
+            b_ent["last_green_sha"] = canon_hist[0]
+            b_ent["green_history"] = canon_hist
+
+    raw_shared_failed = cursor.get("shared_cpu_failed_shas")
+    if raw_shared_failed is None:
+        raw_shared_failed = []
     if not isinstance(raw_shared_failed, list):
         raise ValueError("shared_cpu_failed_shas must be a list")
     clean_shared_failed: list[str] = []
@@ -1729,7 +1866,9 @@ def _sanitize_cursor(
         if sf_sha not in clean_shared_failed:
             clean_shared_failed.append(sf_sha)
 
-    raw_fps = cursor.get("patch_fingerprints") or {}
+    raw_fps = cursor.get("patch_fingerprints")
+    if raw_fps is None:
+        raw_fps = {}
     if not isinstance(raw_fps, dict):
         raise ValueError("patch_fingerprints must be an object")
     clean_fps: dict[str, str] = {}
@@ -1801,7 +1940,9 @@ def _sanitize_cursor(
         clean_history.append(clean_last)
         seen_shas.add(clean_last["upstream_sha"])
 
-    raw_hist = cursor.get("probe_history") or []
+    raw_hist = cursor.get("probe_history")
+    if raw_hist is None:
+        raw_hist = []
     if not isinstance(raw_hist, list):
         raise ValueError("probe_history must be a list")
     for idx, item in enumerate(raw_hist):
@@ -2684,12 +2825,12 @@ def advance_cursor(
                 for s in (order_map.get(line_k) or ())
                 if SHA1_RE.fullmatch(str(s or "").strip())
             ]
-            seeded_missing: list[str] = []
+            seed_snap: list[str] = []
 
             def _seed_add(cand: str) -> None:
                 c = cand.strip()
-                if SHA1_RE.fullmatch(c) and c not in order and c not in seeded_missing:
-                    seeded_missing.append(c)
+                if SHA1_RE.fullmatch(c) and c not in seed_snap:
+                    seed_snap.append(c)
 
             prior_br = updated["rc_branch_states"].get(br_k) or {}
             prior_sup = [
@@ -2733,8 +2874,7 @@ def advance_cursor(
                 _seed_add(ts)
             for ls in (updated.get("rc_line_revoked_shas") or {}).get(line_k) or ():
                 _seed_add(str(ls or ""))
-            if seeded_missing:
-                order = [*seeded_missing, *order]
+            order = _merge_commit_orders(order, seed_snap)
 
             if new_sha not in order:
                 if new_rc_num is not None:
