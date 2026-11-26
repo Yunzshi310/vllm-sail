@@ -4452,3 +4452,71 @@ def test_vllm_dp_env_fallback_crossnode_tp_and_hybrid_headless_contract(
             ppu_recipe_runner._launch_resolved_server(
                 tampered, log_path=tmp_path / "never_started_us.log"
             )
+
+    # Review #6066321892: external-LB multi_node_ep accepts both omitted and explicit
+    # --data-parallel-size-local 1 on the same external rank (matching pinned arg_utils.py:2501-2535).
+    for ext_args in (
+        ["--data-parallel-external-lb", "--data-parallel-rank", "0"],
+        [
+            "--data-parallel-external-lb",
+            "--data-parallel-rank",
+            "0",
+            "--data-parallel-size-local",
+            "1",
+        ],
+        ["--data-parallel-rank", "0", "--data-parallel-size-local", "1"],
+        ["--data-parallel-hybrid-lb", "--data-parallel-size-local", "1"],
+        ["--data-parallel-start-rank", "0", "--data-parallel-size-local", "1"],
+    ):
+        ext_doc = copy.deepcopy(glm_orig)
+        ext_doc["presets"]["decode_ep"]["args"] = [
+            *ext_doc["presets"]["decode_ep"]["args"],
+            *ext_args,
+        ]
+        ppu_recipe.validate_serving_recipe_structure(ext_doc, context="ext_lb_mn")
+        glm_rec_path.write_text(yaml.safe_dump(ext_doc), encoding="utf-8")
+        report = ppu_recipe.validate_paths([glm_rec_path], vllm_parser_mode="skip")
+        assert report["checked_combinations"] > 0
+        ext_res = ppu_recipe.resolve_recipe(glm_rec_path, preset="decode_ep")
+        assert (ext_res["ppu_count"], ext_res["dp_size"], ext_res["dp_size_local"]) == (
+            32,
+            32,
+            1,
+        )
+
+    for bad_ext_args, err_pat in (
+        (
+            [
+                "--data-parallel-external-lb",
+                "--data-parallel-rank",
+                "0",
+                "--data-parallel-size-local",
+                "8",
+            ],
+            "external data-parallel mode requires --data-parallel-size-local 1 or omitted",
+        ),
+        (
+            ["--data-parallel-rank", "0"],
+            "external data-parallel mode requires --data-parallel-size-local 1 or omitted",
+        ),
+        (
+            ["--data-parallel-start-rank", "32", "--data-parallel-size-local", "1"],
+            "--data-parallel-start-rank must be in",
+        ),
+        (
+            ["--data-parallel-start-rank", "bad", "--data-parallel-size-local", "8"],
+            "--data-parallel-start-rank must be an integer",
+        ),
+    ):
+        bad_ext_doc = copy.deepcopy(glm_orig)
+        bad_ext_doc["presets"]["decode_ep"]["args"] = [
+            *bad_ext_doc["presets"]["decode_ep"]["args"],
+            *bad_ext_args,
+        ]
+        with pytest.raises(ppu_recipe.ValidationError, match=err_pat):
+            ppu_recipe.validate_serving_recipe_structure(
+                bad_ext_doc, context="bad_ext_lb_mn"
+            )
+        glm_rec_path.write_text(yaml.safe_dump(bad_ext_doc), encoding="utf-8")
+        with pytest.raises(ppu_recipe.ValidationError, match=err_pat):
+            ppu_recipe.resolve_recipe(glm_rec_path, preset="decode_ep")

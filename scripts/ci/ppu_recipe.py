@@ -1452,8 +1452,8 @@ def _compute_parallel_and_dp_local(
     topo_nodes: int,
     context: str,
     base_env: Mapping[str, str] | None = None,
-) -> tuple[int, int, int, int | None, int]:
-    """Return ``(ppu_count, dp_size, dp_size_local, dpl_explicit, world_within_dp)`` matching pinned vLLM."""
+) -> tuple[int, int, int, int | None, int, bool]:
+    """Return ``(ppu_count, dp_size, dp_size_local, dpl_explicit, world_within_dp, ext_lb)`` matching pinned vLLM."""
     effective_env: dict[str, str] = dict(os.environ if base_env is None else base_env)
     effective_env.update({k: str(v) for k, v in server_env.items()})
 
@@ -1532,6 +1532,16 @@ def _compute_parallel_and_dp_local(
                 f"{context}: --data-parallel-rank must be in [0, {cli_dp_val - 1}], got {dp_rank_val}"
             )
 
+    dp_start_rank_raw = _flag_value(entries, "--data-parallel-start-rank")
+    dp_start_rank_val: int | None = None
+    if dp_start_rank_raw is not None:
+        try:
+            dp_start_rank_val = int(dp_start_rank_raw)
+        except ValueError as exc:
+            raise ValidationError(
+                f"{context}: --data-parallel-start-rank must be an integer, got {dp_start_rank_raw!r}"
+            ) from exc
+
     dp_backend = _flag_value(entries, "--data-parallel-backend") or "mp"
     if dp_backend not in {"mp", "ray"}:
         raise ValidationError(
@@ -1603,9 +1613,20 @@ def _compute_parallel_and_dp_local(
         hybrid_lb = False
     elif dpl_val is not None:
         dp_local_val = dpl_val
+        if dp_start_rank_val is not None and not headless:
+            hybrid_lb = True
         if hybrid_lb and dp_local_val == 1:
             ext_lb = True
             hybrid_lb = False
+        if (
+            dp_start_rank_val is not None
+            and cli_dp_val > 1
+            and not 0 <= dp_start_rank_val < cli_dp_val
+        ):
+            raise ValidationError(
+                f"{context}: --data-parallel-start-rank must be in [0, {cli_dp_val - 1}], "
+                f"got {dp_start_rank_val}"
+            )
     else:
         if hybrid_lb:
             raise ValidationError(
@@ -1709,7 +1730,7 @@ def _compute_parallel_and_dp_local(
                     f"{context}: per-replica world size ({world_within_dp}) must be divisible "
                     f"by nodes per DP replica ({nnodes_within_dp})"
                 )
-    return ppu_count, dp_val, dp_local_val, dpl_explicit, world_within_dp
+    return ppu_count, dp_val, dp_local_val, dpl_explicit, world_within_dp, ext_lb
 
 
 def _validate_resolved_topology_and_placeholders(
@@ -1735,6 +1756,7 @@ def _validate_resolved_topology_and_placeholders(
         dp_local_val,
         dpl_explicit,
         world_within_dp,
+        ext_lb,
     ) = _compute_parallel_and_dp_local(
         entries,
         server_env,
@@ -1831,11 +1853,16 @@ def _validate_resolved_topology_and_placeholders(
             raise ValidationError(
                 f"{context}: multi_node_ep topology requires effective --enable-expert-parallel"
             )
-        inferred_multi_dpl = max((ppu_count // topo_nodes) // world_within_dp, 1)
-        if dpl_explicit is not None and dpl_explicit != inferred_multi_dpl:
+        expected_multi_dpl = (
+            1 if ext_lb else max((ppu_count // topo_nodes) // world_within_dp, 1)
+        )
+        if dpl_explicit is not None and dpl_explicit != expected_multi_dpl:
+            layout_desc = (
+                "external-LB per-process DP layout" if ext_lb else "per-node DP layout"
+            )
             raise ValidationError(
                 f"{context}: multi_node_ep --data-parallel-size-local ({dpl_explicit}) "
-                f"must match per-node DP layout ({inferred_multi_dpl}) for {topo_nodes} nodes "
+                f"must match {layout_desc} ({expected_multi_dpl}) for {topo_nodes} nodes "
                 f"(DP={dp_val}, replica world={world_within_dp})"
             )
     elif topo_kind == "pd_disagg":
@@ -2218,7 +2245,7 @@ def _resolve_recipe_from_doc(
         *flags_only,
     ]
 
-    ppu_count, dp_val, dp_local_val, _, _ = _compute_parallel_and_dp_local(
+    ppu_count, dp_val, dp_local_val, _, _, _ = _compute_parallel_and_dp_local(
         ordered,
         server_env,
         topo_nodes=int(eff_topology["nodes"]),
