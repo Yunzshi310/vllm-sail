@@ -5106,7 +5106,9 @@ def test_rc_legacy_cursor_upgrade_and_manual_override_variants(tmp_path):
     assert sanitized["schema"] == 1
     assert sanitized["rc_branch_states"] == {}
 
-    # Legacy tested_rc_tags still deduplicates releases/v0.35.0 when tip_sha == tags["v0.35.0rc0"]!
+    # Legacy name-only `tested_rc_tags` without an immutable SHA binding in `rc_tag_states`
+    # must re-qualify the RC tag to establish an immutable `(tag -> sha)` receipt, and
+    # cannot supply an unverified live tag SHA as `last_green_sha`!
     ls_same = {
         "main_sha": sha_main,
         "tags": {"v0.35.0rc0": sha_rc0},
@@ -5119,9 +5121,31 @@ def test_rc_legacy_cursor_upgrade_and_manual_override_variants(tmp_path):
         requested_gear="auto",
         cursor=legacy_cursor,
     )
-    assert d_legacy_dedup["selected_gear"] == "probe"
+    assert d_legacy_dedup["selected_gear"] == "rc_qualify"
+    assert d_legacy_dedup["rc_tag"] == "v0.35.0rc0"
+    assert d_legacy_dedup["target_sha"] == sha_rc0
 
-    # And when releases/v0.35.0 advances to sha_cp1, legacy tested_rc_tags resolves sha_rc0 as last_green_sha!
+    # Once SHA-bound in `rc_tag_states`, deduplication and `last_green_sha` resolution work normally:
+    bound_rc0_cursor = post_merge.advance_cursor(
+        legacy_cursor,
+        verified_pin=VERIFIED_PIN,
+        selected_gear="rc_qualify",
+        target_sha=sha_rc0,
+        rc_tag="v0.35.0rc0",
+        status="pass",
+        cpu_status="pass",
+        ppu_status="pass",
+    )
+    assert (
+        post_merge.route_three_gears(
+            ls_remote_data=ls_same,
+            verified_pin=VERIFIED_PIN,
+            release_baseline_tag="v0.34.0",
+            requested_gear="auto",
+            cursor=bound_rc0_cursor,
+        )["selected_gear"]
+        == "probe"
+    )
     ls_next = {
         "main_sha": sha_main,
         "tags": {"v0.35.0rc0": sha_rc0},
@@ -5132,7 +5156,7 @@ def test_rc_legacy_cursor_upgrade_and_manual_override_variants(tmp_path):
         verified_pin=VERIFIED_PIN,
         release_baseline_tag="v0.34.0",
         requested_gear="auto",
-        cursor=legacy_cursor,
+        cursor=bound_rc0_cursor,
     )
     assert d_legacy_next["selected_gear"] == "rc_qualify"
     assert d_legacy_next["rc_tag"] == "releases/v0.35.0"
@@ -6898,9 +6922,9 @@ new AsyncFunction("github", "context", "core", "require", script)(
     assert dec_26["selected_gear"] == "rc_qualify"
     assert dec_26["last_green_sha"] == pin_sha
 
-    # Even after 300 additional ephemeral failures (> MAX_EPHEMERAL_REVOKED_SHAS), `main_green` stays revoked:
+    # Even after >MAX_EPHEMERAL_REVOKED_SHAS additional ephemeral failures, `main_green` stays revoked:
     cur_obj = json.loads(cur_branch.read_text(encoding="utf-8"))
-    for k in range(300):
+    for k in range(post_merge.MAX_EPHEMERAL_REVOKED_SHAS + 20):
         cur_obj = post_merge.advance_cursor(
             cur_obj,
             verified_pin=pin_sha,
@@ -6929,3 +6953,767 @@ new AsyncFunction("github", "context", "core", "require", script)(
         "revoked_shas", ()
     )
     assert _cli_route(cur_requal, "auto")["last_green_sha"] == main_green
+
+    # [R1 P1-1] Late / out-of-order `probe` rerun on older SHA `B` after newer `C` already passed
+    # must NOT regress `last_ppu_green_sha`, `probe_history` ordering, or `daily_pin_bump` candidate:
+    probe_b_fail_dir = tmp_path / "probe-b-fail"
+    assert (
+        post_merge.main(
+            [
+                "publish",
+                "--gear",
+                "probe",
+                "--upstream-sha",
+                sha_b,
+                "--verified-pin-file",
+                str(pin_file),
+                "--sail-sha",
+                sail_sha,
+                "--public-dir",
+                str(probe_b_fail_dir),
+                "--status",
+                "fail",
+                "--cpu-status",
+                "pass",
+                "--ppu-status",
+                "fail",
+                "--failure-stage",
+                "ppu_probe_smoke",
+            ]
+        )
+        == 0
+    )
+    probe_c_pass = _cli_publish(
+        "probe-c-pass", probe_b_fail_dir / "cursor.json", "probe", sha_c, status="pass"
+    )
+    probe_b_late_pass = _cli_publish(
+        "probe-b-late-pass", probe_c_pass, "probe", sha_b, status="pass"
+    )
+    late_probe_model = json.loads(probe_b_late_pass.read_text(encoding="utf-8"))
+    assert late_probe_model["last_ppu_green_sha"] == sha_c
+    assert late_probe_model["last_ppu_tested_sha"] == sha_c
+    assert late_probe_model["last_cpu_green_sha"] == sha_c
+    assert late_probe_model["last_probe_record"]["upstream_sha"] == sha_c
+    assert [r["upstream_sha"] for r in late_probe_model["probe_history"]] == [
+        sha_c,
+        sha_b,
+    ]
+    assert late_probe_model["probe_history"][1]["ppu_status"] == "pass"
+    assert (
+        post_merge.select_pin_bump_candidate(
+            late_probe_model["probe_history"], verified_pin=pin_sha
+        )
+        == sha_c
+    )
+
+    # Same protection when `12/1` never uploaded a cursor (`B` absent from `probe_history = [C]`)
+    # and `publish-and-triage` passes `--superseded-probe-frontier`:
+    c_only_cursor = _cli_publish("probe-c-only", None, "probe", sha_c, status="pass")
+    sup_b_dir = tmp_path / "probe-b-superseded"
+    assert (
+        post_merge.main(
+            [
+                "publish",
+                "--gear",
+                "probe",
+                "--upstream-sha",
+                sha_b,
+                "--verified-pin-file",
+                str(pin_file),
+                "--sail-sha",
+                sail_sha,
+                "--public-dir",
+                str(sup_b_dir),
+                "--status",
+                "pass",
+                "--cpu-status",
+                "pass",
+                "--ppu-status",
+                "pass",
+                "--cursor-in",
+                str(c_only_cursor),
+                "--superseded-probe-frontier",
+            ]
+        )
+        == 0
+    )
+    sup_b_model = json.loads((sup_b_dir / "cursor.json").read_text(encoding="utf-8"))
+    assert sup_b_model["last_ppu_green_sha"] == sha_c
+    assert [r["upstream_sha"] for r in sup_b_model["probe_history"]] == [sha_c, sha_b]
+    assert (
+        post_merge.select_pin_bump_candidate(
+            sup_b_model["probe_history"], verified_pin=pin_sha
+        )
+        == sha_c
+    )
+
+    # Docs-only `C` (`ppu_status="skipped"`) inheriting from `B` rolls back cleanly if late `B` fails:
+    b_init_pass = _cli_publish("probe-b-init-pass", None, "probe", sha_b, status="pass")
+    c_docs_dir = tmp_path / "probe-c-docs"
+    assert (
+        post_merge.main(
+            [
+                "publish",
+                "--gear",
+                "probe",
+                "--upstream-sha",
+                sha_c,
+                "--verified-pin-file",
+                str(pin_file),
+                "--sail-sha",
+                sail_sha,
+                "--public-dir",
+                str(c_docs_dir),
+                "--status",
+                "pass",
+                "--cpu-status",
+                "pass",
+                "--ppu-status",
+                "skipped",
+                "--ppu-skip-reason",
+                "docs_or_tests_only",
+                "--cursor-in",
+                str(b_init_pass),
+            ]
+        )
+        == 0
+    )
+    b_late_fail = _cli_publish(
+        "probe-b-late-fail",
+        c_docs_dir / "cursor.json",
+        "probe",
+        sha_b,
+        status="fail",
+    )
+    docs_demoted = json.loads(b_late_fail.read_text(encoding="utf-8"))
+    assert docs_demoted["last_ppu_green_sha"] == pin_sha
+    assert docs_demoted["last_ppu_status"] == "fail"
+    assert docs_demoted["probe_history"][0]["upstream_sha"] == sha_c
+    assert docs_demoted["probe_history"][0]["last_ppu_result_status"] == "fail"
+    assert (
+        post_merge.select_pin_bump_candidate(
+            docs_demoted["probe_history"], verified_pin=pin_sha
+        )
+        is None
+    )
+
+    # Legacy cursor with `tested_rc_tags=["v0.35.0rc1"]` and `rc_tag_states={}`
+    # re-qualifies unmapped `v0.35.0rc1` and retains `sha_b` revocation across >256 (`300`) failures:
+    legacy_seed = tmp_path / "legacy-rc-seed.json"
+    legacy_seed.write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "last_cpu_checked_sha": pin_sha,
+                "last_cpu_green_sha": pin_sha,
+                "last_cpu_status": "pass",
+                "last_ppu_tested_sha": pin_sha,
+                "last_ppu_green_sha": pin_sha,
+                "last_ppu_status": "pass",
+                "tested_rc_tags": ["v0.35.0rc1"],
+                "rc_tag_states": {},
+                "rc_branch_states": {},
+                "patch_fingerprints": {},
+                "probe_history": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    _snapshot(sha_b, {"v0.35.0rc1": sha_b})
+    assert _cli_route(legacy_seed, "auto")["target_sha"] == sha_b
+    leg_cur = _cli_publish(
+        "legacy-b-fail", legacy_seed, "rc_qualify", sha_b, branch, "fail"
+    )
+    leg_obj = json.loads(leg_cur.read_text(encoding="utf-8"))
+    for k in range(300):
+        leg_obj = post_merge.advance_cursor(
+            leg_obj,
+            verified_pin=pin_sha,
+            selected_gear="rc_qualify",
+            target_sha=f"{k + 1000:040x}",
+            rc_tag=branch,
+            status="fail",
+            cpu_status="pass",
+            ppu_status="fail",
+        )
+    leg_300_path = tmp_path / "legacy-after-300.json"
+    leg_300_path.write_text(json.dumps(leg_obj), encoding="utf-8")
+    _snapshot(sha_c, {})
+    leg_dec = _cli_route(leg_300_path, "auto")
+    assert leg_dec["selected_gear"] == "rc_qualify"
+    assert leg_dec["target_sha"] == sha_c
+    assert leg_dec["last_green_sha"] == pin_sha
+    assert (
+        sha_b
+        in json.loads(leg_300_path.read_text(encoding="utf-8"))["rc_branch_states"][
+            branch
+        ]["revoked_shas"]
+    )
+
+
+def test_cursor_audit_rev6066758288_invariants(tmp_path: Path) -> None:
+    """End-to-end regressions for PR #374 cursor state-machine audit (#6066758288)."""
+    wf_jobs = yaml.safe_load(
+        (REPO_ROOT / ".github/workflows/upstream-canary.yaml").read_text(
+            encoding="utf-8"
+        )
+    )["jobs"]
+    discover_js = next(
+        s["with"]["script"] for s in wf_jobs["route"]["steps"] if s.get("id") == "prior"
+    )
+    latest_js = next(
+        s["with"]["script"]
+        for s in wf_jobs["publish-and-triage"]["steps"]
+        if s.get("id") == "latest_cursor"
+    )
+    daily_steps = wf_jobs["daily-pin-bump"]["steps"]
+    assert not any(
+        "needs.route.outputs.target_sha" in str(s.get("env", {})) for s in daily_steps
+    )
+    assert not any(
+        "parents: [context.sha]" in str(s.get("with", {})) for s in daily_steps
+    )
+
+    node_bin = shutil.which("node")
+    if node_bin:
+        harness = tmp_path / "js_audit_harness.cjs"
+        harness.write_text(
+            """
+const fs = require("node:fs");
+const payload = JSON.parse(fs.readFileSync(0, "utf8"));
+const outputs = {};
+const actions = {
+  async listWorkflowRuns(x) {
+    if (x.workflow_id === "ppu-pr-ci.yaml") return { data: { total_count: 0, workflow_runs: [] } };
+    const r = payload.records.filter(v => v.status === x.status);
+    return { data: { total_count: r.length, workflow_runs: r.map(({ artifacts, ...run }) => run) } };
+  },
+  async listWorkflowRunArtifacts(x) {
+    const r = payload.records.find(q => q.id === x.run_id).artifacts;
+    return { data: { total_count: r.length, artifacts: r } };
+  },
+};
+if (payload.attemptJobs !== undefined) {
+  actions.listJobsForWorkflowRunAttempt = async () => ({ data: { jobs: payload.attemptJobs } });
+}
+const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+(async () => {
+  try {
+    await new AsyncFunction("github", "context", "core", "require", payload.script)(
+      { rest: { actions } },
+      { repo: { owner: "o", repo: "r" }, runId: payload.current, runAttempt: payload.runAttempt || 0 },
+      { setOutput: (k, v) => { outputs[k] = v; } },
+      require
+    );
+    console.log(JSON.stringify({ ok: true, outputs }));
+  } catch (e) {
+    console.log(JSON.stringify({ ok: false, outputs, message: e.message }));
+  }
+})();
+""".strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "state").mkdir(exist_ok=True)
+
+        def _run_js(
+            script: str,
+            records: list[dict],
+            *,
+            current: int,
+            prior: str = "",
+            run_attempt: int = 0,
+            attempt_jobs: list[dict] | None = None,
+            gear: str = "rc_qualify",
+        ) -> dict:
+            inp: dict = {
+                "script": script,
+                "records": records,
+                "current": current,
+                "runAttempt": run_attempt,
+            }
+            if attempt_jobs is not None:
+                inp["attemptJobs"] = attempt_jobs
+            proc = subprocess.run(
+                [node_bin, str(harness)],
+                input=json.dumps(inp),
+                cwd=str(tmp_path),
+                env={
+                    **os.environ,
+                    "CURSOR_DISCOVERY_RETRY_MS": "0",
+                    "ROUTE_PRIOR_CURSOR_ARTIFACT": prior,
+                    "SELECTED_GEAR": gear,
+                    "RUN_CPU": "true",
+                    "RUN_PPU": "true",
+                },
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            return json.loads(proc.stdout)
+
+        # 1. Full rerun of active run 12 (`status="in_progress"`, `attempt=2`) restores `12-1`:
+        in_prog_records = [
+            {
+                "id": 12,
+                "created_at": "2026-11-26T00:12:00Z",
+                "updated_at": "2026-11-26T00:12:00Z",
+                "run_attempt": 2,
+                "status": "in_progress",
+                "artifacts": [
+                    {
+                        "id": 12,
+                        "name": "upstream-post-merge-cursor-12-1",
+                        "created_at": "2026-11-26T00:12:00Z",
+                        "expired": False,
+                    }
+                ],
+            },
+            {
+                "id": 11,
+                "created_at": "2026-11-26T00:11:00Z",
+                "updated_at": "2026-11-26T00:11:00Z",
+                "run_attempt": 1,
+                "status": "completed",
+                "artifacts": [
+                    {
+                        "id": 11,
+                        "name": "upstream-post-merge-cursor-11-1",
+                        "created_at": "2026-11-26T00:11:00Z",
+                        "expired": False,
+                    }
+                ],
+            },
+        ]
+        own_res = _run_js(discover_js, in_prog_records, current=12, run_attempt=2)
+        assert own_res["ok"] is True
+        assert (
+            own_res["outputs"]["prior_cursor_artifact"]
+            == "upstream-post-merge-cursor-12-1"
+        )
+
+        # 2. Publisher-only partial retry (`retested_lanes == 0`) after external `13-1` fails closed:
+        partial_records = [
+            {
+                "id": 13,
+                "created_at": "2026-11-26T00:13:00Z",
+                "updated_at": "2026-11-26T00:13:00Z",
+                "run_attempt": 1,
+                "status": "completed",
+                "artifacts": [
+                    {
+                        "id": 13,
+                        "name": "upstream-post-merge-cursor-13-1",
+                        "created_at": "2026-11-26T00:13:00Z",
+                        "expired": False,
+                    }
+                ],
+            },
+            *in_prog_records,
+        ]
+        pub_only_res = _run_js(
+            latest_js,
+            partial_records,
+            current=12,
+            prior="upstream-post-merge-cursor-11-1",
+            run_attempt=2,
+            attempt_jobs=[
+                {
+                    "name": "Publish allowlisted summary & dual-track triage",
+                    "status": "in_progress",
+                    "conclusion": None,
+                }
+            ],
+        )
+        assert pub_only_res["ok"] is False
+        assert "retested_lanes=0" in pub_only_res["message"]
+
+        # Genuine retest in attempt 2 (`retested_lanes > 0`) succeeds and adopts `13-1`:
+        retested_res = _run_js(
+            latest_js,
+            partial_records,
+            current=12,
+            prior="upstream-post-merge-cursor-11-1",
+            run_attempt=2,
+            attempt_jobs=[
+                {
+                    "name": "SDK container CPU fast check & static bisect",
+                    "status": "completed",
+                    "conclusion": "success",
+                }
+            ],
+        )
+        assert retested_res["ok"] is True
+        assert retested_res["outputs"]["has_newer_external_cursor"] == "true"
+        assert (
+            retested_res["outputs"]["latest_cursor_artifact"]
+            == "upstream-post-merge-cursor-13-1"
+        )
+
+        # Idempotent same-run publish retry (`best.runId === context.runId`) is allowed:
+        same_run_retry = _run_js(
+            latest_js,
+            in_prog_records,
+            current=12,
+            prior="upstream-post-merge-cursor-11-1",
+            run_attempt=2,
+            attempt_jobs=[],
+        )
+        assert same_run_retry["ok"] is True
+        assert same_run_retry["outputs"]["has_newer_external_cursor"] == "false"
+
+    # Build a real Git DAG: pin -> A -> B -> X1 -> C -> D on `main`, plus `side` off `pin`.
+    repo = tmp_path / "upstream-dag"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    git_env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "Test",
+        "GIT_COMMITTER_NAME": "Test",
+        "GIT_AUTHOR_EMAIL": "test@example.org",
+        "GIT_COMMITTER_EMAIL": "test@example.org",
+    }
+
+    def _mk(label: str) -> str:
+        (repo / "src").mkdir(exist_ok=True)
+        (repo / "docs").mkdir(exist_ok=True)
+        if label not in {"C"}:
+            (repo / "src" / "code.py").write_text(f"v = {label!r}\n", encoding="utf-8")
+        (repo / "docs" / "note.md").write_text(f"{label}\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "src", "docs"], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "commit", "-qm", label], check=True, env=git_env
+        )
+        return subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
+        ).strip()
+
+    pin = _mk("pin")
+    sha_a = _mk("A")
+    sha_b = _mk("B")
+    _mk("X1")
+    sha_c = _mk("C")
+    sha_d = _mk("D")
+    subprocess.run(
+        ["git", "-C", str(repo), "checkout", "--detach", "-q", pin], check=True
+    )
+    sha_side = _mk("side")
+    subprocess.run(
+        ["git", "-C", str(repo), "update-ref", "refs/heads/main", sha_d], check=True
+    )
+
+    pin_file = tmp_path / "verified.commit"
+    pin_file.write_text(pin + "\n", encoding="utf-8")
+    rel_file = tmp_path / "release.tag"
+    rel_file.write_text("v0.34.0\n", encoding="utf-8")
+    branch = "releases/v0.35.0"
+
+    # 3. Retagged RC tag (`v0.35.0rc0` moved from `side` -> `B`) must re-qualify `B`
+    #    and never supply unverified `B` as a green control for `v0.35.0rc1(C)`:
+    cur_a = post_merge.advance_cursor(
+        None,
+        verified_pin=pin,
+        selected_gear="probe",
+        target_sha=sha_a,
+        status="pass",
+        cpu_status="pass",
+        ppu_status="pass",
+    )
+    cur_rc0_side = post_merge.advance_cursor(
+        cur_a,
+        verified_pin=pin,
+        selected_gear="rc_qualify",
+        target_sha=sha_side,
+        rc_tag="v0.35.0rc0",
+        status="pass",
+        cpu_status="pass",
+        ppu_status="pass",
+    )
+    retag_dec = post_merge.route_three_gears(
+        ls_remote_data={
+            "main_sha": sha_a,
+            "tags": {"v0.35.0rc0": sha_b},
+            "release_branches": {branch: sha_b},
+        },
+        verified_pin=pin,
+        release_baseline_tag="v0.34.0",
+        requested_gear="auto",
+        cursor=cur_rc0_side,
+        vllm_repo=repo,
+    )
+    assert retag_dec["selected_gear"] == "rc_qualify"
+    assert retag_dec["target_sha"] == sha_b
+    retag_rc1_dec = post_merge.route_three_gears(
+        ls_remote_data={
+            "main_sha": sha_a,
+            "tags": {"v0.35.0rc0": sha_b, "v0.35.0rc1": sha_c},
+            "release_branches": {branch: sha_c},
+        },
+        verified_pin=pin,
+        release_baseline_tag="v0.34.0",
+        requested_gear="auto",
+        cursor=cur_rc0_side,
+        vllm_repo=repo,
+    )
+    assert retag_rc1_dec["last_green_sha"] == sha_a
+
+    # 4. Nearest strict first-parent ancestor (`C` wins over `B` even after historical rerun of `B`):
+    cur_b_rc = post_merge.advance_cursor(
+        cur_a,
+        verified_pin=pin,
+        selected_gear="rc_qualify",
+        target_sha=sha_b,
+        rc_tag=branch,
+        status="pass",
+        cpu_status="pass",
+        ppu_status="pass",
+    )
+    cur_c_rc = post_merge.advance_cursor(
+        cur_b_rc,
+        verified_pin=pin,
+        selected_gear="rc_qualify",
+        target_sha=sha_c,
+        rc_tag=branch,
+        status="pass",
+        cpu_status="pass",
+        ppu_status="pass",
+    )
+    cur_b_rerun = post_merge.advance_cursor(
+        cur_c_rc,
+        verified_pin=pin,
+        selected_gear="rc_qualify",
+        target_sha=sha_b,
+        rc_tag=branch,
+        status="pass",
+        cpu_status="pass",
+        ppu_status="pass",
+    )
+    chosen_ctrl, chosen_rng = post_merge.resolve_verified_bisect_control(
+        repo,
+        primary_green=sha_b,
+        red_sha=sha_d,
+        fallback_greens=[sha_c, sha_a, pin],
+    )
+    assert chosen_ctrl == sha_c
+    assert chosen_rng == [sha_d]
+    assert cur_b_rerun["rc_branch_states"][branch]["last_green_sha"] == sha_c
+
+    # 5. Shared CPU gate failure in `rc_qualify` invalidates probe reuse, direct pin bump,
+    #    and docs-only inheritance (plus `--force` bypasses `allowlisted_non_ppu_changes`):
+    cur_main_b = post_merge.advance_cursor(
+        cur_a,
+        verified_pin=pin,
+        selected_gear="probe",
+        target_sha=sha_b,
+        status="pass",
+        cpu_status="pass",
+        ppu_status="pass",
+    )
+    cur_rc_cpu_fail = post_merge.advance_cursor(
+        cur_main_b,
+        verified_pin=pin,
+        selected_gear="rc_qualify",
+        target_sha=sha_b,
+        rc_tag=branch,
+        status="fail",
+        cpu_status="fail",
+        ppu_status="skipped",
+        ppu_skip_reason="cpu_fast_check_failed",
+    )
+    reprobe_b = post_merge.route_three_gears(
+        ls_remote_data={
+            "main_sha": sha_b,
+            "tags": {},
+            "release_branches": {branch: sha_b},
+        },
+        verified_pin=pin,
+        release_baseline_tag="v0.34.0",
+        requested_gear="probe",
+        cursor=cur_rc_cpu_fail,
+        vllm_repo=repo,
+    )
+    assert reprobe_b["run_cpu"] is True and reprobe_b["run_ppu"] is True
+    assert (
+        post_merge.route_three_gears(
+            ls_remote_data={
+                "main_sha": sha_b,
+                "tags": {},
+                "release_branches": {branch: sha_b},
+            },
+            verified_pin=pin,
+            release_baseline_tag="v0.34.0",
+            requested_gear="daily_pin_bump",
+            cursor=cur_rc_cpu_fail,
+            vllm_repo=repo,
+        )["target_sha"]
+        == sha_a
+    )
+    docs_on_revoked = post_merge.route_three_gears(
+        ls_remote_data={
+            "main_sha": sha_c,
+            "tags": {},
+            "release_branches": {branch: sha_b},
+        },
+        verified_pin=pin,
+        release_baseline_tag="v0.34.0",
+        requested_gear="probe",
+        cursor=cur_rc_cpu_fail,
+        changed_paths_since_ppu=["docs/note.md"],
+        changed_files_base_sha=sha_b,
+        vllm_repo=repo,
+    )
+    assert docs_on_revoked["run_ppu"] is True
+    forced_docs = post_merge.route_three_gears(
+        ls_remote_data={"main_sha": sha_c, "tags": {}},
+        verified_pin=pin,
+        release_baseline_tag="v0.34.0",
+        requested_gear="probe",
+        cursor=cur_main_b,
+        changed_paths_since_ppu=["docs/note.md"],
+        changed_files_base_sha=sha_b,
+        force=True,
+        vllm_repo=repo,
+    )
+    assert forced_docs["run_ppu"] is True
+
+    # 6. `prepare-pin-bump` revalidates cursor + upstream `main` first-parent membership:
+    pin_repo = tmp_path / "sail-pin-repo"
+    (pin_repo / ".github").mkdir(parents=True)
+    (pin_repo / "csrc" / "upstream").mkdir(parents=True)
+    (pin_repo / ".github" / "vllm-main-verified.commit").write_text(
+        pin + "\n", encoding="utf-8"
+    )
+    (pin_repo / "csrc" / "upstream" / "manifest.toml").write_text(
+        f'upstream_ref = "{pin}"\n', encoding="utf-8"
+    )
+    revoked_cur_file = tmp_path / "revoked-cur.json"
+    revoked_cur_file.write_text(json.dumps(cur_rc_cpu_fail), encoding="utf-8")
+    stale_bump_out = tmp_path / "stale-bump.json"
+    assert (
+        post_merge.main(
+            [
+                "prepare-pin-bump",
+                "--repo-root",
+                str(pin_repo),
+                "--target-sha",
+                sha_b,
+                "--cursor-file",
+                str(revoked_cur_file),
+                "--vllm-repo",
+                str(repo),
+                "--output-json",
+                str(stale_bump_out),
+            ]
+        )
+        == 0
+    )
+    assert json.loads(stale_bump_out.read_text(encoding="utf-8"))["changed"] == "false"
+
+    cur_off_main = post_merge.advance_cursor(
+        cur_a,
+        verified_pin=pin,
+        selected_gear="probe",
+        target_sha=sha_side,
+        status="pass",
+        cpu_status="pass",
+        ppu_status="pass",
+    )
+    assert (
+        post_merge.route_three_gears(
+            ls_remote_data={
+                "main_sha": sha_c,
+                "tags": {},
+                "release_branches": {branch: sha_side},
+            },
+            verified_pin=pin,
+            release_baseline_tag="v0.34.0",
+            requested_gear="daily_pin_bump",
+            cursor=cur_off_main,
+            vllm_repo=repo,
+        )["target_sha"]
+        == sha_a
+    )
+    with pytest.raises(ValueError, match="upstream main first-parent"):
+        post_merge.prepare_pin_bump(
+            repo_root=pin_repo,
+            target_sha=sha_side,
+            vllm_repo=repo,
+        )
+
+    # 7. Unbound exact-SHA RC failure, >256 revocations, corrupt `null` cursor, and empty unresolved `last_good_sha`:
+    cur_unbound = post_merge.advance_cursor(
+        cur_main_b,
+        verified_pin=pin,
+        selected_gear="rc_qualify",
+        target_sha=sha_b,
+        rc_tag="",
+        status="fail",
+        cpu_status="pass",
+        ppu_status="fail",
+    )
+    assert cur_unbound["rc_sha_states"] == {sha_b: "fail"}
+    assert (
+        post_merge.route_three_gears(
+            ls_remote_data={
+                "main_sha": sha_a,
+                "tags": {},
+                "release_branches": {branch: sha_c},
+            },
+            verified_pin=pin,
+            release_baseline_tag="v0.34.0",
+            requested_gear="rc_qualify",
+            upstream_ref_override=branch,
+            cursor=cur_unbound,
+            vllm_repo=repo,
+        )["last_green_sha"]
+        == sha_a
+    )
+
+    null_cur = tmp_path / "null-cursor.json"
+    null_cur.write_text("null", encoding="utf-8")
+    ls_f = tmp_path / "ls-null.txt"
+    ls_f.write_text(f"{sha_a}\trefs/heads/main\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="JSON object"):
+        post_merge.main(
+            [
+                "route",
+                "--ls-remote-file",
+                str(ls_f),
+                "--verified-pin-file",
+                str(pin_file),
+                "--release-tag-file",
+                str(rel_file),
+                "--cursor-file",
+                str(null_cur),
+            ]
+        )
+
+    for bad_ctrl in (sha_d, sha_side):
+        bad_pin = tmp_path / "bad-pin.commit"
+        bad_pin.write_text(bad_ctrl + "\n", encoding="utf-8")
+        out_unres = tmp_path / f"unres-{bad_ctrl[:8]}.json"
+        assert (
+            post_merge.main(
+                [
+                    "bisect",
+                    "--vllm-repo",
+                    str(repo),
+                    "--last-green-sha",
+                    bad_ctrl,
+                    "--verified-pin-file",
+                    str(bad_pin),
+                    "--rc-tag",
+                    branch,
+                    "--red-sha",
+                    sha_d,
+                    "--probe-cmd",
+                    "true",
+                    "--output-json",
+                    str(out_unres),
+                ]
+            )
+            == 0
+        )
+        unres_payload = json.loads(out_unres.read_text(encoding="utf-8"))
+        assert unres_payload["bisect_status"] == "unresolved_history"
+        assert unres_payload["last_good_sha"] == ""
+        assert unres_payload["first_failing_sha"] == ""

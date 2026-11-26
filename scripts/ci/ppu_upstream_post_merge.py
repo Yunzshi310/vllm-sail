@@ -614,6 +614,8 @@ def select_newest_rc_tag(
     release_baseline_tag: str,
     tested_rc_tags: Sequence[str] = (),
     rc_tag_states: dict[str, dict[str, str]] | None = None,
+    rc_branch_states: dict[str, dict[str, Any]] | None = None,
+    rc_sha_states: dict[str, str] | None = None,
     include_failed: bool = False,
 ) -> tuple[str, str] | None:
     """Return ``(rc_tag, commit_sha)`` for the newest eligible ``vX.Y.0rc*``."""
@@ -621,13 +623,15 @@ def select_newest_rc_tag(
     if not base_match:
         raise ValueError(f"invalid release baseline tag: {release_baseline_tag!r}")
     base_line = (int(base_match.group(1)), int(base_match.group(2)))
-    tested = set(tested_rc_tags)
+    _ = tested_rc_tags
     states = rc_tag_states or {}
+    br_states = rc_branch_states or {}
+    sha_states = rc_sha_states or {}
 
     candidates: list[tuple[tuple[int, int, int], str, str]] = []
     for tag, sha in tags.items():
         match = RC_TAG_RE.fullmatch(tag)
-        if not match or tag in tested or not SHA1_RE.fullmatch(sha):
+        if not match or not SHA1_RE.fullmatch(sha):
             continue
         major, minor, rc_num = (
             int(match.group(1)),
@@ -640,6 +644,16 @@ def select_newest_rc_tag(
         if isinstance(prior, dict) and prior.get("sha") == sha:
             if prior.get("status") == "pass" or not include_failed:
                 continue
+        if not include_failed:
+            if sha in sha_states and sha_states[sha] != "pass":
+                continue
+            prior_br = br_states.get(f"releases/v{major}.{minor}.0")
+            if isinstance(prior_br, dict):
+                br_rev = prior_br.get("revoked_shas") or ()
+                if sha in br_rev or (
+                    prior_br.get("sha") == sha and prior_br.get("status") != "pass"
+                ):
+                    continue
         candidates.append(((major, minor, rc_num), tag, sha))
 
     if not candidates:
@@ -657,6 +671,7 @@ def select_newest_rc_target(
     tested_rc_tags: Sequence[str] = (),
     rc_tag_states: dict[str, dict[str, str]] | None = None,
     rc_branch_states: dict[str, dict[str, str]] | None = None,
+    rc_sha_states: dict[str, str] | None = None,
     include_failed: bool = False,
 ) -> tuple[str, str] | None:
     """Return ``(rc_ref, commit_sha)`` for the newest active-window RC tag or branch.
@@ -665,13 +680,15 @@ def select_newest_rc_target(
     A ``releases/vX.Y.0`` branch is eligible only when ``(X, Y) > base_line``,
     the final ``vX.Y.0`` tag does not yet exist in ``tags``, and its ``tip_sha``
     has not already passed (or failed/errored without ``include_failed``) in
-    ``rc_branch_states`` or any same-line ``rc_tag_states`` / ``tested_rc_tags``.
+    ``rc_branch_states`` or any SHA-bound same-line ``rc_tag_states``.
     """
     tag_hit = select_newest_rc_tag(
         tags,
         release_baseline_tag=release_baseline_tag,
         tested_rc_tags=tested_rc_tags,
         rc_tag_states=rc_tag_states,
+        rc_branch_states=rc_branch_states,
+        rc_sha_states=rc_sha_states,
         include_failed=include_failed,
     )
     if tag_hit is not None:
@@ -682,7 +699,6 @@ def select_newest_rc_target(
         raise ValueError(f"invalid release baseline tag: {release_baseline_tag!r}")
     base_line = (int(base_match.group(1)), int(base_match.group(2)))
     branches = release_branches or {}
-    tested = set(tested_rc_tags)
     tag_states = rc_tag_states or {}
     branch_states = rc_branch_states or {}
 
@@ -728,19 +744,6 @@ def select_newest_rc_target(
                 continue
             if t_entry.get("sha") == tip_sha and (
                 t_entry.get("status") == "pass" or not include_failed
-            ):
-                covered_by_tag = True
-                break
-        if covered_by_tag:
-            continue
-
-        for t_name in tested:
-            t_match = RC_TAG_RE.fullmatch(t_name)
-            if (
-                t_match
-                and (int(t_match.group(1)), int(t_match.group(2))) == (major, minor)
-                and tags.get(t_name) == tip_sha
-                and (not include_failed or tip_sha not in br_revoked_set)
             ):
                 covered_by_tag = True
                 break
@@ -916,7 +919,7 @@ def _match_rc_line_context(
     return None, None
 
 
-MAX_EPHEMERAL_REVOKED_SHAS = 256
+MAX_EPHEMERAL_REVOKED_SHAS = 2048
 
 
 def _protected_control_shas_in_cursor(
@@ -976,7 +979,7 @@ def _cap_revoked_shas(
     revoked: Sequence[str],
     protected_shas: set[str],
     *,
-    max_ephemeral: int = MAX_EPHEMERAL_REVOKED_SHAS,
+    max_ephemeral: int | None = MAX_EPHEMERAL_REVOKED_SHAS,
 ) -> list[str]:
     """Bound ephemeral failed branch tips while retaining all live control revocations."""
     kept: list[str] = []
@@ -986,7 +989,7 @@ def _cap_revoked_shas(
         s = str(raw or "").strip()
         if not SHA1_RE.fullmatch(s) or s in seen:
             continue
-        if s in protected_shas:
+        if s in protected_shas or max_ephemeral is None:
             kept.append(s)
             seen.add(s)
         elif ephemeral_count < max_ephemeral:
@@ -1008,6 +1011,8 @@ def _collect_excluded_control_shas(
     tags_map = tags or {}
     rc_branch_states = (state or {}).get("rc_branch_states") or {}
     rc_tag_states = (state or {}).get("rc_tag_states") or {}
+    rc_sha_states = (state or {}).get("rc_sha_states") or {}
+    shared_cpu_failed = (state or {}).get("shared_cpu_failed_shas") or ()
     line, max_rc_num = _match_rc_line_context(
         state,
         rc_ref=rc_ref,
@@ -1019,7 +1024,7 @@ def _collect_excluded_control_shas(
     excluded: set[str] = set()
 
     # Fail closed across all RC release lines: any SHA with an unrecovered non-pass
-    # RC verdict on any branch or tag cannot serve as a verified green control.
+    # RC verdict on any branch, tag, or unbound SHA cannot serve as a verified green control.
     for br_ent in rc_branch_states.values():
         if not isinstance(br_ent, dict):
             continue
@@ -1037,6 +1042,15 @@ def _collect_excluded_control_shas(
         ts_bad = str(tg_ent.get("sha") or "").strip()
         if tg_ent.get("status") != "pass" and SHA1_RE.fullmatch(ts_bad):
             excluded.add(ts_bad)
+    if isinstance(rc_sha_states, dict):
+        for raw_sha, raw_st in rc_sha_states.items():
+            s = str(raw_sha or "").strip()
+            if raw_st != "pass" and SHA1_RE.fullmatch(s):
+                excluded.add(s)
+    for raw_shared in shared_cpu_failed:
+        s = str(raw_shared or "").strip()
+        if SHA1_RE.fullmatch(s):
+            excluded.add(s)
 
     if line is not None and max_rc_num is not None:
         for tg_name, tg_entry in rc_tag_states.items():
@@ -1098,10 +1112,8 @@ def _collect_verified_control_shas(
     release_branches: dict[str, str] | None = None,
 ) -> list[str]:
     """Return ordered verified green SHAs (same-line RC greens, main greens, verified pin)."""
-    tags_map = tags or {}
     rc_branch_states = (state or {}).get("rc_branch_states") or {}
     rc_tag_states = (state or {}).get("rc_tag_states") or {}
-    tested_rc_tags = (state or {}).get("tested_rc_tags") or ()
     line, max_rc_num = _match_rc_line_context(
         state,
         rc_ref=rc_ref,
@@ -1150,17 +1162,6 @@ def _collect_verified_control_shas(
             ):
                 rc_num = int(tm.group(3))
                 tg_sha = str(tg_entry.get("sha") or "").strip()
-                if (
-                    (max_rc_num is None or rc_num < max_rc_num)
-                    and SHA1_RE.fullmatch(tg_sha)
-                    and tg_sha not in excluded
-                ):
-                    passing_tags.append((rc_num, tg_sha))
-        for tg_name in tested_rc_tags:
-            tm = RC_TAG_RE.fullmatch(tg_name)
-            if tm and (int(tm.group(1)), int(tm.group(2))) == line:
-                rc_num = int(tm.group(3))
-                tg_sha = str(tags_map.get(tg_name) or "").strip()
                 if (
                     (max_rc_num is None or rc_num < max_rc_num)
                     and SHA1_RE.fullmatch(tg_sha)
@@ -1242,7 +1243,9 @@ def _resolve_rc_last_green_sha(
         candidates.append(fallback_green)
 
     non_target = [cand for cand in candidates if cand != target_sha]
-    if vllm_repo is not None and non_target and SHA1_RE.fullmatch(target_sha):
+    if vllm_repo is not None and SHA1_RE.fullmatch(target_sha):
+        if not non_target:
+            return ""
         chosen, rng = resolve_verified_bisect_control(
             vllm_repo,
             primary_green=non_target[0],
@@ -1250,8 +1253,7 @@ def _resolve_rc_last_green_sha(
             fallback_greens=non_target[1:],
             excluded_shas=excluded,
         )
-        if rng:
-            return chosen
+        return chosen if rng else ""
 
     if non_target:
         return non_target[0]
@@ -1555,6 +1557,34 @@ def _sanitize_cursor(
         if t not in clean_rc_states or clean_rc_states[t]["status"] == "pass"
     ]
 
+    raw_rc_sha_states = cursor.get("rc_sha_states") or {}
+    if not isinstance(raw_rc_sha_states, dict):
+        raise ValueError("rc_sha_states must be an object")
+    clean_rc_sha_states: dict[str, str] = {}
+    for raw_k, raw_v in raw_rc_sha_states.items():
+        if not isinstance(raw_k, str):
+            raise ValueError(
+                "rc_sha_states key must be a 40-character lowercase hex SHA"
+            )
+        sha_k = _require_sha1(raw_k, "rc_sha_states.sha")
+        st_v = str(raw_v or "")
+        if st_v not in ("fail", "infra_error"):
+            raise ValueError(f"invalid rc_sha_states status: {raw_v!r}")
+        clean_rc_sha_states[sha_k] = st_v
+
+    raw_shared_failed = cursor.get("shared_cpu_failed_shas") or []
+    if not isinstance(raw_shared_failed, list):
+        raise ValueError("shared_cpu_failed_shas must be a list")
+    clean_shared_failed: list[str] = []
+    for idx, item in enumerate(raw_shared_failed):
+        if not isinstance(item, str):
+            raise ValueError(
+                f"shared_cpu_failed_shas[{idx}] must be a 40-character lowercase hex SHA"
+            )
+        sf_sha = _require_sha1(item, f"shared_cpu_failed_shas[{idx}]")
+        if sf_sha not in clean_shared_failed:
+            clean_shared_failed.append(sf_sha)
+
     raw_fps = cursor.get("patch_fingerprints") or {}
     if not isinstance(raw_fps, dict):
         raise ValueError("patch_fingerprints must be an object")
@@ -1647,12 +1677,19 @@ def _sanitize_cursor(
     sanitized["probe_history"] = clean_history
     if clean_history and "last_probe_record" not in sanitized:
         sanitized["last_probe_record"] = clean_history[0]
+    if clean_rc_sha_states:
+        sanitized["rc_sha_states"] = dict(sorted(clean_rc_sha_states.items()))
+    if clean_shared_failed:
+        sanitized["shared_cpu_failed_shas"] = clean_shared_failed[
+            :MAX_EPHEMERAL_REVOKED_SHAS
+        ]
 
     protected_controls = _protected_control_shas_in_cursor(sanitized, verified_pin=pin)
     for b_ent in sanitized["rc_branch_states"].values():
         if isinstance(b_ent, dict) and "revoked_shas" in b_ent:
             capped_rev = _cap_revoked_shas(
-                b_ent.get("revoked_shas") or (), protected_controls
+                b_ent.get("revoked_shas") or (),
+                protected_controls,
             )
             if capped_rev:
                 b_ent["revoked_shas"] = capped_rev
@@ -1662,12 +1699,59 @@ def _sanitize_cursor(
     return sanitized
 
 
+def _is_on_main_first_parent_lineage(
+    vllm_repo: Path | None,
+    *,
+    previous_pin: str,
+    candidate_sha: str,
+    main_sha: str = "",
+) -> bool:
+    """Return True iff ``candidate_sha`` advances from ``previous_pin`` along upstream ``main``."""
+    if vllm_repo is None:
+        return True
+    _ensure_commit_fetched(vllm_repo, candidate_sha, depth=250)
+    _ensure_commit_fetched(vllm_repo, previous_pin, depth=64)
+    if not resolve_complete_first_parent_range(vllm_repo, previous_pin, candidate_sha):
+        return False
+
+    eff_main = main_sha.strip() if SHA1_RE.fullmatch(main_sha.strip()) else ""
+    if not eff_main:
+        for ref_name in ("refs/remotes/origin/main", "refs/heads/main"):
+            rev = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(vllm_repo),
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    f"{ref_name}^{{commit}}",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            resolved = rev.stdout.strip()
+            if rev.returncode == 0 and SHA1_RE.fullmatch(resolved):
+                eff_main = resolved
+                break
+    if eff_main:
+        _ensure_commit_fetched(vllm_repo, eff_main, depth=250)
+        if candidate_sha == eff_main:
+            return True
+        if not resolve_complete_first_parent_range(vllm_repo, candidate_sha, eff_main):
+            return False
+    return True
+
+
 def select_pin_bump_candidate(
     probe_records: Sequence[dict[str, Any]],
     *,
     verified_pin: str,
+    excluded_shas: set[str] | frozenset[str] = frozenset(),
+    vllm_repo: Path | None = None,
+    main_sha: str = "",
 ) -> str | None:
-    """Pick the latest healthy probe SHA newer than verified_pin."""
+    """Pick the latest healthy, unrevoked main-line probe SHA newer than verified_pin."""
     pin = _require_sha1(verified_pin, "verified_pin")
     for record in probe_records:
         if not isinstance(record, dict) or record.get("gear") != "probe":
@@ -1679,23 +1763,31 @@ def select_pin_bump_candidate(
         # all remaining entries predate the current pin and must never downgrade it.
         if sha == pin:
             return None
-        if record.get("cpu_status") != "pass":
+        if sha in excluded_shas or record.get("cpu_status") != "pass":
             continue
         ppu_status = record.get("ppu_status")
         skip_reason = record.get("ppu_skip_reason", "none")
         last_ppu_green = str(record.get("last_ppu_green_sha", "")).strip()
         last_ppu_tested = str(record.get("last_ppu_tested_sha", last_ppu_green)).strip()
         last_ppu_res = str(record.get("last_ppu_result_status", "pass")).strip()
+        eligible = False
         if ppu_status == "pass":
-            return sha
-        # A docs-only successor is promotable ONLY when PPU is currently green
-        # (including after any force re-run on last_ppu_tested_sha).
-        if (
+            eligible = True
+        elif (
             ppu_status == "skipped"
             and skip_reason == "allowlisted_non_ppu_changes"
             and SHA1_RE.fullmatch(last_ppu_green)
             and last_ppu_tested == last_ppu_green
             and last_ppu_res == "pass"
+            and last_ppu_green not in excluded_shas
+            and last_ppu_tested not in excluded_shas
+        ):
+            eligible = True
+        if eligible and _is_on_main_first_parent_lineage(
+            vllm_repo,
+            previous_pin=pin,
+            candidate_sha=sha,
+            main_sha=main_sha,
         ):
             return sha
     return None
@@ -1756,6 +1848,7 @@ def route_three_gears(
                 tested_rc_tags=tested_rcs,
                 rc_tag_states=state["rc_tag_states"],
                 rc_branch_states=state["rc_branch_states"],
+                rc_sha_states=state.get("rc_sha_states"),
                 include_failed=force,
             )
             if rc_hit is not None and not override:
@@ -1926,9 +2019,27 @@ def route_three_gears(
                     for rec in newer_than_pin
                     if str(rec.get("upstream_sha", "")).strip() == candidate
                 ]
-                bump_sha = select_pin_bump_candidate(matching, verified_pin=pin) or ""
+                bump_sha = (
+                    select_pin_bump_candidate(
+                        matching,
+                        verified_pin=pin,
+                        excluded_shas=bump_excluded,
+                        vllm_repo=vllm_repo,
+                        main_sha=str(main_sha or ""),
+                    )
+                    or ""
+                )
         else:
-            bump_sha = select_pin_bump_candidate(newer_than_pin, verified_pin=pin) or ""
+            bump_sha = (
+                select_pin_bump_candidate(
+                    newer_than_pin,
+                    verified_pin=pin,
+                    excluded_shas=bump_excluded,
+                    vllm_repo=vllm_repo,
+                    main_sha=str(main_sha or ""),
+                )
+                or ""
+            )
         return {
             "selected_gear": "daily_pin_bump",
             "target_sha": bump_sha,
@@ -1966,9 +2077,13 @@ def route_three_gears(
         last_ppu_tested = effective_probe_override
         state["last_ppu_status"] = "pass"
 
-    # Skip checks ONLY when target_sha and the latest CPU/PPU outcomes are GREEN.
+    shared_cpu_failed = set(state.get("shared_cpu_failed_shas") or ())
+    # Skip checks ONLY when target_sha and the latest CPU/PPU outcomes are GREEN and unrevoked.
     run_cpu = bool(
-        force or target_sha != last_cpu_green or state["last_cpu_status"] != "pass"
+        force
+        or target_sha != last_cpu_green
+        or state["last_cpu_status"] != "pass"
+        or target_sha in shared_cpu_failed
     )
     ppu_diff_base_ok = (not changed_files_base_sha) or (
         _require_sha1(changed_files_base_sha, "changed_files_base_sha")
@@ -1976,16 +2091,20 @@ def route_three_gears(
     )
     if (
         not force
+        and not run_cpu
         and target_sha == last_cpu_green
         and target_sha == last_ppu_green
         and state["last_cpu_status"] == "pass"
         and state["last_ppu_status"] == "pass"
+        and target_sha not in probe_excluded
     ):
         run_ppu = False
         skip_reason = "already_tested"
     elif (
-        state["last_ppu_status"] == "pass"
+        not force
+        and state["last_ppu_status"] == "pass"
         and last_ppu_tested == last_ppu_green
+        and last_ppu_green not in probe_excluded
         and ppu_diff_base_ok
         and should_skip_ppu_for_paths(changed_paths_since_ppu)
     ):
@@ -2188,6 +2307,7 @@ def advance_cursor(
     ppu_status: str = "not_run",
     ppu_skip_reason: str = "none",
     patch_fingerprints: dict[str, str] | None = None,
+    superseded_probe_frontier: bool = False,
 ) -> dict[str, Any]:
     """Update persistent cursor without recording hardware pass for skipped SHAs."""
     pin = _require_sha1(verified_pin, "verified_pin")
@@ -2372,17 +2492,11 @@ def advance_cursor(
             prev_max_passing_rc_num = max(
                 (
                     int(m.group(3))
-                    for t_name in (
-                        *(
-                            k
-                            for k, v in updated["rc_tag_states"].items()
-                            if isinstance(v, dict)
-                            and v.get("status") == "pass"
-                            and v.get("sha") != target_sha
-                        ),
-                        *updated["tested_rc_tags"],
-                    )
+                    for t_name, v in updated["rc_tag_states"].items()
                     if t_name != rc_clean
+                    and isinstance(v, dict)
+                    and v.get("status") == "pass"
+                    and v.get("sha") != target_sha
                     and (m := RC_TAG_RE.fullmatch(t_name))
                     and (int(m.group(1)), int(m.group(2))) == (major, minor)
                 ),
@@ -2454,18 +2568,35 @@ def advance_cursor(
         elif branch_match:
             major, minor = int(branch_match.group(1)), int(branch_match.group(2))
             if rc_passed:
+                prior_br_cur = updated["rc_branch_states"].get(rc_clean) or {}
                 prev_rev = _prior_revoked_list(rc_clean)
-                seeded_before = [
-                    s
-                    for s in _seed_branch_green_history(rc_clean, major, minor)
-                    if s != target_sha
-                ]
+                full_seeded = _seed_branch_green_history(rc_clean, major, minor)
                 _restore_line_sha(major, minor, target_sha)
-                hist = [target_sha, *seeded_before][:20]
+                if target_sha in full_seeded and full_seeded.index(target_sha) >= 1:
+                    hist = full_seeded[:20]
+                    keep_tip_sha = (
+                        str(prior_br_cur.get("sha") or "").strip()
+                        if isinstance(prior_br_cur, dict)
+                        else ""
+                    )
+                    keep_tip_st = (
+                        str(prior_br_cur.get("status") or "pass")
+                        if isinstance(prior_br_cur, dict)
+                        else "pass"
+                    )
+                else:
+                    seeded_before = [s for s in full_seeded if s != target_sha]
+                    hist = [target_sha, *seeded_before][:20]
+                    keep_tip_sha = target_sha
+                    keep_tip_st = "pass"
                 rem_rev = [s for s in prev_rev if s != target_sha]
                 br_entry: dict[str, Any] = {
-                    "sha": target_sha,
-                    "status": "pass",
+                    "sha": keep_tip_sha
+                    if SHA1_RE.fullmatch(keep_tip_sha)
+                    else target_sha,
+                    "status": keep_tip_st
+                    if keep_tip_st in ("pass", "fail", "infra_error")
+                    else "pass",
                     "last_green_sha": hist[0],
                     "green_history": hist,
                 }
@@ -2494,13 +2625,52 @@ def advance_cursor(
             updated["rc_branch_states"] = dict(
                 sorted(updated["rc_branch_states"].items())
             )
+        else:
+            rc_sha_map = dict(updated.get("rc_sha_states") or {})
+            if rc_passed:
+                rc_sha_map.pop(target_sha, None)
+            else:
+                prev_sha_st = rc_sha_map.get(target_sha)
+                if prev_sha_st != "fail" or rc_st == "fail":
+                    rc_sha_map[target_sha] = rc_st
+            if rc_sha_map:
+                updated["rc_sha_states"] = dict(sorted(rc_sha_map.items()))
+            else:
+                updated.pop("rc_sha_states", None)
+
+        if rc_passed and "rc_sha_states" in updated:
+            rc_sha_map = dict(updated["rc_sha_states"])
+            rc_sha_map.pop(target_sha, None)
+            if rc_sha_map:
+                updated["rc_sha_states"] = dict(sorted(rc_sha_map.items()))
+            else:
+                updated.pop("rc_sha_states", None)
+
+        shared_failed = [
+            s
+            for s in (updated.get("shared_cpu_failed_shas") or ())
+            if SHA1_RE.fullmatch(str(s or "").strip())
+        ]
+        if cpu_status == "pass":
+            shared_failed = [s for s in shared_failed if s != target_sha]
+        elif not rc_passed:
+            shared_failed = [
+                target_sha,
+                *(s for s in shared_failed if s != target_sha),
+            ][:MAX_EPHEMERAL_REVOKED_SHAS]
+        if shared_failed:
+            updated["shared_cpu_failed_shas"] = shared_failed
+        else:
+            updated.pop("shared_cpu_failed_shas", None)
+
         protected_rc_controls = _protected_control_shas_in_cursor(
             updated, verified_pin=pin
         )
         for b_ent in updated["rc_branch_states"].values():
             if isinstance(b_ent, dict) and "revoked_shas" in b_ent:
                 capped_rev = _cap_revoked_shas(
-                    b_ent.get("revoked_shas") or (), protected_rc_controls
+                    b_ent.get("revoked_shas") or (),
+                    protected_rc_controls,
                 )
                 if capped_rev:
                     b_ent["revoked_shas"] = capped_rev
@@ -2514,33 +2684,264 @@ def advance_cursor(
         and ppu_status not in ("pass", "fail")
     )
 
+    prior_history = [dict(r) for r in (updated.get("probe_history") or [])]
+    existing_idx = next(
+        (
+            idx
+            for idx, r in enumerate(prior_history)
+            if r.get("upstream_sha") == target_sha
+        ),
+        None,
+    )
+    is_historical_probe = selected_gear == "probe" and (
+        (existing_idx is not None and existing_idx >= 1)
+        or (
+            superseded_probe_frontier
+            and bool(prior_history)
+            and prior_history[0].get("upstream_sha") != target_sha
+        )
+    )
+
+    def _merge_patch_fingerprints() -> None:
+        if cpu_status == "pass" and patch_fingerprints:
+            for k, v in patch_fingerprints.items():
+                assert_zero_sensitive_leaks(k)
+                if (
+                    OPAQUE_PATCH_KEY_RE.fullmatch(k) or SAFE_SYMBOL_RE.fullmatch(k)
+                ) and (v == "additive" or re.fullmatch(r"[0-9a-f]{64}", v)):
+                    updated["patch_fingerprints"][k] = v
+            updated["patch_fingerprints"] = dict(
+                sorted(updated["patch_fingerprints"].items())
+            )
+
+    def _older_ppu_green_from(
+        records: Sequence[dict[str, str]],
+        *,
+        excluded: set[str] | frozenset[str] = frozenset(),
+    ) -> str:
+        for rec_cand in records:
+            up_c = str(rec_cand.get("upstream_sha") or "").strip()
+            if (
+                rec_cand.get("cpu_status") == "pass"
+                and rec_cand.get("ppu_status") == "pass"
+                and SHA1_RE.fullmatch(up_c)
+                and up_c not in excluded
+            ):
+                return up_c
+            gr_c = str(rec_cand.get("last_ppu_green_sha") or "").strip()
+            if (
+                rec_cand.get("last_ppu_result_status") == "pass"
+                and SHA1_RE.fullmatch(gr_c)
+                and gr_c != target_sha
+                and gr_c not in excluded
+            ):
+                return gr_c
+        return pin if pin not in excluded else ""
+
+    def _older_cpu_green_from(records: Sequence[dict[str, str]]) -> str:
+        for rec_cand in records:
+            up_c = str(rec_cand.get("upstream_sha") or "").strip()
+            if rec_cand.get("cpu_status") == "pass" and SHA1_RE.fullmatch(up_c):
+                return up_c
+        return pin
+
+    if is_historical_probe:
+        if not (
+            pre_lane_failure
+            or cpu_status in ("pass", "fail", "infra_error")
+            or ppu_status in ("pass", "fail", "infra_error")
+        ):
+            return updated
+
+        if updated["last_cpu_status"] != "pass":
+            _merge_patch_fingerprints()
+
+        prior_b = prior_history[existing_idx] if existing_idx is not None else None
+        older_slice = (
+            prior_history[existing_idx + 1 :]
+            if existing_idx is not None
+            else prior_history[1:]
+        )
+
+        if pre_lane_failure:
+            rec_cpu = "infra_error" if status == "infra_error" else "fail"
+        elif (
+            cpu_status == "not_run"
+            and status in ("pass", "deferred")
+            and prior_b is not None
+            and prior_b.get("cpu_status") == "pass"
+        ):
+            rec_cpu = "pass"
+        else:
+            rec_cpu = cpu_status
+
+        older_green = _older_ppu_green_from(older_slice)
+        if ppu_status in ("pass", "fail", "infra_error"):
+            b_tested = target_sha
+            if ppu_status == "pass" and rec_cpu == "pass":
+                b_green = target_sha
+                b_res = "pass"
+            else:
+                b_green = older_green
+                b_res = "fail"
+        elif prior_b is not None:
+            b_tested = str(prior_b.get("last_ppu_tested_sha") or older_green)
+            prev_b_green = str(prior_b.get("last_ppu_green_sha") or older_green)
+            b_green = older_green if prev_b_green == target_sha else prev_b_green
+            b_res = (
+                "fail"
+                if (pre_lane_failure and b_tested == target_sha)
+                else str(prior_b.get("last_ppu_result_status") or "pass")
+            )
+            if b_tested == target_sha and b_res != "pass":
+                b_green = older_green
+        else:
+            base_rec = older_slice[0] if older_slice else None
+            b_tested = (
+                str(base_rec.get("last_ppu_tested_sha") or older_green)
+                if base_rec is not None
+                else older_green
+            )
+            b_green = older_green
+            b_res = (
+                str(base_rec.get("last_ppu_result_status") or "pass")
+                if base_rec is not None
+                else "pass"
+            )
+
+        hist_rec = {
+            "gear": "probe",
+            "upstream_sha": target_sha,
+            "cpu_status": rec_cpu,
+            "ppu_status": ppu_status,
+            "ppu_skip_reason": ppu_skip_reason
+            if ppu_skip_reason in VALID_PPU_SKIP_REASONS
+            else "none",
+            "last_ppu_tested_sha": b_tested,
+            "last_ppu_green_sha": b_green,
+            "last_ppu_result_status": b_res,
+        }
+
+        if existing_idx is not None:
+            merged_history = [
+                *prior_history[:existing_idx],
+                hist_rec,
+                *prior_history[existing_idx + 1 :],
+            ][:20]
+            b_pos = existing_idx
+        elif len(prior_history) < 20:
+            merged_history = [prior_history[0], hist_rec, *prior_history[1:]][:20]
+            b_pos = 1
+        else:
+            merged_history = prior_history[:20]
+            b_pos = None
+
+        if b_pos is not None:
+            eff_tested, eff_green, eff_res = b_tested, b_green, b_res
+            for idx in range(b_pos - 1, -1, -1):
+                rec_up = dict(merged_history[idx])
+                up_s = rec_up["upstream_sha"]
+                p_st = rec_up.get("ppu_status", "not_run")
+                c_st = rec_up.get("cpu_status", "not_run")
+                if p_st in ("pass", "fail", "infra_error"):
+                    eff_tested = up_s
+                    if p_st == "pass" and c_st == "pass":
+                        eff_green = up_s
+                        eff_res = "pass"
+                    else:
+                        eff_res = "fail"
+                    rec_up["last_ppu_tested_sha"] = eff_tested
+                    rec_up["last_ppu_green_sha"] = eff_green
+                    rec_up["last_ppu_result_status"] = eff_res
+                else:
+                    if c_st in ("fail", "infra_error") and eff_tested == up_s:
+                        eff_res = "fail"
+                    rec_up["last_ppu_tested_sha"] = eff_tested
+                    rec_up["last_ppu_green_sha"] = eff_green
+                    rec_up["last_ppu_result_status"] = eff_res
+                merged_history[idx] = rec_up
+        elif ppu_status == "pass" and rec_cpu == "pass":
+            # Even when >20 newer records exist, if none of them passed PPU and prior green was `pin`,
+            # `target_sha` can still serve as fallback PPU green for failed newer records.
+            if updated["last_ppu_green_sha"] == pin and not any(
+                r.get("cpu_status") == "pass" and r.get("ppu_status") == "pass"
+                for r in merged_history
+            ):
+                updated["last_ppu_green_sha"] = target_sha
+
+        front = merged_history[0]
+        updated["probe_history"] = merged_history
+        updated["last_probe_record"] = front
+        updated["last_ppu_tested_sha"] = front["last_ppu_tested_sha"]
+        updated["last_ppu_green_sha"] = front["last_ppu_green_sha"]
+        updated["last_ppu_status"] = front["last_ppu_result_status"]
+        if front.get("cpu_status") in ("pass", "fail", "infra_error"):
+            updated["last_cpu_checked_sha"] = front["upstream_sha"]
+            updated["last_cpu_status"] = (
+                "pass" if front["cpu_status"] == "pass" else "fail"
+            )
+        updated["last_cpu_green_sha"] = _older_cpu_green_from(merged_history)
+        return updated
+
+    if cpu_status == "pass" and "shared_cpu_failed_shas" in updated:
+        rem_shared = [
+            s for s in (updated.get("shared_cpu_failed_shas") or ()) if s != target_sha
+        ]
+        if rem_shared:
+            updated["shared_cpu_failed_shas"] = rem_shared
+        else:
+            updated.pop("shared_cpu_failed_shas", None)
+
+    older_without_target = [
+        r for r in prior_history if r.get("upstream_sha") != target_sha
+    ]
+
     if pre_lane_failure:
         updated["last_cpu_checked_sha"] = target_sha
         updated["last_cpu_status"] = "fail"
+        if updated["last_cpu_green_sha"] == target_sha:
+            updated["last_cpu_green_sha"] = _older_cpu_green_from(older_without_target)
         if updated["last_ppu_tested_sha"] == target_sha:
             updated["last_ppu_status"] = "fail"
+        if updated["last_ppu_green_sha"] == target_sha:
+            updated["last_ppu_green_sha"] = _older_ppu_green_from(older_without_target)
     elif cpu_status in ("pass", "fail", "infra_error"):
         updated["last_cpu_checked_sha"] = target_sha
         updated["last_cpu_status"] = "pass" if cpu_status == "pass" else "fail"
         if cpu_status == "pass":
             updated["last_cpu_green_sha"] = target_sha
-            if patch_fingerprints:
-                for k, v in patch_fingerprints.items():
-                    assert_zero_sensitive_leaks(k)
-                    if (
-                        OPAQUE_PATCH_KEY_RE.fullmatch(k) or SAFE_SYMBOL_RE.fullmatch(k)
-                    ) and (v == "additive" or re.fullmatch(r"[0-9a-f]{64}", v)):
-                        updated["patch_fingerprints"][k] = v
-                updated["patch_fingerprints"] = dict(
-                    sorted(updated["patch_fingerprints"].items())
+            _merge_patch_fingerprints()
+        elif updated["last_cpu_green_sha"] == target_sha:
+            updated["last_cpu_green_sha"] = _older_cpu_green_from(older_without_target)
+            if updated["last_ppu_green_sha"] == target_sha:
+                updated["last_ppu_green_sha"] = _older_ppu_green_from(
+                    older_without_target
                 )
+                if updated["last_ppu_tested_sha"] == target_sha:
+                    updated["last_ppu_status"] = "fail"
 
     # Hardware cursor advances ONLY when device smoke actually executed!
     if ppu_status in ("pass", "fail", "infra_error"):
         updated["last_ppu_tested_sha"] = target_sha
-        updated["last_ppu_status"] = "pass" if ppu_status == "pass" else "fail"
-        if ppu_status == "pass":
+        updated["last_ppu_status"] = (
+            "pass"
+            if (ppu_status == "pass" and updated["last_cpu_status"] == "pass")
+            else "fail"
+        )
+        if ppu_status == "pass" and updated["last_cpu_status"] == "pass":
             updated["last_ppu_green_sha"] = target_sha
+        elif updated["last_ppu_green_sha"] == target_sha:
+            updated["last_ppu_green_sha"] = _older_ppu_green_from(older_without_target)
+    else:
+        active_excluded = _collect_excluded_control_shas(updated)
+        if updated["last_ppu_green_sha"] in active_excluded:
+            fallback_p = _older_ppu_green_from(
+                older_without_target, excluded=active_excluded
+            )
+            if SHA1_RE.fullmatch(fallback_p):
+                updated["last_ppu_green_sha"] = fallback_p
+        if updated["last_ppu_tested_sha"] in active_excluded:
+            updated["last_ppu_status"] = "fail"
 
     if selected_gear == "probe" and (
         pre_lane_failure
@@ -4692,31 +5093,106 @@ def publish_sanitized_channels(
 def prepare_pin_bump(
     *,
     repo_root: Path,
-    target_sha: str,
+    target_sha: str = "",
     verified_pin_file: Path | None = None,
     manifest_file: Path | None = None,
     vllm_repo: Path | None = None,
+    cursor: dict[str, Any] | None = None,
+    ls_remote_data: dict[str, Any] | None = None,
+    require_cursor: bool = False,
 ) -> dict[str, str]:
     """Validate and atomically bump ``vllm-main-verified.commit`` and ``manifest.toml``."""
-    target = _require_sha1(target_sha, "target_sha")
     pin_path = verified_pin_file or (
         repo_root / ".github" / "vllm-main-verified.commit"
     )
     manifest_path = manifest_file or (repo_root / "csrc" / "upstream" / "manifest.toml")
     previous = _require_sha1(pin_path.read_text(encoding="utf-8"), "previous_pin")
-    if target == previous:
+
+    def _noop() -> dict[str, str]:
         return {
             "changed": "false",
             "previous_pin": previous,
-            "new_pin": target,
+            "new_pin": previous,
             "title": "",
             "body": "",
         }
+
+    if require_cursor and cursor is None:
+        return _noop()
+
+    main_tip = str((ls_remote_data or {}).get("main_sha") or "").strip()
+    if cursor is not None:
+        state = _sanitize_cursor(cursor, verified_pin=previous)
+        bump_excluded = _collect_excluded_control_shas(
+            state,
+            tags=(ls_remote_data or {}).get("tags"),
+            release_branches=(ls_remote_data or {}).get("release_branches"),
+        )
+        history = list(state.get("probe_history") or [])
+        if not history and state.get("last_probe_record"):
+            history = [state["last_probe_record"]]
+        newer_than_pin: list[dict[str, Any]] = []
+        for rec in history:
+            if not isinstance(rec, dict) or rec.get("gear") != "probe":
+                continue
+            if str(rec.get("upstream_sha", "")).strip() == previous:
+                break
+            newer_than_pin.append(rec)
+        if target_sha.strip():
+            req_target = _require_sha1(target_sha, "target_sha")
+            if req_target == previous:
+                return _noop()
+            if vllm_repo is not None and resolve_complete_first_parent_range(
+                vllm_repo, req_target, previous
+            ):
+                return _noop()
+            matching = [
+                rec
+                for rec in newer_than_pin
+                if str(rec.get("upstream_sha", "")).strip() == req_target
+            ]
+            verified_cand = select_pin_bump_candidate(
+                matching,
+                verified_pin=previous,
+                excluded_shas=bump_excluded,
+                vllm_repo=vllm_repo,
+                main_sha=main_tip,
+            )
+            if verified_cand != req_target:
+                return _noop()
+            target = verified_cand
+        else:
+            verified_cand = select_pin_bump_candidate(
+                newer_than_pin,
+                verified_pin=previous,
+                excluded_shas=bump_excluded,
+                vllm_repo=vllm_repo,
+                main_sha=main_tip,
+            )
+            if not verified_cand:
+                return _noop()
+            target = verified_cand
+    else:
+        if not target_sha.strip():
+            return _noop()
+        target = _require_sha1(target_sha, "target_sha")
+        if target == previous:
+            return _noop()
+
     if vllm_repo is not None:
         forward_range = resolve_complete_first_parent_range(vllm_repo, previous, target)
         if not forward_range:
             raise ValueError(
                 "target_sha must be a strict first-parent descendant of previous_pin"
+            )
+        if not _is_on_main_first_parent_lineage(
+            vllm_repo,
+            previous_pin=previous,
+            candidate_sha=target,
+            main_sha=main_tip,
+        ):
+            raise ValueError(
+                "target_sha must belong to upstream main first-parent history"
             )
 
     if manifest_path.is_file():
@@ -5051,18 +5527,20 @@ def resolve_verified_bisect_control(
     if not ordered:
         return "", None
 
+    ordered_set = set(ordered)
     for cand in ordered:
         if cand == red:
             continue
         _ensure_commit_fetched(vllm_repo, cand, depth=64)
         rng = resolve_complete_first_parent_range(vllm_repo, cand, red)
         if rng:
+            for idx in range(len(rng) - 2, -1, -1):
+                closer = rng[idx]
+                if closer in ordered_set and closer != red:
+                    return closer, rng[idx + 1 :]
             return cand, rng
 
-    first_valid = ordered[0]
-    if first_valid == red:
-        return first_valid, []
-    return first_valid, None
+    return "", None
 
 
 # ---------------------------------------------------------------------------
@@ -6013,6 +6491,18 @@ def run_source_only_build_triage(
 # ---------------------------------------------------------------------------
 
 
+def _load_cursor_file(path: Path | None) -> dict[str, Any] | None:
+    """Load an optional cursor JSON file, rejecting corrupt non-object payloads."""
+    if path is None or not path.is_file():
+        return None
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"cursor file {path} must contain a JSON object, got {type(raw).__name__}"
+        )
+    return raw
+
+
 def _write_github_outputs(path: Path | None, values: dict[str, Any]) -> None:
     lines: list[str] = []
     for key, raw in values.items():
@@ -6095,8 +6585,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     p_bump = sub.add_parser("prepare-pin-bump")
     p_bump.add_argument("--repo-root", type=Path, default=REPO_ROOT)
-    p_bump.add_argument("--target-sha", required=True)
+    p_bump.add_argument("--target-sha", default="")
     p_bump.add_argument("--vllm-repo", type=Path, default=None)
+    p_bump.add_argument("--cursor-file", type=Path, default=None)
+    p_bump.add_argument("--ls-remote-file", type=Path, default=None)
+    p_bump.add_argument("--allow-unverified-target", action="store_true")
     p_bump.add_argument("--output-json", type=Path, default=None)
     p_bump.add_argument("--github-output", type=Path, default=None)
 
@@ -6160,6 +6653,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     p_pub.add_argument("--fetch-upstream-author", action="store_true")
     p_pub.add_argument("--run-url", default="")
     p_pub.add_argument("--cursor-in", type=Path, default=None)
+    p_pub.add_argument("--superseded-probe-frontier", action="store_true")
     p_pub.add_argument("--public-dir", type=Path, required=True)
     p_pub.add_argument("--step-summary", type=Path, default=None)
 
@@ -6199,11 +6693,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ls_data = parse_ls_remote(raw_ls)
         verified_pin = args.verified_pin_file.read_text(encoding="utf-8").strip()
         release_tag = args.release_tag_file.read_text(encoding="utf-8").strip()
-        cursor = (
-            json.loads(args.cursor_file.read_text(encoding="utf-8"))
-            if args.cursor_file and args.cursor_file.is_file()
-            else None
-        )
+        cursor = _load_cursor_file(args.cursor_file)
         changed = (
             parse_changed_paths_lines(
                 args.changed_files_file.read_text(encoding="utf-8").splitlines()
@@ -6251,11 +6741,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "source-build-triage":
         verified_pin = args.verified_pin_file.read_text(encoding="utf-8").strip()
-        sbt_cursor = (
-            json.loads(args.cursor_file.read_text(encoding="utf-8"))
-            if args.cursor_file and args.cursor_file.is_file()
-            else None
-        )
+        sbt_cursor = _load_cursor_file(args.cursor_file)
         sbt_fallbacks = [
             s.strip()
             for s in args.fallback_green_shas.split(",")
@@ -6315,8 +6801,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             and DEFAULT_VERIFIED_PIN_FILE.is_file()
         ):
             bisect_pin = DEFAULT_VERIFIED_PIN_FILE.read_text(encoding="utf-8").strip()
-        if args.cursor_file and args.cursor_file.is_file():
-            raw_cur = json.loads(args.cursor_file.read_text(encoding="utf-8"))
+        raw_cur = _load_cursor_file(args.cursor_file)
+        if raw_cur is not None:
             cur_pin = (
                 bisect_pin
                 if SHA1_RE.fullmatch(bisect_pin)
@@ -6338,15 +6824,24 @@ def main(argv: Sequence[str] | None = None) -> int:
                     bisect_fallbacks.append(cand_s)
         elif SHA1_RE.fullmatch(bisect_pin) and bisect_pin not in bisect_fallbacks:
             bisect_fallbacks.append(bisect_pin)
-        if not green and not bisect_fallbacks:
+        if (
+            not green
+            and not bisect_fallbacks
+            and raw_cur is None
+            and not SHA1_RE.fullmatch(bisect_pin)
+        ):
             raise ValueError("last_green_sha must be a 40-character lowercase hex SHA")
 
-        green, commits = resolve_verified_bisect_control(
-            args.vllm_repo,
-            primary_green=green,
-            red_sha=red,
-            fallback_greens=bisect_fallbacks,
-            excluded_shas=bisect_excluded,
+        green, commits = (
+            resolve_verified_bisect_control(
+                args.vllm_repo,
+                primary_green=green,
+                red_sha=red,
+                fallback_greens=bisect_fallbacks,
+                excluded_shas=bisect_excluded,
+            )
+            if (green or bisect_fallbacks)
+            else ("", None)
         )
         if not commits:
             fallback_outcome = initial_red or ProbeOutcome(
@@ -6472,10 +6967,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if args.command == "prepare-pin-bump":
+        bump_cursor = _load_cursor_file(args.cursor_file)
+        bump_ls = (
+            parse_ls_remote(args.ls_remote_file.read_text(encoding="utf-8"))
+            if args.ls_remote_file and args.ls_remote_file.is_file()
+            else None
+        )
         res = prepare_pin_bump(
             repo_root=args.repo_root,
             target_sha=args.target_sha,
             vllm_repo=args.vllm_repo,
+            cursor=bump_cursor,
+            ls_remote_data=bump_ls,
+            require_cursor=not args.allow_unverified_target,
         )
         res_text = json.dumps(res, indent=2, sort_keys=True) + "\n"
         staging = [args.output_json] if args.output_json is not None else ()
@@ -6649,11 +7153,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     fetch_remote=args.fetch_upstream_author,
                 )
 
-        prev_cursor = (
-            json.loads(args.cursor_in.read_text(encoding="utf-8"))
-            if args.cursor_in and args.cursor_in.is_file()
-            else None
-        )
+        prev_cursor = _load_cursor_file(args.cursor_in)
         effective_rc_tag = args.rc_tag
         if (
             args.gear == "rc_qualify"
@@ -6713,6 +7213,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ppu_status=args.ppu_status,
                 ppu_skip_reason=args.ppu_skip_reason,
                 patch_fingerprints=patch_fps,
+                superseded_probe_frontier=args.superseded_probe_frontier,
             )
             cursor_text = json.dumps(next_cursor, indent=2, sort_keys=True) + "\n"
             assert_zero_sensitive_leaks(cursor_text, staging_paths=[cursor_path])
