@@ -93,7 +93,7 @@ unset PYTHONPATH
 python - <<'PY'
 from vllm_sail.compat import check_vllm_compatibility
 
-check_vllm_compatibility(force=True)
+check_vllm_compatibility(force=True, strict=True)
 PY
 
 log "collect_env"

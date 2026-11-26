@@ -4,7 +4,7 @@
     "previous": "b618d99448fd26830f1609495b49a0819f20823f3f8ff7f92db1fc226dedb9b3"
   },
   "scripts/ci/build_ppu_wheels.sh": {
-    "current": "548cd1720211f2ddd7384a5c9398f32414843ef206ec336f097958cab99b8332",
+    "current": "e219d47372b8cf12a4195b5b7a6418e6d761b20daafe67a295b99048209d42ef",
     "previous": "6e48c98567d899cd9662cd061e1d42269c7745b30c991ac3fa3ddec645518602"
   },
   "scripts/ci/ppu_wheel_manifest.py": {
