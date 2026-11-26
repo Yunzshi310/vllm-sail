@@ -2043,6 +2043,15 @@ def test_accuracy_nightly_notification_when_selection_did_not_confirm_full_run(
             False,
         ),
         (
+            "vllm-project/vllm-sail",
+            "refs/tags/v1.0.0",
+            "workflow_dispatch",
+            "false",
+            "success",
+            "true",
+            False,
+        ),
+        (
             "someone/vllm-sail",
             "refs/heads/releases/v0.34.0",
             "workflow_dispatch",
@@ -2066,6 +2075,80 @@ def test_accuracy_nightly_notification_requires_official_repo_and_branch(
         "needs.select.outputs.full_run": full_run,
     }
     assert bool(expression(notify["if"], context)) == expected
+
+
+@pytest.mark.parametrize(
+    ("repository", "ref", "webhook", "expected"),
+    [
+        ("vllm-project/vllm-sail", "refs/heads/main", "https://example.invalid", True),
+        (
+            "vllm-project/vllm-sail",
+            "refs/heads/releases/v0.34.0",
+            "https://example.invalid",
+            True,
+        ),
+        (
+            "vllm-project/vllm-sail",
+            "refs/heads/releases/v0.35.0",
+            "https://example.invalid",
+            True,
+        ),
+        ("vllm-project/vllm-sail", "refs/heads/Main", "https://example.invalid", False),
+        (
+            "vllm-project/vllm-sail",
+            "refs/heads/Releases/candidate",
+            "https://example.invalid",
+            False,
+        ),
+        (
+            "vllm-project/vllm-sail",
+            "refs/heads/releases/",
+            "https://example.invalid",
+            False,
+        ),
+        (
+            "vllm-project/vllm-sail",
+            "refs/heads/ci/deepseek-v41-forward-perf",
+            "https://example.invalid",
+            False,
+        ),
+        (
+            "vllm-project/vllm-sail",
+            "refs/tags/v1.0.0",
+            "https://example.invalid",
+            False,
+        ),
+        ("VLLM-PROJECT/vllm-sail", "refs/heads/main", "https://example.invalid", False),
+        ("someone/vllm-sail", "refs/heads/main", "https://example.invalid", False),
+        ("vllm-project/vllm-sail", "refs/heads/main", "", False),
+    ],
+)
+def test_accuracy_nightly_notification_configured_step_enforces_exact_case(
+    tmp_path, repository, ref, webhook, expected
+):
+    steps = workflow("ppu-accuracy-nightly.yaml")["jobs"]["notify-summary"]["steps"]
+    configured = next(step for step in steps if step.get("id") == "configured")
+    output = tmp_path / "github_output.txt"
+    result = subprocess.run(
+        ["bash", "-e", "-c", configured["run"]],
+        env={
+            **os.environ,
+            "GITHUB_REPOSITORY": repository,
+            "GITHUB_REF": ref,
+            "PPU_CI_NOTIFY_WEBHOOK_URL": webhook,
+            "GITHUB_OUTPUT": str(output),
+        },
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert result.returncode == 0
+    published = (
+        dict(line.split("=", 1) for line in output.read_text().splitlines())
+        if output.exists()
+        else {}
+    )
+    assert (published.get("enabled") == "true") is expected
 
 
 @pytest.mark.parametrize("models", ["", " \t"])
@@ -2465,6 +2548,7 @@ def test_accuracy_nightly_hardening_target_trust_digest_pin_and_cron_concurrency
         assert expression(group_expr, override_ctx) == f"accuracy-nightly-{version}"
     dev_ctx = {
         "github.event_name": "workflow_dispatch",
+        "github.ref_type": "branch",
         "github.ref": "refs/heads/ci/deepseek-v41-forward-perf",
         "github.ref_name": "ci/deepseek-v41-forward-perf",
         "inputs.target_ref": "",
@@ -2473,6 +2557,28 @@ def test_accuracy_nightly_hardening_target_trust_digest_pin_and_cron_concurrency
     assert (
         expression(group_expr, dev_ctx)
         == "accuracy-nightly-dev-ci/deepseek-v41-forward-perf"
+    )
+    branch_same_name_ctx = {
+        "github.event_name": "workflow_dispatch",
+        "github.ref_type": "branch",
+        "github.ref": "refs/heads/v1.0.0",
+        "github.ref_name": "v1.0.0",
+        "inputs.target_ref": "",
+        "vars.PPU_NIGHTLY_SCHEDULE_DISABLED": "",
+    }
+    assert expression(group_expr, branch_same_name_ctx) == "accuracy-nightly-dev-v1.0.0"
+    tag_ctx = {
+        "github.event_name": "workflow_dispatch",
+        "github.ref_type": "tag",
+        "github.ref": "refs/tags/v1.0.0",
+        "github.ref_name": "v1.0.0",
+        "inputs.target_ref": "",
+        "vars.PPU_NIGHTLY_SCHEDULE_DISABLED": "",
+    }
+    assert expression(group_expr, tag_ctx) == "accuracy-nightly-main"
+    assert (
+        expression(group_expr, {**tag_ctx, "inputs.target_ref": "releases/v0.34.0"})
+        == "accuracy-nightly-v0.34.0"
     )
     for target, expected_group in (
         ("releases/v0.34.0", "accuracy-nightly-v0.34.0"),
