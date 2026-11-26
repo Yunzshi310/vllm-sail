@@ -7717,3 +7717,218 @@ const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
         assert unres_payload["bisect_status"] == "unresolved_history"
         assert unres_payload["last_good_sha"] == ""
         assert unres_payload["first_failing_sha"] == ""
+
+        # [R1 B4] Passing unresolved bisect JSON (`last_good_sha=""`) to `publish` must NOT
+        # backfill `last_good_sha` with `verified_pin` (especially when `verified_pin == red`!):
+        pub_unres_dir = tmp_path / f"pub-unres-{bad_ctrl[:8]}"
+        assert (
+            post_merge.main(
+                [
+                    "publish",
+                    "--gear",
+                    "rc_qualify",
+                    "--status",
+                    "fail",
+                    "--sail-sha",
+                    "f" * 40,
+                    "--upstream-sha",
+                    sha_d,
+                    "--verified-pin-file",
+                    str(bad_pin),
+                    "--rc-tag",
+                    branch,
+                    "--cpu-status",
+                    "pass",
+                    "--ppu-status",
+                    "fail",
+                    "--failure-stage",
+                    "rc_model_sanity",
+                    "--bisect-result-json",
+                    str(out_unres),
+                    "--public-dir",
+                    str(pub_unres_dir),
+                ]
+            )
+            == 0
+        )
+        pub_unres_sum = json.loads(
+            (pub_unres_dir / "public-summary.json").read_text(encoding="utf-8")
+        )
+        assert pub_unres_sum["bisect"]["last_good_sha"] is None
+        assert pub_unres_sum["bisect"]["first_failing_sha"] is None
+
+    # [R1 B1] Failed RC tag overwritten by a successful retag (`v0.35.0rc1(B)=fail` -> `v0.35.0rc1(C)=pass`)
+    # preserves `B`'s revocation across `daily_pin_bump` and `prepare_pin_bump` until `B` is requalified:
+    cur_b1_fail = post_merge.advance_cursor(
+        cur_main_b,
+        verified_pin=pin,
+        selected_gear="rc_qualify",
+        target_sha=sha_b,
+        rc_tag="v0.35.0rc1",
+        status="fail",
+        cpu_status="pass",
+        ppu_status="fail",
+    )
+    cur_b1_retag_c = post_merge.advance_cursor(
+        cur_b1_fail,
+        verified_pin=pin,
+        selected_gear="rc_qualify",
+        target_sha=sha_c,
+        rc_tag="v0.35.0rc1",
+        status="pass",
+        cpu_status="pass",
+        ppu_status="pass",
+    )
+    assert sha_b in post_merge._collect_excluded_control_shas(cur_b1_retag_c)
+    assert (
+        post_merge.route_three_gears(
+            ls_remote_data={"main_sha": sha_c, "tags": {"v0.35.0rc1": sha_c}},
+            verified_pin=pin,
+            release_baseline_tag="v0.34.0",
+            requested_gear="daily_pin_bump",
+            cursor=cur_b1_retag_c,
+            vllm_repo=repo,
+        )["target_sha"]
+        == sha_a
+    )
+    (pin_repo / ".github" / "vllm-main-verified.commit").write_text(
+        pin + "\n", encoding="utf-8"
+    )
+    (pin_repo / "csrc" / "upstream" / "manifest.toml").write_text(
+        f'upstream_ref = "{pin}"\n', encoding="utf-8"
+    )
+    assert (
+        post_merge.prepare_pin_bump(
+            repo_root=pin_repo,
+            target_sha=sha_b,
+            vllm_repo=repo,
+            cursor=cur_b1_retag_c,
+        )["changed"]
+        == "false"
+    )
+    cur_b1_requal = post_merge.advance_cursor(
+        cur_b1_retag_c,
+        verified_pin=pin,
+        selected_gear="rc_qualify",
+        target_sha=sha_b,
+        rc_tag="",
+        status="pass",
+        cpu_status="pass",
+        ppu_status="pass",
+    )
+    assert sha_b not in post_merge._collect_excluded_control_shas(cur_b1_requal)
+
+    # [R1 B3] `A pass -> B fail -> C pass -> historical B pass` on RC branch preserves `last_green_sha == C`:
+    cur_b3_a = post_merge.advance_cursor(
+        cur_a,
+        verified_pin=pin,
+        selected_gear="rc_qualify",
+        target_sha=sha_a,
+        rc_tag=branch,
+        status="pass",
+        cpu_status="pass",
+        ppu_status="pass",
+    )
+    cur_b3_bfail = post_merge.advance_cursor(
+        cur_b3_a,
+        verified_pin=pin,
+        selected_gear="rc_qualify",
+        target_sha=sha_b,
+        rc_tag=branch,
+        status="fail",
+        cpu_status="pass",
+        ppu_status="fail",
+    )
+    cur_b3_cpass = post_merge.advance_cursor(
+        cur_b3_bfail,
+        verified_pin=pin,
+        selected_gear="rc_qualify",
+        target_sha=sha_c,
+        rc_tag=branch,
+        status="pass",
+        cpu_status="pass",
+        ppu_status="pass",
+    )
+    cur_b3_bpass = post_merge.advance_cursor(
+        cur_b3_cpass,
+        verified_pin=pin,
+        selected_gear="rc_qualify",
+        target_sha=sha_b,
+        rc_tag=branch,
+        status="pass",
+        cpu_status="pass",
+        ppu_status="pass",
+    )
+    assert cur_b3_bpass["rc_branch_states"][branch]["last_green_sha"] == sha_c
+    assert cur_b3_bpass["rc_branch_states"][branch]["green_history"] == [
+        sha_c,
+        sha_b,
+        sha_a,
+    ]
+
+    # [R1 B2] `daily-pin-bump` JS writer aborts if `heads/main` moved after `prep`:
+    if node_bin:
+        daily_writer_js = next(
+            s["with"]["script"]
+            for s in daily_steps
+            if s.get("uses", "").startswith("actions/github-script@")
+        )
+        writer_driver = tmp_path / "b2_writer_driver.cjs"
+        writer_driver.write_text(
+            """
+const fs = require("node:fs");
+const p = JSON.parse(fs.readFileSync(0, "utf8"));
+let wroteBranch = false;
+const api = {
+  git: {
+    getRef: async (a) => a.ref === "heads/main" ? { data: { object: { sha: p.liveMain } } } : { data: {} },
+    getCommit: async (a) => ({ data: { tree: { sha: "tree-" + a.commit_sha } } }),
+    createBlob: async (a) => ({ data: { sha: a.content } }),
+    createTree: async () => ({ data: { sha: "tree" } }),
+    createCommit: async () => ({ data: { sha: "commit" } }),
+    updateRef: async () => { wroteBranch = true; return { data: {} }; },
+  },
+  pulls: { list: async () => ({ data: [{ number: 1 }] }), update: async () => ({ data: {} }) },
+};
+const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+const read = (path, fmt) => path === "/tmp/pin-bump.json" ? JSON.stringify(p.meta) : fs.readFileSync(path, fmt);
+new AsyncFunction("github", "context", "require", p.script)(
+  { rest: api },
+  { repo: { owner: "o", repo: "r" }, sha: p.prepSail },
+  (id) => id === "fs" ? { readFileSync: read } : require(id)
+).then(() => {
+  console.log(JSON.stringify({ ok: true, wroteBranch }));
+}).catch((e) => {
+  console.log(JSON.stringify({ ok: false, wroteBranch, message: e.message }));
+});
+""".strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        race_proc = subprocess.run(
+            [node_bin, str(writer_driver)],
+            input=json.dumps(
+                {
+                    "script": daily_writer_js,
+                    "prepSail": "1" * 40,
+                    "liveMain": "2" * 40,
+                    "meta": {
+                        "changed": "true",
+                        "previous_pin": pin,
+                        "new_pin": sha_b,
+                        "sail_base_sha": "1" * 40,
+                        "title": "bump",
+                        "body": "body",
+                    },
+                }
+            ),
+            cwd=str(pin_repo),
+            env={**os.environ, "SAIL_MAIN_SHA": "1" * 40},
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        race_out = json.loads(race_proc.stdout)
+        assert race_out["ok"] is False
+        assert race_out["wroteBranch"] is False
+        assert "heads/main advanced" in race_out["message"]

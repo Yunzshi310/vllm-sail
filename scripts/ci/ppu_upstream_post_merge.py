@@ -616,6 +616,7 @@ def select_newest_rc_tag(
     rc_tag_states: dict[str, dict[str, str]] | None = None,
     rc_branch_states: dict[str, dict[str, Any]] | None = None,
     rc_sha_states: dict[str, str] | None = None,
+    rc_line_revoked_shas: dict[str, list[str]] | None = None,
     include_failed: bool = False,
 ) -> tuple[str, str] | None:
     """Return ``(rc_tag, commit_sha)`` for the newest eligible ``vX.Y.0rc*``."""
@@ -627,6 +628,7 @@ def select_newest_rc_tag(
     states = rc_tag_states or {}
     br_states = rc_branch_states or {}
     sha_states = rc_sha_states or {}
+    line_revoked = rc_line_revoked_shas or {}
 
     candidates: list[tuple[tuple[int, int, int], str, str]] = []
     for tag, sha in tags.items():
@@ -646,6 +648,8 @@ def select_newest_rc_tag(
                 continue
         if not include_failed:
             if sha in sha_states and sha_states[sha] != "pass":
+                continue
+            if sha in (line_revoked.get(f"v{major}.{minor}.0") or ()):
                 continue
             prior_br = br_states.get(f"releases/v{major}.{minor}.0")
             if isinstance(prior_br, dict):
@@ -672,6 +676,7 @@ def select_newest_rc_target(
     rc_tag_states: dict[str, dict[str, str]] | None = None,
     rc_branch_states: dict[str, dict[str, str]] | None = None,
     rc_sha_states: dict[str, str] | None = None,
+    rc_line_revoked_shas: dict[str, list[str]] | None = None,
     include_failed: bool = False,
 ) -> tuple[str, str] | None:
     """Return ``(rc_ref, commit_sha)`` for the newest active-window RC tag or branch.
@@ -689,6 +694,7 @@ def select_newest_rc_target(
         rc_tag_states=rc_tag_states,
         rc_branch_states=rc_branch_states,
         rc_sha_states=rc_sha_states,
+        rc_line_revoked_shas=rc_line_revoked_shas,
         include_failed=include_failed,
     )
     if tag_hit is not None:
@@ -767,6 +773,7 @@ def _resolve_unique_rc_ref_for_sha(
     release_baseline_tag: str = "",
     rc_branch_states: dict[str, Any] | None = None,
     rc_tag_states: dict[str, Any] | None = None,
+    rc_line_revoked_shas: dict[str, Any] | None = None,
     tested_rc_tags: Sequence[str] = (),
 ) -> str:
     """Resolve a 40-char RC target SHA to its unique release ref, failing closed on ambiguity."""
@@ -781,6 +788,7 @@ def _resolve_unique_rc_ref_for_sha(
     )
     br_states = rc_branch_states or {}
     tg_states = rc_tag_states or {}
+    line_revs = rc_line_revoked_shas or {}
     tested_set = set(tested_rc_tags)
 
     tracked_lines: set[tuple[int, int]] = set()
@@ -792,6 +800,10 @@ def _resolve_unique_rc_ref_for_sha(
         tm = RC_TAG_RE.fullmatch(tg_name)
         if tm:
             tracked_lines.add((int(tm.group(1)), int(tm.group(2))))
+    for lk_name in line_revs:
+        lm = RELEASE_LINE_RE.fullmatch(str(lk_name))
+        if lm:
+            tracked_lines.add((int(lm.group(1)), int(lm.group(2))))
 
     def _is_eligible_line(maj: int, minr: int) -> bool:
         if (maj, minr) in tracked_lines:
@@ -846,6 +858,14 @@ def _resolve_unique_rc_ref_for_sha(
                 int(tm.group(3)),
             )
             _slot((maj, minr))["tags"].append((rc_num, tg_name))
+
+    for lk_name, lk_revs in line_revs.items():
+        lm = RELEASE_LINE_RE.fullmatch(str(lk_name))
+        if lm and isinstance(lk_revs, list) and clean_sha in lk_revs:
+            maj, minr = int(lm.group(1)), int(lm.group(2))
+            slot = _slot((maj, minr))
+            if not slot["branch"]:
+                slot["branch"] = f"releases/v{maj}.{minr}.0"
 
     if not matched_by_line:
         return ""
@@ -1012,6 +1032,7 @@ def _collect_excluded_control_shas(
     rc_branch_states = (state or {}).get("rc_branch_states") or {}
     rc_tag_states = (state or {}).get("rc_tag_states") or {}
     rc_sha_states = (state or {}).get("rc_sha_states") or {}
+    rc_line_revoked = (state or {}).get("rc_line_revoked_shas") or {}
     shared_cpu_failed = (state or {}).get("shared_cpu_failed_shas") or ()
     line, max_rc_num = _match_rc_line_context(
         state,
@@ -1047,6 +1068,13 @@ def _collect_excluded_control_shas(
             s = str(raw_sha or "").strip()
             if raw_st != "pass" and SHA1_RE.fullmatch(s):
                 excluded.add(s)
+    if isinstance(rc_line_revoked, dict):
+        for rev_items in rc_line_revoked.values():
+            if isinstance(rev_items, list):
+                for raw_rev in rev_items:
+                    s = str(raw_rev or "").strip()
+                    if SHA1_RE.fullmatch(s):
+                        excluded.add(s)
     for raw_shared in shared_cpu_failed:
         s = str(raw_shared or "").strip()
         if SHA1_RE.fullmatch(s):
@@ -1464,6 +1492,19 @@ def _sanitize_cursor(
                 rs = _require_sha1(item, f"rc_branch_states.revoked_shas[{idx}]")
                 if rs not in revoked_list:
                     revoked_list.append(rs)
+        superseded_list: list[str] = []
+        raw_sup_val = raw_entry.get("superseded_shas")
+        if raw_sup_val is not None:
+            if not isinstance(raw_sup_val, list):
+                raise ValueError("rc_branch_states.superseded_shas must be a list")
+            for idx, item in enumerate(raw_sup_val):
+                if not isinstance(item, str):
+                    raise ValueError(
+                        f"rc_branch_states.superseded_shas[{idx}] must be a 40-character lowercase hex SHA"
+                    )
+                ss = _require_sha1(item, f"rc_branch_states.superseded_shas[{idx}]")
+                if ss not in superseded_list:
+                    superseded_list.append(ss)
         raw_green = raw_entry.get("last_green_sha")
         if raw_green is not None and raw_green != "":
             if not isinstance(raw_green, str):
@@ -1481,6 +1522,9 @@ def _sanitize_cursor(
             entry_clean["green_history"] = hist
         if revoked_list:
             entry_clean["revoked_shas"] = revoked_list
+            kept_sup = [s for s in superseded_list if s in revoked_list]
+            if kept_sup:
+                entry_clean["superseded_shas"] = kept_sup
         clean_branch_states[br_clean] = entry_clean
 
     # Enforce cross-entry fail-closed SHA verdict per release line (`fail` > `infra_error` > `pass`).
@@ -1550,6 +1594,14 @@ def _sanitize_cursor(
                 b_ent["last_green_sha"] = rem_hist[0]
                 b_ent["green_history"] = rem_hist
             b_ent["revoked_shas"] = bad_order
+            if "superseded_shas" in b_ent:
+                rem_sup = [
+                    s for s in (b_ent.get("superseded_shas") or ()) if s in bad_by_sha
+                ]
+                if rem_sup:
+                    b_ent["superseded_shas"] = rem_sup
+                else:
+                    b_ent.pop("superseded_shas", None)
 
     tested_rcs = [
         t
@@ -1571,6 +1623,32 @@ def _sanitize_cursor(
         if st_v not in ("fail", "infra_error"):
             raise ValueError(f"invalid rc_sha_states status: {raw_v!r}")
         clean_rc_sha_states[sha_k] = st_v
+
+    raw_rc_line_revs = cursor.get("rc_line_revoked_shas") or {}
+    if not isinstance(raw_rc_line_revs, dict):
+        raise ValueError("rc_line_revoked_shas must be an object")
+    clean_rc_line_revs: dict[str, list[str]] = {}
+    for raw_line_k, raw_line_v in raw_rc_line_revs.items():
+        if not isinstance(raw_line_k, str) or not RELEASE_LINE_RE.fullmatch(
+            raw_line_k.strip()
+        ):
+            raise ValueError(
+                f"invalid release line key in rc_line_revoked_shas: {raw_line_k!r}"
+            )
+        if not isinstance(raw_line_v, list):
+            raise ValueError("rc_line_revoked_shas entry must be a list")
+        lk_clean = raw_line_k.strip()
+        lv_clean: list[str] = []
+        for idx, item in enumerate(raw_line_v):
+            if not isinstance(item, str):
+                raise ValueError(
+                    f"rc_line_revoked_shas[{lk_clean!r}][{idx}] must be a 40-character lowercase hex SHA"
+                )
+            s = _require_sha1(item, f"rc_line_revoked_shas[{lk_clean!r}][{idx}]")
+            if s not in lv_clean:
+                lv_clean.append(s)
+        if lv_clean:
+            clean_rc_line_revs[lk_clean] = lv_clean
 
     raw_shared_failed = cursor.get("shared_cpu_failed_shas") or []
     if not isinstance(raw_shared_failed, list):
@@ -1679,6 +1757,8 @@ def _sanitize_cursor(
         sanitized["last_probe_record"] = clean_history[0]
     if clean_rc_sha_states:
         sanitized["rc_sha_states"] = dict(sorted(clean_rc_sha_states.items()))
+    if clean_rc_line_revs:
+        sanitized["rc_line_revoked_shas"] = dict(sorted(clean_rc_line_revs.items()))
     if clean_shared_failed:
         sanitized["shared_cpu_failed_shas"] = clean_shared_failed[
             :MAX_EPHEMERAL_REVOKED_SHAS
@@ -1695,6 +1775,16 @@ def _sanitize_cursor(
                 b_ent["revoked_shas"] = capped_rev
             else:
                 b_ent.pop("revoked_shas", None)
+    if "rc_line_revoked_shas" in sanitized:
+        capped_lines: dict[str, list[str]] = {}
+        for lk, lv in sanitized["rc_line_revoked_shas"].items():
+            capped_lv = _cap_revoked_shas(lv, protected_controls)
+            if capped_lv:
+                capped_lines[lk] = capped_lv
+        if capped_lines:
+            sanitized["rc_line_revoked_shas"] = dict(sorted(capped_lines.items()))
+        else:
+            sanitized.pop("rc_line_revoked_shas", None)
 
     return sanitized
 
@@ -1849,6 +1939,7 @@ def route_three_gears(
                 rc_tag_states=state["rc_tag_states"],
                 rc_branch_states=state["rc_branch_states"],
                 rc_sha_states=state.get("rc_sha_states"),
+                rc_line_revoked_shas=state.get("rc_line_revoked_shas"),
                 include_failed=force,
             )
             if rc_hit is not None and not override:
@@ -1881,6 +1972,7 @@ def route_three_gears(
                         release_baseline_tag=release_baseline_tag,
                         rc_branch_states=state["rc_branch_states"],
                         rc_tag_states=state["rc_tag_states"],
+                        rc_line_revoked_shas=state.get("rc_line_revoked_shas"),
                         tested_rc_tags=tested_rcs,
                     )
             else:
@@ -1891,6 +1983,7 @@ def route_three_gears(
                     tested_rc_tags=tested_rcs,
                     rc_tag_states=state["rc_tag_states"],
                     rc_branch_states=state["rc_branch_states"],
+                    rc_line_revoked_shas=state.get("rc_line_revoked_shas"),
                     include_failed=force,
                 )
                 if rc_hit is None:
@@ -2446,6 +2539,20 @@ def advance_cursor(
                     b_cur["revoked_shas"] = rem_rev
                 else:
                     b_cur.pop("revoked_shas", None)
+            line_k = f"v{maj}.{minr}.0"
+            if (
+                "rc_line_revoked_shas" in updated
+                and line_k in updated["rc_line_revoked_shas"]
+            ):
+                rem_lk = [
+                    s for s in updated["rc_line_revoked_shas"][line_k] if s != good_sha
+                ]
+                if rem_lk:
+                    updated["rc_line_revoked_shas"][line_k] = rem_lk
+                else:
+                    updated["rc_line_revoked_shas"].pop(line_k, None)
+                if not updated["rc_line_revoked_shas"]:
+                    updated.pop("rc_line_revoked_shas", None)
 
         if not rc_clean and SHA1_RE.fullmatch(target_sha):
             rc_clean = _resolve_unique_rc_ref_for_sha(
@@ -2455,6 +2562,7 @@ def advance_cursor(
                 release_baseline_tag="",
                 rc_branch_states=updated["rc_branch_states"],
                 rc_tag_states=updated["rc_tag_states"],
+                rc_line_revoked_shas=updated.get("rc_line_revoked_shas"),
                 tested_rc_tags=updated["tested_rc_tags"],
             )
             tag_match = RC_TAG_RE.fullmatch(rc_clean) if rc_clean else None
@@ -2503,6 +2611,32 @@ def advance_cursor(
                 default=-1,
             )
             branch_key = f"releases/v{major}.{minor}.0"
+            line_key = f"v{major}.{minor}.0"
+            displaced_bad_sha = ""
+            if isinstance(prior_tag, dict):
+                old_sha = str(prior_tag.get("sha") or "").strip()
+                old_st = str(prior_tag.get("status") or "").strip()
+                if (
+                    SHA1_RE.fullmatch(old_sha)
+                    and old_sha != target_sha
+                    and old_st in ("fail", "infra_error")
+                ):
+                    displaced_bad_sha = old_sha
+                    line_map = dict(updated.get("rc_line_revoked_shas") or {})
+                    prev_line_list = list(line_map.get(line_key) or [])
+                    line_map[line_key] = [
+                        displaced_bad_sha,
+                        *(s for s in prev_line_list if s != displaced_bad_sha),
+                    ]
+                    updated["rc_line_revoked_shas"] = dict(sorted(line_map.items()))
+                    if branch_key in updated["rc_branch_states"]:
+                        br_dis = dict(updated["rc_branch_states"][branch_key])
+                        prev_br_rev = _prior_revoked_list(branch_key)
+                        br_dis["revoked_shas"] = [
+                            displaced_bad_sha,
+                            *(s for s in prev_br_rev if s != displaced_bad_sha),
+                        ]
+                        updated["rc_branch_states"][branch_key] = br_dis
             seeded_before = (
                 _seed_branch_green_history(
                     branch_key, major, minor, exclude_tag=rc_clean
@@ -2569,27 +2703,52 @@ def advance_cursor(
             major, minor = int(branch_match.group(1)), int(branch_match.group(2))
             if rc_passed:
                 prior_br_cur = updated["rc_branch_states"].get(rc_clean) or {}
+                prior_sup = [
+                    str(x).strip()
+                    for x in (prior_br_cur.get("superseded_shas") or ())
+                    if SHA1_RE.fullmatch(str(x or "").strip())
+                ]
                 prev_rev = _prior_revoked_list(rc_clean)
                 full_seeded = _seed_branch_green_history(rc_clean, major, minor)
                 _restore_line_sha(major, minor, target_sha)
+                rem_rev = [s for s in prev_rev if s != target_sha]
+                prior_tip_sha = (
+                    str(prior_br_cur.get("sha") or "").strip()
+                    if isinstance(prior_br_cur, dict)
+                    else ""
+                )
+                prior_tip_st = (
+                    str(prior_br_cur.get("status") or "pass")
+                    if isinstance(prior_br_cur, dict)
+                    else "pass"
+                )
                 if target_sha in full_seeded and full_seeded.index(target_sha) >= 1:
                     hist = full_seeded[:20]
-                    keep_tip_sha = (
-                        str(prior_br_cur.get("sha") or "").strip()
-                        if isinstance(prior_br_cur, dict)
-                        else ""
-                    )
-                    keep_tip_st = (
-                        str(prior_br_cur.get("status") or "pass")
-                        if isinstance(prior_br_cur, dict)
-                        else "pass"
-                    )
+                    keep_tip_sha = prior_tip_sha
+                    keep_tip_st = prior_tip_st
+                    next_sup = [s for s in prior_sup if s in rem_rev]
+                elif target_sha in prior_sup and full_seeded:
+                    # Historical previously-failed SHA requalified after a newer green
+                    # frontier (`full_seeded[0]`) already passed behind it: preserve `full_seeded[0]`.
+                    hist = [
+                        full_seeded[0],
+                        target_sha,
+                        *(s for s in full_seeded[1:] if s != target_sha),
+                    ][:20]
+                    keep_tip_sha = prior_tip_sha
+                    keep_tip_st = prior_tip_st
+                    next_sup = [
+                        s for s in prior_sup if s != target_sha and s in rem_rev
+                    ]
                 else:
                     seeded_before = [s for s in full_seeded if s != target_sha]
                     hist = [target_sha, *seeded_before][:20]
                     keep_tip_sha = target_sha
                     keep_tip_st = "pass"
-                rem_rev = [s for s in prev_rev if s != target_sha]
+                    next_sup = []
+                    for s in (*prior_sup, *rem_rev):
+                        if s in rem_rev and s not in next_sup:
+                            next_sup.append(s)
                 br_entry: dict[str, Any] = {
                     "sha": keep_tip_sha
                     if SHA1_RE.fullmatch(keep_tip_sha)
@@ -2602,7 +2761,15 @@ def advance_cursor(
                 }
                 if rem_rev:
                     br_entry["revoked_shas"] = rem_rev
+                    if next_sup:
+                        br_entry["superseded_shas"] = next_sup
             else:
+                prior_br_cur = updated["rc_branch_states"].get(rc_clean) or {}
+                prior_sup = [
+                    str(x).strip()
+                    for x in (prior_br_cur.get("superseded_shas") or ())
+                    if SHA1_RE.fullmatch(str(x or "").strip())
+                ]
                 prev_rev = _prior_revoked_list(rc_clean)
                 _revoke_line_sha(major, minor, target_sha, rc_st)
                 hist = [
@@ -2610,17 +2777,21 @@ def advance_cursor(
                     for s in _seed_branch_green_history(rc_clean, major, minor)
                     if s != target_sha
                 ][:20]
+                new_rev = [
+                    target_sha,
+                    *(s for s in prev_rev if s != target_sha),
+                ]
                 br_entry = {
                     "sha": target_sha,
                     "status": rc_st,
-                    "revoked_shas": [
-                        target_sha,
-                        *(s for s in prev_rev if s != target_sha),
-                    ],
+                    "revoked_shas": new_rev,
                 }
                 if hist:
                     br_entry["last_green_sha"] = hist[0]
                     br_entry["green_history"] = hist
+                kept_sup_fail = [s for s in prior_sup if s in new_rev]
+                if kept_sup_fail:
+                    br_entry["superseded_shas"] = kept_sup_fail
             updated["rc_branch_states"][rc_clean] = br_entry
             updated["rc_branch_states"] = dict(
                 sorted(updated["rc_branch_states"].items())
@@ -2674,8 +2845,30 @@ def advance_cursor(
                 )
                 if capped_rev:
                     b_ent["revoked_shas"] = capped_rev
+                    if "superseded_shas" in b_ent:
+                        capped_set = set(capped_rev)
+                        kept_s = [
+                            s
+                            for s in (b_ent.get("superseded_shas") or ())
+                            if s in capped_set
+                        ]
+                        if kept_s:
+                            b_ent["superseded_shas"] = kept_s
+                        else:
+                            b_ent.pop("superseded_shas", None)
                 else:
                     b_ent.pop("revoked_shas", None)
+                    b_ent.pop("superseded_shas", None)
+        if "rc_line_revoked_shas" in updated:
+            capped_rc_lines: dict[str, list[str]] = {}
+            for lk, lv in updated["rc_line_revoked_shas"].items():
+                capped_lv = _cap_revoked_shas(lv or (), protected_rc_controls)
+                if capped_lv:
+                    capped_rc_lines[lk] = capped_lv
+            if capped_rc_lines:
+                updated["rc_line_revoked_shas"] = dict(sorted(capped_rc_lines.items()))
+            else:
+                updated.pop("rc_line_revoked_shas", None)
         return updated
 
     pre_lane_failure = (
@@ -4906,7 +5099,15 @@ def publish_sanitized_channels(
     runtime_digest = extract_image_digest(runtime_image)
 
     safe_first_bad = first_failing_sha if SHA1_RE.fullmatch(first_failing_sha) else ""
-    safe_last_good = last_good_sha if SHA1_RE.fullmatch(last_good_sha) else pin
+    safe_last_good = (
+        last_good_sha
+        if (
+            SHA1_RE.fullmatch(last_good_sha)
+            and last_good_sha != up_sha
+            and last_good_sha != safe_first_bad
+        )
+        else ""
+    )
 
     triage = (
         classify_failure(
@@ -4990,7 +5191,7 @@ def publish_sanitized_channels(
         },
         "bisect": {
             "first_failing_sha": (safe_first_bad or None) if status == "fail" else None,
-            "last_good_sha": safe_last_good if status == "fail" else None,
+            "last_good_sha": (safe_last_good or None) if status == "fail" else None,
             "steps": max(0, min(int(bisect_steps), 64)),
             "first_failing_author": safe_author or None,
         },
@@ -5107,12 +5308,31 @@ def prepare_pin_bump(
     )
     manifest_path = manifest_file or (repo_root / "csrc" / "upstream" / "manifest.toml")
     previous = _require_sha1(pin_path.read_text(encoding="utf-8"), "previous_pin")
+    sail_base_sha = ""
+    if (repo_root / ".git").exists():
+        rev_sail = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo_root),
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "HEAD^{commit}",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        cand_sail = rev_sail.stdout.strip()
+        if rev_sail.returncode == 0 and SHA1_RE.fullmatch(cand_sail):
+            sail_base_sha = cand_sail
 
     def _noop() -> dict[str, str]:
         return {
             "changed": "false",
             "previous_pin": previous,
             "new_pin": previous,
+            "sail_base_sha": sail_base_sha,
             "title": "",
             "body": "",
         }
@@ -5225,6 +5445,7 @@ def prepare_pin_bump(
         "changed": "true",
         "previous_pin": previous,
         "new_pin": target,
+        "sail_base_sha": sail_base_sha,
         "title": title,
         "body": body,
     }
@@ -6131,7 +6352,7 @@ def run_source_only_build_triage(
                 is_public=False,
                 bisect_status="baseline_control_failed",
                 first_failing="",
-                last_good=control,
+                last_good="",
                 steps_executed=1,
                 probe_steps_on_range=0,
                 history=[
@@ -6189,7 +6410,7 @@ def run_source_only_build_triage(
                     is_public=False,
                     bisect_status="baseline_control_failed",
                     first_failing="",
-                    last_good=control,
+                    last_good="",
                     steps_executed=3,
                     probe_steps_on_range=0,
                     history=[
@@ -6231,7 +6452,7 @@ def run_source_only_build_triage(
                     is_public=False,
                     bisect_status="unresolved_history",
                     first_failing="",
-                    last_good=control,
+                    last_good="",
                     steps_executed=2,
                     probe_steps_on_range=0,
                     history=kern_hist,
@@ -6301,7 +6522,7 @@ def run_source_only_build_triage(
                 is_public=red_outcome.is_public_plugin_interface,
                 bisect_status="unresolved_history",
                 first_failing="",
-                last_good=control,
+                last_good="",
                 steps_executed=2,
                 probe_steps_on_range=0,
                 history=base_hist,
@@ -7138,7 +7359,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             and effective_status == "fail"
             and SHA1_RE.fullmatch(first_bad)
         ):
-            eff_good = last_good if SHA1_RE.fullmatch(last_good) else verified_pin
+            eff_good = (
+                last_good
+                if (
+                    SHA1_RE.fullmatch(last_good)
+                    and last_good != args.upstream_sha.strip()
+                    and last_good != first_bad
+                )
+                else ""
+            )
             pre_triage = classify_failure(
                 outcome,
                 non_ppu_repro=non_ppu_repro,
@@ -7170,6 +7399,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 release_baseline_tag="",
                 rc_branch_states=clean_prev["rc_branch_states"],
                 rc_tag_states=clean_prev["rc_tag_states"],
+                rc_line_revoked_shas=clean_prev.get("rc_line_revoked_shas"),
                 tested_rc_tags=clean_prev["tested_rc_tags"],
             )
 
