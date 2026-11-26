@@ -185,6 +185,14 @@ def _recipe_entries(
                     f"which cannot become ready in a single-server CI launch"
                 )
             continue
+        if resolved.get("frontend_mode", "http") != "http":
+            if requested:
+                raise ValueError(
+                    f"recipe policy {slug!r} resolves to frontend_mode={resolved['frontend_mode']!r} "
+                    f"(api_server_count={resolved.get('api_server_count')}), "
+                    f"which does not expose an OpenAI HTTP server"
+                )
+            continue
         if eff_max_devices is not None and int(resolved["ppu_count"]) > eff_max_devices:
             if requested:
                 raise ValueError(

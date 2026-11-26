@@ -82,8 +82,8 @@ models and frameworks:
 | --- | --- | --- | --- |
 | `prefill` | `single_node` (`nodes: 1`) | Prefill-optimized single-node layout (e.g., smaller TP width, `spec_decoding: false`) | None (placeholders and multi-node flags forbidden; effective local DP must equal global `--data-parallel-size`) |
 | `decode` | `single_node` (`nodes: 1`) | Decode-optimized single-node layout (e.g., TP8 with MTP / speculative decoding enabled) | None (effective local DP must equal global `--data-parallel-size`) |
-| `decode_ep` | `multi_node_ep` (`nodes >= 2`) | Multi-node DP+EP decode layout (e.g., 4-node DP32+EP+MTP) | Must enable `--enable-expert-parallel` and include `{master_addr}` and `{node_rank}` (`--nnodes` must match `topology.nodes`; for default internal-LB layouts where node 0 hosts the API server, launchers append `--headless` on non-zero node ranks, whereas `--data-parallel-hybrid-lb` runs an API server per node without `--headless` and `--data-parallel-external-lb` runs an API server per DP replica leader without `--headless`) |
-| `pd_prefill` + `pd_decode` | `pd_disagg` (paired roles `prefill` + `decode`) | Disaggregated prefill/decode pair using `--kv-transfer-config` | Must be declared as a pair with matching `kv_role` (`kv_producer` / `kv_consumer`); for `MooncakeConnector`, wire `{kv_ip}` via `VLLM_HOST_IP`, `{ib_devices}` via `kv_connector_extra_config.device_name`, and `{kv_port}` on `pd_prefill` via `VLLM_MOONCAKE_BOOTSTRAP_PORT` (embedded bootstrap) or `kv_connector_extra_config.bootstrap_server_address` (external bootstrap); `pd_decode` receives `remote_bootstrap_addr` per request from the PD proxy |
+| `decode_ep` | `multi_node_ep` (`nodes >= 2`) | Multi-node DP+EP decode layout (e.g., 4-node DP32+EP+MTP) | Must enable `--enable-expert-parallel`, wire `{master_addr}` in `--master-addr`, and wire `{node_rank}` in `--node-rank` (`--nnodes` must match `topology.nodes`; `{node_rank}` may additionally template `--data-parallel-rank` / `--data-parallel-start-rank`; for default internal-LB layouts where node 0 hosts the API server, launchers append `--headless` on non-zero node ranks, whereas `--data-parallel-hybrid-lb` runs an API server per node without `--headless` and `--data-parallel-external-lb` runs an API server per DP replica leader without `--headless`) |
+| `pd_prefill` + `pd_decode` | `pd_disagg` (paired roles `prefill` + `decode`) | Disaggregated prefill/decode pair using `--kv-transfer-config` | Must be declared as a pair covering identical `(variant, hardware)` targets with compatible `kv_connector` / transfer protocol and matching `kv_role` (`kv_producer` / `kv_consumer`); for `MooncakeConnector`, wire `{kv_ip}` via `VLLM_HOST_IP`, `{ib_devices}` via `kv_connector_extra_config.device_name`, and `{kv_port}` on `pd_prefill` via `VLLM_MOONCAKE_BOOTSTRAP_PORT` (embedded bootstrap) or `kv_connector_extra_config.bootstrap_server_address` (external bootstrap); `pd_decode` receives `remote_bootstrap_addr` per request from the PD proxy |
 
 Specialized single-node slots already in use by existing recipes (`dp_ep_low_latency`,
 `prefill_long`, `eval_longctx`, `decode_nographs`, `tp8`) remain accepted for
@@ -111,8 +111,9 @@ CI runners. Promotion follows three tiers:
 2. **Tier 2 — PR `fast_sanity` (Selective single-node Zhenwu M890 execution)**
    Create or update a `tests/ppu/policy/models/<slug>.yaml` `fast_sanity` entry only
    when **both** conditions hold:
-   - Hardware is `zhenwu_m890`, `topology.kind == "single_node"` (`nodes == 1`), and
-     the target `hf_model_id` snapshot is confirmed present in the runner offline HF
+   - Hardware is `zhenwu_m890`, `topology.kind == "single_node"` (`nodes == 1`),
+     `frontend_mode == "http"` (at least one TCP OpenAI HTTP API server), and the
+     target `hf_model_id` snapshot is confirmed present in the runner offline HF
      cache; and
    - The preset covers a distinct operator, parallelism, or feature execution path
      (for example, TP4 without MTP `prefill` vs TP8 with MTP `decode`, or single-node

@@ -36,6 +36,9 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
 from ppu_recipe import (  # noqa: E402
+    ValidationError,
+    _compute_parallel_dp_and_frontend,
+    _parse_flag_entries,
     _validate_resolved_topology_and_placeholders,
     infer_fast_sanity_layer_override,
     redact_and_verify_public_payload,
@@ -606,6 +609,23 @@ def _launch_resolved_server(
         _validate_resolved_topology_and_placeholders(
             resolved, context="launch_resolved_server", base_env=env
         )
+        *_, eff_frontend, eff_asc = _compute_parallel_dp_and_frontend(
+            _parse_flag_entries(list(resolved["flags"])),
+            dict(resolved.get("server_env", {})),
+            topo_nodes=int(resolved["topology"]["nodes"]),
+            context="launch_resolved_server",
+            base_env=env,
+        )
+    else:
+        eff_frontend = str(resolved.get("frontend_mode", "http"))
+        eff_asc = resolved.get("api_server_count", 1)
+    declared_frontend = str(resolved.get("frontend_mode", eff_frontend))
+    if eff_frontend != "http" or declared_frontend != "http":
+        bad_mode = eff_frontend if eff_frontend != "http" else declared_frontend
+        raise ValidationError(
+            f"launch_resolved_server requires OpenAI HTTP server (frontend_mode='http'), "
+            f"got frontend_mode={bad_mode!r} (api_server_count={eff_asc!r})"
+        )
     if (
         model_dir is not None
         and model_dir.parent.name == "snapshots"
@@ -750,6 +770,11 @@ def run_fast_sanity(
         layer_override=None,
         assets_map_path=assets_map,
     )
+    if base_resolved.get("frontend_mode", "http") != "http":
+        raise ValidationError(
+            f"run_fast_sanity requires OpenAI HTTP server (frontend_mode='http'), "
+            f"got frontend_mode={base_resolved.get('frontend_mode')!r}"
+        )
     effective_env = {
         **os.environ,
         **{k: str(v) for k, v in base_resolved.get("server_env", {}).items()},

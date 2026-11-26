@@ -110,6 +110,11 @@ INVERSE_BOOLEAN_GROUPS: tuple[tuple[str, ...], ...] = (
     ("--enforce-eager", "--no-enforce-eager"),
     ("--data-parallel-external-lb", "--no-data-parallel-external-lb"),
     ("--data-parallel-hybrid-lb", "--no-data-parallel-hybrid-lb"),
+    (
+        "--data-parallel-multi-port-external-lb",
+        "--no-data-parallel-multi-port-external-lb",
+    ),
+    ("--tokens-only", "--no-tokens-only"),
 )
 FORBIDDEN_RECIPE_FLAGS = frozenset(
     {
@@ -147,6 +152,15 @@ TOPOLOGY_PLACEHOLDERS: dict[str, tuple[str, Any]] = {
     "ib_devices": ("rdma0", "rdma0"),
 }
 MULTI_NODE_REQUIRED_PLACEHOLDERS = frozenset({"master_addr", "node_rank"})
+_MULTI_NODE_PLACEHOLDERS = frozenset({"master_addr", "master_port", "node_rank"})
+_PD_DISAGG_PLACEHOLDERS = frozenset({"kv_ip", "kv_port", "ib_devices"})
+_NODE_RANK_ALLOWED_FLAGS = frozenset(
+    {"--node-rank", "--data-parallel-rank", "--data-parallel-start-rank"}
+)
+_MASTER_ADDR_ALLOWED_FLAGS = frozenset({"--master-addr", "--data-parallel-address"})
+_MASTER_ADDR_ALLOWED_ENV = frozenset({"VLLM_DP_MASTER_IP"})
+_MASTER_PORT_ALLOWED_FLAGS = frozenset({"--master-port", "--data-parallel-rpc-port"})
+_MASTER_PORT_ALLOWED_ENV = frozenset({"VLLM_DP_MASTER_PORT"})
 PD_DISAGG_PREFILL_REQUIRED_PLACEHOLDERS = frozenset({"kv_ip", "kv_port", "ib_devices"})
 PD_DISAGG_DECODE_REQUIRED_PLACEHOLDERS = frozenset({"kv_ip", "ib_devices"})
 PD_DISAGG_REQUIRED_PLACEHOLDERS = PD_DISAGG_PREFILL_REQUIRED_PLACEHOLDERS
@@ -1446,15 +1460,185 @@ def _effective_bool_flag(
     return state
 
 
-def _compute_parallel_and_dp_local(
+def _validate_topology_flag_and_placeholder_wiring(
+    flags: Sequence[str],
+    server_env: Mapping[str, Any],
+    *,
+    topo_kind: str,
+    topo_nodes: int,
+    context: str,
+) -> set[str]:
+    """Validate topology-specific launch flags and consuming-flag placeholder wiring."""
+    str_env = {str(k): str(v) for k, v in server_env.items()}
+    entries = _parse_flag_entries(list(flags))
+    flag_names = {name for name, _, _ in entries}
+    placeholders = _extract_placeholders_from_flags_and_env(flags, str_env)
+    unknown = sorted(placeholders - set(TOPOLOGY_PLACEHOLDERS))
+    if unknown:
+        raise ValidationError(
+            f"{context}: unknown topology placeholder(s): {', '.join(unknown)}"
+        )
+
+    if topo_kind == "single_node":
+        if placeholders:
+            raise ValidationError(
+                f"{context}: single_node topology must not contain placeholders: "
+                f"{', '.join(sorted(placeholders))}"
+            )
+        bad_mn = sorted(flag_names & MULTI_NODE_LAUNCH_FLAGS)
+        if bad_mn:
+            raise ValidationError(
+                f"{context}: single_node topology must not set multi-node flag(s): "
+                f"{', '.join(bad_mn)}"
+            )
+        if "--kv-transfer-config" in flag_names:
+            raise ValidationError(
+                f"{context}: single_node topology must not set --kv-transfer-config; "
+                f"declare paired pd_disagg presets instead"
+            )
+    elif topo_kind == "multi_node_ep":
+        if "--kv-transfer-config" in flag_names:
+            raise ValidationError(
+                f"{context}: multi_node_ep topology must not set --kv-transfer-config; "
+                f"use paired pd_disagg presets instead"
+            )
+        bad_pd_ph = sorted(placeholders & _PD_DISAGG_PLACEHOLDERS)
+        if bad_pd_ph:
+            raise ValidationError(
+                f"{context}: multi_node_ep topology must not contain pd_disagg placeholder(s): "
+                f"{', '.join(bad_pd_ph)}"
+            )
+    elif topo_kind == "pd_disagg" and topo_nodes == 1:
+        bad_mn_ph = sorted(placeholders & _MULTI_NODE_PLACEHOLDERS)
+        if bad_mn_ph:
+            raise ValidationError(
+                f"{context}: single-node pd_disagg topology must not contain multi-node "
+                f"placeholder(s): {', '.join(bad_mn_ph)}"
+            )
+        bad_mn = sorted(flag_names & MULTI_NODE_LAUNCH_FLAGS)
+        if bad_mn:
+            raise ValidationError(
+                f"{context}: single-node pd_disagg topology must not set multi-node flag(s): "
+                f"{', '.join(bad_mn)}"
+            )
+
+    for flag, val, _ in entries:
+        if val is None:
+            continue
+        ph_in_flag = (
+            _find_placeholders_in_obj(json.loads(val))
+            if flag in JSON_FLAGS
+            else set(_PLACEHOLDER_RE.findall(val))
+        )
+        if "node_rank" in ph_in_flag and flag not in _NODE_RANK_ALLOWED_FLAGS:
+            raise ValidationError(
+                f"{context}: placeholder '{{node_rank}}' is only valid in --node-rank, "
+                f"--data-parallel-rank, or --data-parallel-start-rank (found in {flag})"
+            )
+        if "master_addr" in ph_in_flag and flag not in _MASTER_ADDR_ALLOWED_FLAGS:
+            raise ValidationError(
+                f"{context}: placeholder '{{master_addr}}' is only valid in --master-addr, "
+                f"--data-parallel-address, or env VLLM_DP_MASTER_IP (found in {flag})"
+            )
+        if "master_port" in ph_in_flag and flag not in _MASTER_PORT_ALLOWED_FLAGS:
+            raise ValidationError(
+                f"{context}: placeholder '{{master_port}}' is only valid in --master-port, "
+                f"--data-parallel-rpc-port, or env VLLM_DP_MASTER_PORT (found in {flag})"
+            )
+
+    for env_key, env_val in str_env.items():
+        ph_in_env = set(_PLACEHOLDER_RE.findall(env_val))
+        if "node_rank" in ph_in_env:
+            raise ValidationError(
+                f"{context}: placeholder '{{node_rank}}' is only valid in --node-rank, "
+                f"--data-parallel-rank, or --data-parallel-start-rank (found in env {env_key})"
+            )
+        if "master_addr" in ph_in_env and env_key not in _MASTER_ADDR_ALLOWED_ENV:
+            raise ValidationError(
+                f"{context}: placeholder '{{master_addr}}' is only valid in --master-addr, "
+                f"--data-parallel-address, or env VLLM_DP_MASTER_IP (found in env {env_key})"
+            )
+        if "master_port" in ph_in_env and env_key not in _MASTER_PORT_ALLOWED_ENV:
+            raise ValidationError(
+                f"{context}: placeholder '{{master_port}}' is only valid in --master-port, "
+                f"--data-parallel-rpc-port, or env VLLM_DP_MASTER_PORT (found in env {env_key})"
+            )
+
+    if topo_nodes > 1:
+        topo_label = (
+            "multi-node pd_disagg" if topo_kind == "pd_disagg" else "multi_node_ep"
+        )
+        missing = sorted(MULTI_NODE_REQUIRED_PLACEHOLDERS - placeholders)
+        if missing:
+            raise ValidationError(
+                f"{context}: {topo_label} topology missing required placeholder(s): "
+                f"{', '.join(missing)}"
+            )
+        nnodes_raw = _flag_value(entries, "--nnodes")
+        if nnodes_raw is None:
+            raise ValidationError(
+                f"{context}: {topo_kind} topology (nodes={topo_nodes}) requires "
+                f"--nnodes matching topology.nodes ({topo_nodes})"
+            )
+        try:
+            nnodes_val = int(nnodes_raw)
+        except ValueError as exc:
+            raise ValidationError(
+                f"{context}: --nnodes must be an integer, got {nnodes_raw!r}"
+            ) from exc
+        if nnodes_val != topo_nodes:
+            raise ValidationError(
+                f"{context}: --nnodes ({nnodes_val}) must match topology.nodes ({topo_nodes})"
+            )
+
+        master_addr_raw = _flag_value(entries, "--master-addr")
+        if master_addr_raw is None or "{master_addr}" not in master_addr_raw:
+            raise ValidationError(
+                f"{context}: {topo_kind} topology (nodes={topo_nodes}) requires "
+                f"--master-addr wiring '{{master_addr}}'"
+            )
+        dp_addr_raw = _flag_value(entries, "--data-parallel-address")
+        if dp_addr_raw is not None and "{master_addr}" not in dp_addr_raw:
+            raise ValidationError(
+                f"{context}: --data-parallel-address must wire '{{master_addr}}' on multi-node topology"
+            )
+
+        node_rank_raw = _flag_value(entries, "--node-rank")
+        if node_rank_raw is None or "{node_rank}" not in node_rank_raw:
+            raise ValidationError(
+                f"{context}: {topo_kind} topology (nodes={topo_nodes}) requires "
+                f"--node-rank wiring '{{node_rank}}'"
+            )
+        resolved_node_ranks: list[int] = []
+        for node_idx in range(topo_nodes):
+            sub_rank = _substitute_placeholders_in_str(
+                node_rank_raw, _build_placeholder_table({"node_rank": node_idx})
+            )
+            try:
+                resolved_node_ranks.append(int(sub_rank))
+            except ValueError as exc:
+                raise ValidationError(
+                    f"{context}: --node-rank must resolve to an integer, got {sub_rank!r}"
+                ) from exc
+        if resolved_node_ranks != list(range(topo_nodes)):
+            raise ValidationError(
+                f"{context}: --node-rank template {node_rank_raw!r} must resolve to "
+                f"{list(range(topo_nodes))}, got {resolved_node_ranks}"
+            )
+
+    return placeholders
+
+
+def _compute_single_node_parallel_dp_and_frontend(
     entries: list[tuple[str, str | None, bool]],
     server_env: Mapping[str, Any],
     *,
     topo_nodes: int,
+    node_idx: int,
     context: str,
     base_env: Mapping[str, str] | None = None,
-) -> tuple[int, int, int, int | None, int, bool]:
-    """Return ``(ppu_count, dp_size, dp_size_local, dpl_explicit, world_within_dp, ext_lb)`` matching pinned vLLM."""
+) -> tuple[int, int, int, int | None, int, bool, str, int]:
+    """Evaluate per-node parallelism, LB mode, and ServeSubcommand frontend contract."""
     effective_env: dict[str, str] = dict(os.environ if base_env is None else base_env)
     effective_env.update({k: str(v) for k, v in server_env.items()})
 
@@ -1520,18 +1704,20 @@ def _compute_parallel_and_dp_local(
     dpl_val: int | None = dpl_explicit
 
     dp_rank_raw = _flag_value(entries, "--data-parallel-rank")
-    dp_rank_val: int | None = None
+    dp_rank_explicit_val: int | None = None
     if dp_rank_raw is not None:
         try:
-            dp_rank_val = int(dp_rank_raw)
+            dp_rank_explicit_val = int(dp_rank_raw)
         except ValueError as exc:
             raise ValidationError(
                 f"{context}: --data-parallel-rank must be an integer, got {dp_rank_raw!r}"
             ) from exc
-        if not 0 <= dp_rank_val < cli_dp_val:
+        if not 0 <= dp_rank_explicit_val < cli_dp_val:
             raise ValidationError(
-                f"{context}: --data-parallel-rank must be in [0, {cli_dp_val - 1}], got {dp_rank_val}"
+                f"{context}: --data-parallel-rank must be in [0, {cli_dp_val - 1}], "
+                f"got {dp_rank_explicit_val}"
             )
+    dp_rank_val: int | None = dp_rank_explicit_val
 
     dp_start_rank_raw = _flag_value(entries, "--data-parallel-start-rank")
     dp_start_rank_val: int | None = None
@@ -1556,23 +1742,97 @@ def _compute_parallel_and_dp_local(
         default=False,
         context=context,
     )
-    hybrid_lb = _effective_bool_flag(
+    hybrid_lb_flag = _effective_bool_flag(
         entries,
         "--data-parallel-hybrid-lb",
         ("--no-data-parallel-hybrid-lb",),
         default=False,
         context=context,
     )
-    headless = any(flag == "--headless" for flag, _, _ in entries)
+    multi_port_ext_lb = _effective_bool_flag(
+        entries,
+        "--data-parallel-multi-port-external-lb",
+        ("--no-data-parallel-multi-port-external-lb",),
+        default=False,
+        context=context,
+    )
+    grpc = _effective_bool_flag(entries, "--grpc", (), default=False, context=context)
+    headless = _effective_bool_flag(
+        entries, "--headless", (), default=False, context=context
+    )
+    tokens_only = _effective_bool_flag(
+        entries,
+        "--tokens-only",
+        ("--no-tokens-only",),
+        default=False,
+        context=context,
+    )
+
+    grpc_port_present = any(flag == "--grpc-port" for flag, _, _ in entries)
+    grpc_port_raw = _flag_value(entries, "--grpc-port")
+    if grpc_port_present:
+        if grpc_port_raw is None:
+            raise ValidationError(f"{context}: --grpc-port must be an integer")
+        try:
+            grpc_port_val = int(grpc_port_raw)
+        except ValueError as exc:
+            raise ValidationError(
+                f"{context}: --grpc-port must be an integer, got {grpc_port_raw!r}"
+            ) from exc
+        if not 0 <= grpc_port_val <= 65535:
+            raise ValidationError(
+                f"{context}: --grpc-port must be between 0 and 65535, got {grpc_port_val}"
+            )
+        if grpc:
+            raise ValidationError(
+                f"{context}: --grpc and --grpc-port are mutually exclusive"
+            )
+
+    asc_present = any(flag == "--api-server-count" for flag, _, _ in entries)
+    asc_raw = _flag_value(entries, "--api-server-count")
+    asc_explicit: int | None = None
+    if asc_present:
+        if asc_raw is None:
+            raise ValidationError(f"{context}: --api-server-count must be an integer")
+        try:
+            asc_explicit = int(asc_raw)
+        except ValueError as exc:
+            raise ValidationError(
+                f"{context}: --api-server-count must be an integer, got {asc_raw!r}"
+            ) from exc
+        if asc_explicit < 0:
+            raise ValidationError(
+                f"{context}: --api-server-count must be >= 0, got {asc_explicit}"
+            )
+    if headless and asc_explicit is not None and asc_explicit > 0:
+        raise ValidationError(
+            f"{context}: --api-server-count={asc_explicit} cannot be used with --headless"
+        )
+
+    uds_present = any(flag == "--uds" for flag, _, _ in entries)
+    uds_raw = _flag_value(entries, "--uds")
+    if uds_present and (uds_raw is None or not uds_raw.strip()):
+        raise ValidationError(f"{context}: --uds requires a non-empty socket path")
+
+    hybrid_lb = hybrid_lb_flag
     if headless and hybrid_lb:
         raise ValidationError(
             f"{context}: --data-parallel-hybrid-lb is not applicable in --headless mode"
         )
-    if hybrid_lb and ext_lb_flag:
+
+    serve_ext_lb = ext_lb_flag or (dp_rank_explicit_val is not None)
+    if not hybrid_lb_flag and not multi_port_ext_lb:
+        serve_hybrid_lb = dp_start_rank_val is not None
+        serve_multi_port = False
+    else:
+        serve_hybrid_lb = hybrid_lb_flag
+        serve_multi_port = multi_port_ext_lb
+    if sum([serve_multi_port, serve_ext_lb, serve_hybrid_lb]) > 1:
         raise ValidationError(
-            f"{context}: --data-parallel-hybrid-lb and --data-parallel-external-lb "
-            f"cannot both be enabled"
+            f"{context}: cannot use more than one data parallel load balancing mode "
+            f"(multi-port external, external, or hybrid)"
         )
+
     if topo_nodes > 1 and dp_backend != "mp":
         raise ValidationError(
             f"{context}: multi-node topology (nodes={topo_nodes}) requires "
@@ -1586,7 +1846,6 @@ def _compute_parallel_and_dp_local(
                 f"vLLM world size ({cli_world})"
             )
         local_world = cli_world // topo_nodes
-        inferred_dp_rank = 0
         if cli_dp_val > 1 and ext_lb_flag:
             if dp_rank_val is None:
                 if topo_nodes % cli_dp_val != 0:
@@ -1595,7 +1854,8 @@ def _compute_parallel_and_dp_local(
                         f"data-parallel ranks when --nnodes ({topo_nodes}) is not divisible "
                         f"by --data-parallel-size ({cli_dp_val})"
                     )
-                dp_rank_val = inferred_dp_rank
+                nodes_per_dp_rank = topo_nodes // cli_dp_val
+                dp_rank_val = node_idx // nodes_per_dp_rank
         elif dpl_val is None:
             dpl_val = max(local_world // world_within_dp, 1)
 
@@ -1731,7 +1991,166 @@ def _compute_parallel_and_dp_local(
                     f"{context}: per-replica world size ({world_within_dp}) must be divisible "
                     f"by nodes per DP replica ({nnodes_within_dp})"
                 )
-    return ppu_count, dp_val, dp_local_val, dpl_explicit, world_within_dp, ext_lb
+
+    if grpc:
+        eff_api_server_count = 0
+        frontend_mode = "grpc"
+    else:
+        if headless:
+            eff_api_server_count = 0
+        elif asc_explicit is not None:
+            eff_api_server_count = asc_explicit
+        elif serve_multi_port or serve_ext_lb:
+            eff_api_server_count = 1
+        elif serve_hybrid_lb:
+            eff_api_server_count = dpl_explicit or 1
+        else:
+            eff_api_server_count = cli_dp_val
+
+        if serve_multi_port:
+            frontend_mode = "multi_port_http"
+        elif eff_api_server_count < 1:
+            frontend_mode = "headless"
+        elif uds_present:
+            frontend_mode = "uds_http"
+        elif tokens_only:
+            frontend_mode = "tokens_only"
+        else:
+            frontend_mode = "http"
+
+    return (
+        ppu_count,
+        dp_val,
+        dp_local_val,
+        dpl_explicit,
+        world_within_dp,
+        ext_lb,
+        frontend_mode,
+        eff_api_server_count,
+    )
+
+
+def _compute_parallel_dp_and_frontend(
+    entries: list[tuple[str, str | None, bool]],
+    server_env: Mapping[str, Any],
+    *,
+    topo_nodes: int,
+    context: str,
+    base_env: Mapping[str, str] | None = None,
+) -> tuple[int, int, int, int | None, int, bool, str, int]:
+    """Evaluate parallelism, DP layout, and ServeSubcommand frontend across all nodes."""
+    raw_flags = _render_entries(entries)
+    str_env = {str(k): str(v) for k, v in server_env.items()}
+    first_result: tuple[int, int, int, int | None, int, bool, str, int] | None = None
+    for node_idx in range(max(topo_nodes, 1)):
+        if topo_nodes > 1:
+            sub_flags, sub_env = substitute_validation_placeholders(
+                raw_flags, str_env, values={"node_rank": node_idx}
+            )
+            node_entries = _parse_flag_entries(sub_flags)
+            node_env: Mapping[str, Any] = sub_env
+        else:
+            node_entries = entries
+            node_env = server_env
+        node_res = _compute_single_node_parallel_dp_and_frontend(
+            node_entries,
+            node_env,
+            topo_nodes=topo_nodes,
+            node_idx=node_idx,
+            context=context,
+            base_env=base_env,
+        )
+        if first_result is None:
+            first_result = node_res
+    assert first_result is not None
+    return first_result
+
+
+def _compute_parallel_and_dp_local(
+    entries: list[tuple[str, str | None, bool]],
+    server_env: Mapping[str, Any],
+    *,
+    topo_nodes: int,
+    context: str,
+    base_env: Mapping[str, str] | None = None,
+) -> tuple[int, int, int, int | None, int, bool]:
+    """Return ``(ppu_count, dp_size, dp_size_local, dpl_explicit, world_within_dp, ext_lb)`` matching pinned vLLM."""
+    res = _compute_parallel_dp_and_frontend(
+        entries,
+        server_env,
+        topo_nodes=topo_nodes,
+        context=context,
+        base_env=base_env,
+    )
+    return res[:6]
+
+
+def _canonical_kv_connector_spec(
+    flags: Sequence[str],
+    server_env: Mapping[str, Any],
+    *,
+    context: str,
+) -> tuple[str, ...]:
+    """Return canonical KV transfer connector/protocol tuple matching KVConnectorFactory."""
+    entries = _parse_flag_entries(list(flags))
+    kv_raw = _flag_value(entries, "--kv-transfer-config")
+    if kv_raw is None:
+        raise ValidationError(
+            f"{context}: pd_disagg preset requires --kv-transfer-config"
+        )
+    kv_obj = json.loads(kv_raw)
+    connector = kv_obj.get("kv_connector")
+    if not isinstance(connector, str) or not connector.strip():
+        raise ValidationError(
+            f"{context}: --kv-transfer-config requires non-empty kv_connector"
+        )
+    connector = connector.strip()
+    module_path_raw = kv_obj.get("kv_connector_module_path")
+    module_path = module_path_raw.strip() if isinstance(module_path_raw, str) else ""
+    extra = kv_obj.get("kv_connector_extra_config")
+    if extra is not None and not isinstance(extra, dict):
+        raise ValidationError(
+            f"{context}: --kv-transfer-config kv_connector_extra_config must be a JSON object"
+        )
+    extra = extra or {}
+
+    if module_path:
+        return ("custom", module_path, connector)
+    if connector == "NixlConnector":
+        mode_raw = extra.get("transfer_mode", "pull")
+        if not isinstance(mode_raw, str) or mode_raw.strip().lower() not in {
+            "pull",
+            "push",
+        }:
+            raise ValidationError(
+                f"{context}: NixlConnector transfer_mode must be 'pull' or 'push', got {mode_raw!r}"
+            )
+        target_cls = (
+            "NixlPullConnector"
+            if mode_raw.strip().lower() == "pull"
+            else "NixlPushConnector"
+        )
+        return ("builtin", target_cls)
+    if connector == "MooncakeConnector":
+        extra_proto = extra.get("mooncake_protocol")
+        env_proto = server_env.get("MOONCAKE_PROTOCOL")
+        norm_extra = (
+            extra_proto.strip().lower()
+            if isinstance(extra_proto, str) and extra_proto.strip()
+            else None
+        )
+        norm_env = (
+            str(env_proto).strip().lower()
+            if env_proto is not None and str(env_proto).strip()
+            else None
+        )
+        if norm_extra is not None and norm_env is not None and norm_extra != norm_env:
+            raise ValidationError(
+                f"{context}: MooncakeConnector mooncake_protocol ({norm_extra!r}) conflicts "
+                f"with env MOONCAKE_PROTOCOL ({norm_env!r})"
+            )
+        return ("builtin", "MooncakeConnector", norm_extra or norm_env or "rdma")
+    return ("builtin", connector)
 
 
 def _validate_resolved_topology_and_placeholders(
@@ -1749,8 +2168,15 @@ def _validate_resolved_topology_and_placeholders(
     topo_capacity = topo_nodes * int(topo["devices_per_node"])
     preset_name = resolved.get("preset")
 
+    placeholders = _validate_topology_flag_and_placeholder_wiring(
+        flags,
+        server_env,
+        topo_kind=topo_kind,
+        topo_nodes=topo_nodes,
+        context=context,
+    )
+
     entries = _parse_flag_entries(flags)
-    flag_names = {name for name, _, _ in entries}
     (
         calc_ppu_count,
         dp_val,
@@ -1758,7 +2184,9 @@ def _validate_resolved_topology_and_placeholders(
         dpl_explicit,
         world_within_dp,
         ext_lb,
-    ) = _compute_parallel_and_dp_local(
+        _frontend_mode,
+        _api_server_count,
+    ) = _compute_parallel_dp_and_frontend(
         entries,
         server_env,
         topo_nodes=topo_nodes,
@@ -1783,61 +2211,7 @@ def _validate_resolved_topology_and_placeholders(
             f"vLLM world size ({ppu_count})"
         )
 
-    placeholders = _extract_placeholders_from_flags_and_env(flags, server_env)
-    unknown = sorted(placeholders - set(TOPOLOGY_PLACEHOLDERS))
-    if unknown:
-        raise ValidationError(
-            f"{context}: unknown topology placeholder(s): {', '.join(unknown)}"
-        )
-
-    def _require_matching_nnodes() -> None:
-        nnodes_raw = _flag_value(entries, "--nnodes")
-        if nnodes_raw is None:
-            raise ValidationError(
-                f"{context}: {topo_kind} topology (nodes={topo_nodes}) requires "
-                f"--nnodes matching topology.nodes ({topo_nodes})"
-            )
-        try:
-            nnodes_val = int(nnodes_raw)
-        except ValueError as exc:
-            raise ValidationError(
-                f"{context}: --nnodes must be an integer, got {nnodes_raw!r}"
-            ) from exc
-        if nnodes_val != topo_nodes:
-            raise ValidationError(
-                f"{context}: --nnodes ({nnodes_val}) must match topology.nodes ({topo_nodes})"
-            )
-
-    if topo_kind == "single_node":
-        if placeholders:
-            raise ValidationError(
-                f"{context}: single_node topology must not contain placeholders: "
-                f"{', '.join(sorted(placeholders))}"
-            )
-        bad_mn = sorted(flag_names & MULTI_NODE_LAUNCH_FLAGS)
-        if bad_mn:
-            raise ValidationError(
-                f"{context}: single_node topology must not set multi-node flag(s): "
-                f"{', '.join(bad_mn)}"
-            )
-        if "--kv-transfer-config" in flag_names:
-            raise ValidationError(
-                f"{context}: single_node topology must not set --kv-transfer-config; "
-                f"declare paired pd_disagg presets instead"
-            )
-    elif topo_kind == "multi_node_ep":
-        if "--kv-transfer-config" in flag_names:
-            raise ValidationError(
-                f"{context}: multi_node_ep topology must not set --kv-transfer-config; "
-                f"use paired pd_disagg presets instead"
-            )
-        missing = sorted(MULTI_NODE_REQUIRED_PLACEHOLDERS - placeholders)
-        if missing:
-            raise ValidationError(
-                f"{context}: multi_node_ep topology missing required placeholder(s): "
-                f"{', '.join(missing)}"
-            )
-        _require_matching_nnodes()
+    if topo_kind == "multi_node_ep":
         if ppu_count != topo_capacity:
             raise ValidationError(
                 f"{context}: multi_node_ep parallelism ({ppu_count}) must match "
@@ -1878,6 +2252,7 @@ def _validate_resolved_topology_and_placeholders(
             raise ValidationError(
                 f"{context}: --kv-transfer-config requires non-empty kv_connector"
             )
+        _canonical_kv_connector_spec(flags, server_env, context=context)
         role = topo.get("role")
         if role is None:
             if preset_name == "pd_prefill":
@@ -1977,21 +2352,6 @@ def _validate_resolved_topology_and_placeholders(
                         f"bootstrap_server_address or VLLM_MOONCAKE_BOOTSTRAP_PORT; "
                         f"decoders receive remote_bootstrap_addr via kv_transfer_params"
                     )
-        if topo_nodes == 1:
-            bad_mn = sorted(flag_names & MULTI_NODE_LAUNCH_FLAGS)
-            if bad_mn:
-                raise ValidationError(
-                    f"{context}: single-node pd_disagg topology must not set multi-node flag(s): "
-                    f"{', '.join(bad_mn)}"
-                )
-        else:
-            missing_mn = sorted(MULTI_NODE_REQUIRED_PLACEHOLDERS - placeholders)
-            if missing_mn:
-                raise ValidationError(
-                    f"{context}: multi-node pd_disagg topology missing required placeholder(s): "
-                    f"{', '.join(missing_mn)}"
-                )
-            _require_matching_nnodes()
 
     sub_flags, sub_env = substitute_validation_placeholders(flags, server_env)
     _validate_flag_list(sub_flags, context=context, allow_policy_flags=True)
@@ -2020,6 +2380,7 @@ def _resolve_recipe_from_doc(
     host: str = "127.0.0.1",
     port: int = 9985,
     served_model_name: str | None = None,
+    _check_pd_pair: bool = True,
 ) -> dict[str, Any]:
     """Resolve an already structurally validated recipe dict (+ optional policy dict)."""
     ppu_blk = recipe["ppu"]
@@ -2246,7 +2607,24 @@ def _resolve_recipe_from_doc(
         *flags_only,
     ]
 
-    ppu_count, dp_val, dp_local_val, _, _, _ = _compute_parallel_and_dp_local(
+    resolved_ctx = f"{recipe_label}:{eff_variant}:{eff_preset or 'baseline'}"
+    _validate_topology_flag_and_placeholder_wiring(
+        flags_only,
+        server_env,
+        topo_kind=str(eff_topology["kind"]),
+        topo_nodes=int(eff_topology["nodes"]),
+        context=resolved_ctx,
+    )
+    (
+        ppu_count,
+        dp_val,
+        dp_local_val,
+        _,
+        _,
+        _,
+        frontend_mode,
+        api_server_count,
+    ) = _compute_parallel_dp_and_frontend(
         ordered,
         server_env,
         topo_nodes=int(eff_topology["nodes"]),
@@ -2285,6 +2663,8 @@ def _resolve_recipe_from_doc(
         "ppu_count": ppu_count,
         "dp_size": dp_val,
         "dp_size_local": dp_local_val,
+        "frontend_mode": frontend_mode,
+        "api_server_count": api_server_count,
         "model_id": model_blk["model_id"],
         "hf_model_id": hf_model_id,
         "resolved_model": resolved_model,
@@ -2303,9 +2683,36 @@ def _resolve_recipe_from_doc(
         "layer_override": eff_layers,
         "dummy_weights": eff_dummy,
     }
-    _validate_resolved_topology_and_placeholders(
-        result, context=f"{recipe_label}:{eff_variant}:{eff_preset or 'baseline'}"
-    )
+    _validate_resolved_topology_and_placeholders(result, context=resolved_ctx)
+    if _check_pd_pair and eff_preset in {"pd_prefill", "pd_decode"}:
+        peer_preset = "pd_decode" if eff_preset == "pd_prefill" else "pd_prefill"
+        peer_res = _resolve_recipe_from_doc(
+            recipe,
+            recipe_label=recipe_label,
+            variant=eff_variant,
+            hardware=eff_hardware,
+            preset=peer_preset,
+            cache=None,
+            _check_pd_pair=False,
+        )
+        self_spec = _canonical_kv_connector_spec(
+            result["flags"], result["server_env"], context=resolved_ctx
+        )
+        peer_ctx = f"{recipe_label}:{eff_variant}:{peer_preset}"
+        peer_spec = _canonical_kv_connector_spec(
+            peer_res["flags"], peer_res["server_env"], context=peer_ctx
+        )
+        if self_spec != peer_spec:
+            prefill_spec, decode_spec = (
+                (self_spec, peer_spec)
+                if eff_preset == "pd_prefill"
+                else (peer_spec, self_spec)
+            )
+            raise ValidationError(
+                f"{recipe_label}: paired pd_prefill and pd_decode have incompatible KV transfer "
+                f"connector configuration for variant={eff_variant!r}, hardware={eff_hardware!r}: "
+                f"pd_prefill={prefill_spec} vs pd_decode={decode_spec}"
+            )
     return result
 
 
@@ -2868,6 +3275,25 @@ def validate_serving_recipe_structure(
         findings = _scan_text(s, context=loc, allow_loopback=False)
         if findings:
             raise ValidationError("; ".join(findings))
+
+    if ppu["framework"] == "vllm" and "pd_prefill" in presets_blk:
+        all_targets = _iter_variant_preset_targets(recipe, context=context)
+        prefill_targets = {
+            (vname, target_hw)
+            for vname, pname, target_hw in all_targets
+            if pname == "pd_prefill"
+        }
+        decode_targets = {
+            (vname, target_hw)
+            for vname, pname, target_hw in all_targets
+            if pname == "pd_decode"
+        }
+        if prefill_targets != decode_targets:
+            raise ValidationError(
+                f"{context}.presets: paired pd_prefill and pd_decode must cover identical "
+                f"(variant, hardware) targets, got pd_prefill={sorted(prefill_targets)} "
+                f"vs pd_decode={sorted(decode_targets)}"
+            )
 
     if validate_expansions and ppu["framework"] == "vllm":
         for vname, pname, target_hw in _iter_variant_preset_targets(
