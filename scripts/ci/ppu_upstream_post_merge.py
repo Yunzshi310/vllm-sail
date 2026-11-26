@@ -2224,11 +2224,6 @@ def route_three_gears(
                     include_failed=force,
                 )
                 if rc_hit is None:
-                    noop_excluded = _collect_excluded_control_shas(
-                        state,
-                        tags=tags,
-                        release_branches=release_branches,
-                    )
                     noop_controls = _collect_verified_control_shas(
                         state,
                         verified_pin=pin,
@@ -2236,9 +2231,7 @@ def route_three_gears(
                         release_branches=release_branches,
                     )
                     noop_override = (
-                        override_green
-                        if (override_green and override_green not in noop_excluded)
-                        else ""
+                        override_green if override_green in noop_controls else ""
                     )
                     return {
                         "selected_gear": "rc_qualify",
@@ -2254,13 +2247,6 @@ def route_three_gears(
                     }
                 rc_tag, target_sha = rc_hit
         clean_target = _require_sha1(target_sha, "rc_target_sha")
-        rc_excluded = _collect_excluded_control_shas(
-            state,
-            rc_ref=rc_tag,
-            target_sha=clean_target,
-            tags=tags,
-            release_branches=release_branches,
-        )
         verified_controls = _collect_verified_control_shas(
             state,
             verified_pin=pin,
@@ -2271,13 +2257,7 @@ def route_three_gears(
         )
         non_target_controls = [s for s in verified_controls if s != clean_target]
         effective_rc_override = (
-            override_green
-            if (
-                override_green
-                and override_green not in rc_excluded
-                and override_green != clean_target
-            )
-            else ""
+            override_green if override_green in non_target_controls else ""
         )
         rc_green = effective_rc_override or _resolve_rc_last_green_sha(
             rc_tag,
@@ -2322,11 +2302,7 @@ def route_three_gears(
             tags=tags,
             release_branches=release_branches,
         )
-        bump_override = (
-            override_green
-            if (override_green and override_green not in bump_excluded)
-            else ""
-        )
+        bump_override = override_green if override_green in bump_controls else ""
         history = list(probe_history)
         if not history:
             history = list(state.get("probe_history") or [])
@@ -2397,10 +2373,15 @@ def route_three_gears(
         tags=tags,
         release_branches=release_branches,
     )
+    probe_controls = _collect_verified_control_shas(
+        state,
+        verified_pin=pin,
+        target_sha=target_sha,
+        tags=tags,
+        release_branches=release_branches,
+    )
     effective_probe_override = (
-        override_green
-        if (override_green and override_green not in probe_excluded)
-        else ""
+        override_green if override_green in probe_controls else ""
     )
     if effective_probe_override:
         last_ppu_green = effective_probe_override
@@ -2447,13 +2428,6 @@ def route_three_gears(
         run_ppu = True
         skip_reason = "none"
 
-    probe_controls = _collect_verified_control_shas(
-        state,
-        verified_pin=pin,
-        target_sha=target_sha,
-        tags=tags,
-        release_branches=release_branches,
-    )
     non_target_probe_controls = [s for s in probe_controls if s != target_sha]
     probe_green = (
         effective_probe_override

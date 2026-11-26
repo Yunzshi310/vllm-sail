@@ -24,7 +24,7 @@ on:
         default: ""
         type: string
       last_green_sha:
-        description: Optional 40-char last-known-good vLLM SHA override for bisection
+        description: Optional 40-char previously verified vLLM SHA override for bisection
         required: false
         default: ""
         type: string
@@ -1387,6 +1387,7 @@ jobs:
           SELECTED_GEAR: ${{ needs.route.outputs.selected_gear || 'probe' }}
           RUN_CPU: ${{ needs.route.outputs.run_cpu || 'false' }}
           RUN_PPU: ${{ needs.route.outputs.run_ppu || 'false' }}
+          OPS_IMAGE: ${{ inputs.ops_image || '' }}
         uses: actions/github-script@v7
         with:
           script: |
@@ -1579,47 +1580,64 @@ jobs:
             const effectiveAttempt = Number(
               process.env.GITHUB_RUN_ATTEMPT || context.runAttempt || observedOwnAttempt || 1
             );
-            if (best && best.name !== routePrior && best.runId !== context.runId) {
-              // On a partial retry (`effectiveAttempt > 1`) after a newer external run published
-              // a cursor, fail closed unless this attempt actually re-executed test lanes (`retested_lanes > 0`).
-              if (effectiveAttempt > 1) {
-                if (typeof github.rest.actions.listJobsForWorkflowRunAttempt !== "function") {
-                  throw new Error(
-                    `Refusing partial retry publication in attempt ${effectiveAttempt} after newer cursor ${best.name}: cannot verify retested lanes without listJobsForWorkflowRunAttempt; dispatch a fresh run by SHA.`
-                  );
+            if (best && best.name !== routePrior) {
+              // A committed earlier attempt of this run may already include an
+              // external verdict. Keep that parent even on a publisher-only retry.
+              if (effectiveAttempt > 1 && best.runId !== context.runId) {
+                const isRc = process.env.SELECTED_GEAR === "rc_qualify";
+                const runCpu = isRc || process.env.RUN_CPU === "true";
+                const runPpu = isRc || process.env.RUN_PPU === "true";
+                const required = new Set();
+                if (runCpu || runPpu) required.add("Build candidate wheels & reuse SAIL .so");
+                if (runCpu) required.add("SDK container CPU fast check & static bisect");
+                if (isRc) {
+                  required.add("RC PPU pin unit tests");
+                  required.add("RC PPU recipe fast sanity");
+                  required.add("RC PPU recipe model sanity");
+                  if ((process.env.OPS_IMAGE || "").trim()) {
+                    required.add("RC PPU operator test selection");
+                    required.add("RC PPU operator qualification");
+                  }
+                } else if (runPpu) {
+                  required.add("PPU 1-card sliding-window smoke & bisect");
                 }
-                const jobsRes = await withRetry(
-                  `listJobsForWorkflowRunAttempt(run_id=${context.runId}, attempt=${effectiveAttempt})`,
-                  () =>
-                    github.rest.actions.listJobsForWorkflowRunAttempt({
-                      owner,
-                      repo,
-                      run_id: context.runId,
-                      attempt_number: effectiveAttempt,
-                      per_page: 100,
-                    })
-                );
-                const jobs = Array.isArray(jobsRes && jobsRes.data && jobsRes.data.jobs)
-                  ? jobsRes.data.jobs
-                  : [];
-                const executedJobs = jobs.filter(
-                  (j) =>
-                    j &&
-                    typeof j.name === "string" &&
-                    !j.name.includes("Publish allowlisted summary") &&
-                    j.status === "completed" &&
-                    j.conclusion !== "skipped"
-                );
-                const gear = process.env.SELECTED_GEAR || "probe";
-                const runCpu = process.env.RUN_CPU === "true";
-                const runPpu = process.env.RUN_PPU === "true";
-                const expectsLanes = gear === "rc_qualify" || runCpu || runPpu;
-                const retestedLanes = executedJobs.filter(
-                  (j) => !j.name.includes("Route gear")
-                ).length;
-                if (expectsLanes && retestedLanes === 0) {
+                const gateCount = required.size;
+                // The build and CPU gate use route's exact target SHA. Rerunning
+                // the CPU gate also reruns its dependent RC jobs and their matrices.
+                for (let jobPage = 1; required.size; jobPage += 1) {
+                  const { data } = await withRetry(
+                    `listJobsForWorkflowRunAttempt(run_id=${context.runId}, attempt=${effectiveAttempt}, page=${jobPage})`,
+                    () =>
+                      github.rest.actions.listJobsForWorkflowRunAttempt({
+                        owner,
+                        repo,
+                        run_id: context.runId,
+                        attempt_number: effectiveAttempt,
+                        per_page: perPage,
+                        page: jobPage,
+                      })
+                  );
+                  const jobs = Array.isArray(data && data.jobs) ? data.jobs : [];
+                  for (const j of jobs) {
+                    if (
+                      !j || typeof j.name !== "string" || j.status !== "completed" ||
+                      !["success", "failure"].includes(j.conclusion) ||
+                      (j.run_attempt != null && Number(j.run_attempt) !== effectiveAttempt)
+                    ) continue;
+                    for (const gate of required) {
+                      if (j.name === gate || j.name.startsWith(gate + " / ")) {
+                        required.delete(gate);
+                      }
+                    }
+                  }
+                  if (jobs.length < perPage || jobPage * perPage >= data.total_count) break;
+                }
+                if (required.size) {
+                  const reason = required.size === gateCount
+                    ? "publisher-only retry (retested_lanes=0)"
+                    : "partial retry (missing " + [...required].join(", ") + ")";
                   throw new Error(
-                    `Refusing publisher-only retry in attempt ${effectiveAttempt} (retested_lanes=0) after newer cursor ${best.name}; dispatch a fresh workflow run for the target SHA.`
+                    `Refusing ${reason} in attempt ${effectiveAttempt} after newer cursor ${best.name}; dispatch a fresh workflow run for the target SHA.`
                   );
                 }
               }
@@ -1632,7 +1650,7 @@ jobs:
               core.setOutput("latest_cursor_artifact", "");
             }
 
-      - name: Download newer external cursor artifact when superseded
+      - name: Download latest committed cursor when superseded
         if: >-
           always() &&
           needs.route.result == 'success' &&

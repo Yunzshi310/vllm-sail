@@ -5086,7 +5086,6 @@ def test_rc_legacy_cursor_upgrade_and_manual_override_variants(tmp_path):
     sha_main = _sha(1001)
     sha_rc0 = _sha(1002)
     sha_cp1 = _sha(1003)
-    sha_custom_green = _sha(1004)
 
     # 1. Legacy schema-1 cursor without `rc_branch_states` (and even without `rc_tag_states` entry) upgrades cleanly.
     legacy_cursor = {
@@ -5172,11 +5171,14 @@ def test_rc_legacy_cursor_upgrade_and_manual_override_variants(tmp_path):
         encoding="utf-8",
     )
     cur_file = tmp_path / "cursor.json"
-    cur_file.write_text(json.dumps(legacy_cursor), encoding="utf-8")
+    cur_file.write_text(json.dumps(bound_rc0_cursor), encoding="utf-8")
     rel_file = tmp_path / "release-tag.txt"
     rel_file.write_text("v0.34.0\n", encoding="utf-8")
 
-    for ref_arg in ("releases/v0.35.0", "refs/heads/releases/v0.35.0"):
+    for ref_arg, override, expected_control in (
+        ("releases/v0.35.0", VERIFIED_PIN, VERIFIED_PIN),
+        ("refs/heads/releases/v0.35.0", _sha(1004), sha_rc0),
+    ):
         gh_out = tmp_path / f"gh-{ref_arg.replace('/', '_')}.env"
         assert (
             post_merge.main(
@@ -5191,7 +5193,7 @@ def test_rc_legacy_cursor_upgrade_and_manual_override_variants(tmp_path):
                     "--upstream-ref",
                     ref_arg,
                     "--last-green-sha",
-                    sha_custom_green,
+                    override,
                     "--cursor-file",
                     str(cur_file),
                     "--github-output",
@@ -5207,7 +5209,7 @@ def test_rc_legacy_cursor_upgrade_and_manual_override_variants(tmp_path):
         assert kv["selected_gear"] == "rc_qualify"
         assert kv["rc_tag"] == "releases/v0.35.0"
         assert kv["target_sha"] == sha_cp1
-        assert kv["last_green_sha"] == sha_custom_green
+        assert kv["last_green_sha"] == expected_control
 
     # Non-existent release branch override fails closed.
     with pytest.raises(ValueError, match="RC release branch"):
@@ -7335,20 +7337,39 @@ const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
         assert pub_only_res["ok"] is False
         assert "retested_lanes=0" in pub_only_res["message"]
 
-        # Genuine retest in attempt 2 (`retested_lanes > 0`) succeeds and adopts `13-1`:
+        def completed_job(job_key: str, leaf: str = "") -> dict[str, str]:
+            return {
+                "name": wf_jobs[job_key]["name"] + leaf,
+                "status": "completed",
+                "conclusion": "success",
+            }
+
+        rc_gates = [
+            completed_job("build", " / PPU wheel build"),
+            completed_job("cpu-fast-check"),
+            completed_job("rc-pin-ut", " / main-verified"),
+            completed_job("rc-fast-sanity", " / Fast sanity glm-5.3"),
+            completed_job("rc-model-sanity", " / Model sanity & micro-E2E glm-5.3"),
+        ]
+        for attempt_jobs in (rc_gates[-1:], rc_gates[:2], rc_gates[:2] + rc_gates[3:]):
+            partial_res = _run_js(
+                latest_js,
+                partial_records,
+                current=12,
+                prior="upstream-post-merge-cursor-11-1",
+                run_attempt=2,
+                attempt_jobs=attempt_jobs,
+            )
+            assert partial_res["ok"] is False
+
+        # In the same run and attempt all required gates allow adopting the external parent.
         retested_res = _run_js(
             latest_js,
             partial_records,
             current=12,
             prior="upstream-post-merge-cursor-11-1",
             run_attempt=2,
-            attempt_jobs=[
-                {
-                    "name": "SDK container CPU fast check & static bisect",
-                    "status": "completed",
-                    "conclusion": "success",
-                }
-            ],
+            attempt_jobs=rc_gates,
         )
         assert retested_res["ok"] is True
         assert retested_res["outputs"]["has_newer_external_cursor"] == "true"
@@ -7357,17 +7378,34 @@ const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
             == "upstream-post-merge-cursor-13-1"
         )
 
-        # Idempotent same-run publish retry (`best.runId === context.runId`) is allowed:
+        # Attempt 2 already adopted run 13. Retrying just the publisher must
+        # retain that parent even if route's old output still points at run 11.
+        self_at_three = {
+            **in_prog_records[0],
+            "run_attempt": 3,
+            "artifacts": [
+                *in_prog_records[0]["artifacts"],
+                {
+                    "id": 14,
+                    "name": "upstream-post-merge-cursor-12-2",
+                    "created_at": "2026-11-26T00:14:00Z",
+                    "expired": False,
+                },
+            ],
+        }
         same_run_retry = _run_js(
             latest_js,
-            in_prog_records,
+            [partial_records[0], self_at_three, in_prog_records[1]],
             current=12,
             prior="upstream-post-merge-cursor-11-1",
-            run_attempt=2,
+            run_attempt=3,
             attempt_jobs=[],
         )
         assert same_run_retry["ok"] is True
-        assert same_run_retry["outputs"]["has_newer_external_cursor"] == "false"
+        assert same_run_retry["outputs"]["latest_cursor_artifact"] == (
+            "upstream-post-merge-cursor-12-2"
+        )
+        assert same_run_retry["outputs"]["has_newer_external_cursor"] == "true"
 
     # Build a real Git DAG: pin -> A -> B -> X1 -> C -> D on `main`, plus `side` off `pin`.
     repo = tmp_path / "upstream-dag"
