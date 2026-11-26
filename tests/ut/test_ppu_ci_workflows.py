@@ -2092,53 +2092,91 @@ def test_accuracy_nightly_notification_requires_official_repo_and_branch(
 
 
 @pytest.mark.parametrize(
-    ("repository", "ref", "webhook", "expected"),
+    ("repository", "ref", "webhook", "targets_json", "expected"),
     [
-        ("vllm-project/vllm-sail", "refs/heads/main", "https://example.invalid", True),
+        (
+            "vllm-project/vllm-sail",
+            "refs/heads/main",
+            "https://example.invalid",
+            "",
+            True,
+        ),
+        (
+            "vllm-project/vllm-sail",
+            "refs/heads/main",
+            "",
+            '{"default":{"webhook_url":"https://example.invalid"}}',
+            True,
+        ),
         (
             "vllm-project/vllm-sail",
             "refs/heads/releases/v0.34.0",
             "https://example.invalid",
+            "",
             True,
         ),
         (
             "vllm-project/vllm-sail",
             "refs/heads/releases/v0.35.0",
-            "https://example.invalid",
+            "",
+            '{"routes":{"v0.35.0":{"webhook_url":"https://example.invalid"}}}',
             True,
         ),
-        ("vllm-project/vllm-sail", "refs/heads/Main", "https://example.invalid", False),
+        (
+            "vllm-project/vllm-sail",
+            "refs/heads/Main",
+            "https://example.invalid",
+            "",
+            False,
+        ),
+        (
+            "vllm-project/vllm-sail",
+            "refs/heads/Main",
+            "",
+            '{"default":{"webhook_url":"https://example.invalid"}}',
+            False,
+        ),
         (
             "vllm-project/vllm-sail",
             "refs/heads/Releases/candidate",
             "https://example.invalid",
+            "",
             False,
         ),
         (
             "vllm-project/vllm-sail",
             "refs/heads/releases/",
             "https://example.invalid",
+            "",
             False,
         ),
         (
             "vllm-project/vllm-sail",
             "refs/heads/ci/deepseek-v41-forward-perf",
             "https://example.invalid",
+            "",
             False,
         ),
         (
             "vllm-project/vllm-sail",
             "refs/tags/v1.0.0",
             "https://example.invalid",
+            "",
             False,
         ),
-        ("VLLM-PROJECT/vllm-sail", "refs/heads/main", "https://example.invalid", False),
-        ("someone/vllm-sail", "refs/heads/main", "https://example.invalid", False),
-        ("vllm-project/vllm-sail", "refs/heads/main", "", False),
+        (
+            "VLLM-PROJECT/vllm-sail",
+            "refs/heads/main",
+            "https://example.invalid",
+            "",
+            False,
+        ),
+        ("someone/vllm-sail", "refs/heads/main", "https://example.invalid", "", False),
+        ("vllm-project/vllm-sail", "refs/heads/main", "", "", False),
     ],
 )
 def test_accuracy_nightly_notification_configured_step_enforces_exact_case(
-    tmp_path, repository, ref, webhook, expected
+    tmp_path, repository, ref, webhook, targets_json, expected
 ):
     steps = workflow("ppu-accuracy-nightly.yaml")["jobs"]["notify-summary"]["steps"]
     configured = next(step for step in steps if step.get("id") == "configured")
@@ -2150,6 +2188,7 @@ def test_accuracy_nightly_notification_configured_step_enforces_exact_case(
             "GITHUB_REPOSITORY": repository,
             "GITHUB_REF": ref,
             "PPU_CI_NOTIFY_WEBHOOK_URL": webhook,
+            "PPU_CI_NOTIFY_TARGETS_JSON": targets_json,
             "GITHUB_OUTPUT": str(output),
         },
         capture_output=True,
@@ -2163,6 +2202,22 @@ def test_accuracy_nightly_notification_configured_step_enforces_exact_case(
         else {}
     )
     assert (published.get("enabled") == "true") is expected
+
+
+def test_accuracy_nightly_notification_passes_targets_json_secret():
+    steps = workflow("ppu-accuracy-nightly.yaml")["jobs"]["notify-summary"]["steps"]
+    configured = next(step for step in steps if step.get("id") == "configured")
+    send = next(
+        step for step in steps if step.get("name") == "Send one Markdown notification"
+    )
+    assert (
+        configured["env"]["PPU_CI_NOTIFY_TARGETS_JSON"]
+        == "${{ secrets.PPU_CI_NOTIFY_TARGETS_JSON }}"
+    )
+    assert (
+        send["env"]["PPU_CI_NOTIFY_TARGETS_JSON"]
+        == "${{ secrets.PPU_CI_NOTIFY_TARGETS_JSON }}"
+    )
 
 
 @pytest.mark.parametrize("models", ["", " \t"])
