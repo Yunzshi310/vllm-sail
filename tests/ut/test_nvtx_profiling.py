@@ -285,6 +285,7 @@ def installed(
             fakes=fake_vllm,
             nvtx_calls=nvtx_stub,
             registry_before=registry_before,
+            dp_scope_first=request.param,
         )
     finally:
         PATCH_REGISTRY[:] = saved_registry
@@ -479,12 +480,14 @@ def test_v2_execute_model_forwards_dummy_runs_unprofiled(
     assert not hasattr(runner, "iteration")
 
 
-@pytest.mark.parametrize("installed", [True], indirect=True, ids=["dp-scope-first"])
 @pytest.mark.parametrize("dummy_run", [False, True])
 @pytest.mark.parametrize("raises", [False, True])
 def test_v2_profiling_preserves_dp_scope(
     installed, recording_nvtx, dummy_run, raises
 ) -> None:
+    if not installed.dp_scope_first:
+        pytest.skip("requires DP scope installed before profiling")
+
     from vllm_sail.patch.bugfix import dp_idle_mtp_dummy_batch as dp
 
     runner = installed.fakes.GPUModelRunnerV2()
