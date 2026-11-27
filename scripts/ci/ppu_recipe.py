@@ -2917,7 +2917,7 @@ def _validate_resolved_topology_and_placeholders(
             http_port=http_port,
             validate_cluster_layout=True,
         )
-    elif topo_kind == "pd_disagg":
+    if topo_kind == "pd_disagg":
         kv_raw = _flag_value(entries, "--kv-transfer-config")
         if kv_raw is None:
             raise ValidationError(

@@ -5472,6 +5472,102 @@ def test_pr462_r2_pd_pairing_multiconnector_explicit_module_decodebench_and_boot
                 inert_port, context=f"inert_port_{nested}"
             )
 
+    # 5. Multi-node pd_disagg (nodes=2) composes cluster layout checks WITH PD semantic checks
+    mn_pd_ok = copy.deepcopy(orig_recipe)
+    for slot in ("pd_prefill", "pd_decode"):
+        mn_pd_ok["presets"][slot]["topology"] = {
+            "kind": "pd_disagg",
+            "nodes": 2,
+            "devices_per_node": 4,
+            "role": "prefill" if slot == "pd_prefill" else "decode",
+        }
+        mn_pd_ok["presets"][slot]["args"].extend(
+            [
+                "--nnodes",
+                "2",
+                "--node-rank",
+                "{node_rank}",
+                "--master-addr",
+                "{master_addr}",
+            ]
+        )
+    for nested_mn in (False, True):
+        mn_ctrl = copy.deepcopy(mn_pd_ok)
+        if nested_mn:
+            for slot in ("pd_prefill", "pd_decode"):
+                _set_kv(mn_ctrl, slot, _wrap_multi)
+        rec_path.write_text(yaml.safe_dump(mn_ctrl, sort_keys=False), encoding="utf-8")
+        assert (
+            ppu_recipe.validate_paths([rec_path], vllm_parser_mode="skip")[
+                "checked_combinations"
+            ]
+            == 12
+        )
+
+        # Wrong decode child/top-level role, DecodeBenchConnector, and inert kv_port must still fail when nodes=2
+        mn_bad_role = copy.deepcopy(mn_ctrl)
+        _set_kv(
+            mn_bad_role,
+            "pd_decode",
+            lambda c, n=nested_mn: (
+                {
+                    **c,
+                    "kv_connector_extra_config": {
+                        "connectors": [
+                            {
+                                **c["kv_connector_extra_config"]["connectors"][0],
+                                "kv_role": "kv_producer",
+                            }
+                        ]
+                    },
+                }
+                if n
+                else {**c, "kv_role": "kv_producer"}
+            ),
+        )
+        with pytest.raises(ppu_recipe.ValidationError, match="kv_role"):
+            ppu_recipe.validate_serving_recipe_structure(
+                mn_bad_role, context=f"mn_pd_bad_role_{nested_mn}"
+            )
+
+        mn_bench = copy.deepcopy(mn_pd_ok)
+        for slot in ("pd_prefill", "pd_decode"):
+            _set_kv(
+                mn_bench,
+                slot,
+                lambda c, n=nested_mn: (
+                    _wrap_multi({**c, "kv_connector": "DecodeBenchConnector"})
+                    if n
+                    else {**c, "kv_connector": "DecodeBenchConnector"}
+                ),
+            )
+        with pytest.raises(
+            ppu_recipe.ValidationError,
+            match="DecodeBenchConnector fills local dummy KV",
+        ):
+            ppu_recipe.validate_serving_recipe_structure(
+                mn_bench, context=f"mn_pd_bench_{nested_mn}"
+            )
+
+        mn_inert = copy.deepcopy(mn_pd_ok)
+        del mn_inert["presets"]["pd_prefill"]["env"]["VLLM_MOONCAKE_BOOTSTRAP_PORT"]
+        for slot in ("pd_prefill", "pd_decode"):
+
+            def _mn_inert_mut(c: dict, s: str = slot, n: bool = nested_mn) -> dict:
+                c2 = copy.deepcopy(c)
+                if s == "pd_prefill":
+                    c2["kv_port"] = "{kv_port}"
+                return _wrap_multi(c2) if n else c2
+
+            _set_kv(mn_inert, slot, _mn_inert_mut)
+        with pytest.raises(
+            ppu_recipe.ValidationError,
+            match="MooncakeConnector does not read KVTransferConfig\\.kv_port",
+        ):
+            ppu_recipe.validate_serving_recipe_structure(
+                mn_inert, context=f"mn_pd_inert_{nested_mn}"
+            )
+
 
 def test_pr462_r2_single_node_sanity_preset_override_and_probe_contracts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
