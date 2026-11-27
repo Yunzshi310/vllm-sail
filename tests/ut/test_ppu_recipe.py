@@ -6400,3 +6400,36 @@ def test_resolved_command_diff_and_pr_template(
         only_when_changed=True,
     )
     assert "10.24.3.8" not in args_diff_md
+
+    # 8. Variant isolation & assets_map collision errors redact credentials before stderr/ValidationError.
+    fake_cred = "ghp_REVIEW_ONLY_12345678"
+    cred_rec = copy.deepcopy(
+        yaml.safe_load((RECIPES_DIR / "zai-org" / "GLM-5.3.yaml").read_text())
+    )
+    cred_rec["ppu"]["served_name"] = fake_cred
+    cred_rec["variants"]["default"]["served_name"] = fake_cred
+    cred_rec["variants"]["fp8"]["served_name"] = fake_cred
+    with pytest.raises(ppu_recipe.ValidationError, match="redacted") as cred_exc:
+        ppu_recipe.validate_serving_recipe_structure(cred_rec, context="cred_leak")
+    assert fake_cred not in str(cred_exc.value)
+
+    cred_cli_root = tmp_path / "cred_cli"
+    shutil.copytree(ROOT / "tests/ppu", cred_cli_root / "tests/ppu")
+    cred_cli_rec = cred_cli_root / "tests/ppu/recipes/zai-org/GLM-5.3.yaml"
+    cred_cli_rec.write_text(yaml.safe_dump(cred_rec, sort_keys=False), encoding="utf-8")
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts/ci/ppu_recipe.py"),
+            "validate",
+            str(cred_cli_rec),
+            "--vllm-parser",
+            "skip",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 1
+    assert fake_cred not in proc.stdout
+    assert fake_cred not in proc.stderr

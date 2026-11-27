@@ -3086,8 +3086,8 @@ def _validate_assets_map_variant_isolation(
         v_ckpt = _resolved_ckpt(vid)
         if (v_asset in assets_map or top_asset in assets_map) and v_ckpt == top_ckpt:
             raise ValidationError(
-                f"{context}.variants.{vname}: assets_map resolves model asset {v_asset!r} "
-                f"to {v_ckpt!r}, colliding with default/top-level checkpoint "
+                f"{context}.variants.{vname}: assets_map resolves model asset {_safe_diag_repr(v_asset)} "
+                f"to {_safe_diag_repr(v_ckpt)}, colliding with default/top-level checkpoint "
                 "(use distinct mapped paths or declare allow_shared_fields: [assets])"
             )
         for other_name, other_id in eff_ids.items():
@@ -3102,8 +3102,8 @@ def _validate_assets_map_variant_isolation(
                     else f"variant {other_name!r}"
                 )
                 raise ValidationError(
-                    f"{context}.variants.{vname}: assets_map resolves model asset {v_asset!r} "
-                    f"to {v_ckpt!r}, colliding with {target} "
+                    f"{context}.variants.{vname}: assets_map resolves model asset {_safe_diag_repr(v_asset)} "
+                    f"to {_safe_diag_repr(v_ckpt)}, colliding with {target} "
                     "(use distinct mapped paths or declare allow_shared_fields: [assets])"
                 )
 
@@ -3547,6 +3547,25 @@ def _scan_text(text: str, *, context: str, allow_loopback: bool = False) -> list
     return findings
 
 
+def _safe_diag_repr(value: str) -> str:
+    """Return ``repr(value)`` unless ``value`` contains sensitive text, else ``'<redacted>'``."""
+    if _scan_text(value, context="diag", allow_loopback=True):
+        return "<redacted>"
+    return repr(value)
+
+
+def _redact_error_text(text: str) -> str:
+    """Scrub secret tokens, internal domains, prohibited tokens, and private IPs from error text."""
+    scrubbed = text
+    for label, pattern in _SENSITIVE_PATTERNS:
+        if label != "local_path":
+            scrubbed = pattern.sub("<redacted>", scrubbed)
+    return _IPV4_RE.sub(
+        lambda m: m.group(0) if m.group(0) == "127.0.0.1" else "<redacted-ip>",
+        scrubbed,
+    )
+
+
 def _walk_strings(obj: Any, prefix: str = "") -> list[tuple[str, str]]:
     items: list[tuple[str, str]] = []
     if isinstance(obj, str):
@@ -3925,7 +3944,7 @@ def validate_serving_recipe_structure(
                 v_model_asset = vid["assets"]["model"]
                 if v_model_asset == top_id["assets"]["model"]:
                     raise ValidationError(
-                        f"{context}.variants.{vname}.assets.model ({v_model_asset!r}) "
+                        f"{context}.variants.{vname}.assets.model ({_safe_diag_repr(v_model_asset)}) "
                         "duplicates default/top-level value "
                         "(set distinct assets or declare allow_shared_fields: [assets])"
                     )
@@ -3939,7 +3958,7 @@ def validate_serving_recipe_structure(
                             else f"variant {other_name!r}"
                         )
                         raise ValidationError(
-                            f"{context}.variants.{vname}.assets.model ({v_model_asset!r}) "
+                            f"{context}.variants.{vname}.assets.model ({_safe_diag_repr(v_model_asset)}) "
                             f"duplicates {target} "
                             "(set distinct assets or declare allow_shared_fields: [assets])"
                         )
@@ -3956,7 +3975,7 @@ def validate_serving_recipe_structure(
                 val = vid[field]
                 if val == top_id[field]:
                     raise ValidationError(
-                        f"{context}.variants.{vname}.{field} ({val!r}) duplicates "
+                        f"{context}.variants.{vname}.{field} ({_safe_diag_repr(val)}) duplicates "
                         f"default/top-level value (set distinct {field} or declare "
                         f"allow_shared_fields: [{field}])"
                     )
@@ -3970,7 +3989,7 @@ def validate_serving_recipe_structure(
                             else f"variant {other_name!r}"
                         )
                         raise ValidationError(
-                            f"{context}.variants.{vname}.{field} ({val!r}) duplicates "
+                            f"{context}.variants.{vname}.{field} ({_safe_diag_repr(val)}) duplicates "
                             f"{target} (set distinct {field} or declare "
                             f"allow_shared_fields: [{field}])"
                         )
@@ -5499,7 +5518,7 @@ def _collect_resolved_diff_entries(
                     entries[("policy", f"{slug}:error")] = {
                         "label": f"policy:{slug}",
                         "tier": "invalid",
-                        "argv": [f"<unresolved: {exc}>"],
+                        "argv": [f"<unresolved: {_redact_error_text(str(exc))}>"],
                         "env": {},
                     }
 
@@ -5544,7 +5563,7 @@ def _collect_resolved_diff_entries(
                     entries[("recipe", f"{rec_rel} (error)")] = {
                         "label": rec_rel,
                         "tier": "invalid",
-                        "argv": [f"<unresolved: {exc}>"],
+                        "argv": [f"<unresolved: {_redact_error_text(str(exc))}>"],
                         "env": {},
                     }
     return entries
@@ -5938,5 +5957,5 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except ValidationError as error:
-        print(f"validation error: {error}", file=sys.stderr)
+        print(f"validation error: {_redact_error_text(str(error))}", file=sys.stderr)
         raise SystemExit(1) from error
