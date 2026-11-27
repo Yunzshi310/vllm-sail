@@ -10,6 +10,7 @@ import copy
 import hashlib
 import importlib
 import json
+import math
 import os
 import re
 import shlex
@@ -1597,7 +1598,7 @@ def _reject_dotted_cli_flags(
 
 
 def _parse_device_ids_flag(raw: str | None, *, context: str) -> list[int | str]:
-    """Parse ``--device-ids`` CSV matching pinned ``EngineArgs``."""
+    """Parse ``--device-ids`` CSV tokens matching pinned ``EngineArgs`` CLI type."""
     if raw is None or not raw.strip():
         raise ValidationError(
             f"{context}: --device-ids requires comma-separated device indices or UUIDs"
@@ -1617,25 +1618,30 @@ def _parse_device_ids_flag(raw: str | None, *, context: str) -> list[int | str]:
             )
         else:
             parsed.append(part)
-    has_int = any(type(item) is int for item in parsed)
-    has_str = any(type(item) is str for item in parsed)
+    return parsed
+
+
+def _check_device_slice_uniform_type(
+    items: Sequence[int | str], *, context: str
+) -> None:
+    has_int = any(type(item) is int for item in items)
+    has_str = any(type(item) is str for item in items)
     if has_int and has_str:
         raise ValidationError(
-            f"{context}: --device-ids cannot mix integer device indices and UUID strings: {raw!r}"
+            f"{context}: --device-ids cannot mix integer device indices and UUID strings: {list(items)!r}"
         )
-    return parsed
 
 
 def _known_visible_device_count(
     effective_env: Mapping[str, str],
-    topo_devices_per_node: int | None,
+    _topo_devices_per_node: int | None = None,
 ) -> int | None:
     if "CUDA_VISIBLE_DEVICES" in effective_env:
         cvd_raw = effective_env["CUDA_VISIBLE_DEVICES"].strip()
         if cvd_raw in {"", "-1", "void", "none", "NoDevFiles"}:
             return 0
         return len([tok.strip() for tok in cvd_raw.split(",") if tok.strip()])
-    return topo_devices_per_node
+    return None
 
 
 def _validate_topology_flag_and_placeholder_wiring(
@@ -2142,6 +2148,14 @@ def _eval_single_node_parallel_dp_and_frontend(
                 f"{sup_start_rank + dpl_explicit - 1}] exceed --data-parallel-size ({cli_dp_val})"
             )
         slice_width = tp_val * pp_val
+        child_local_world_size = tp_val * pp_val * pcp_val
+        if slice_width < child_local_world_size:
+            raise ValidationError(
+                f"{context}: --data-parallel-multi-port-external-lb slices "
+                f"TP*PP={slice_width} device(s) per child, which is smaller than "
+                f"child local_world_size TP*PP*PCP={child_local_world_size} "
+                f"(prefill_context_parallel_size={pcp_val})"
+            )
         effective_device_ids: list[int | str] = (
             parsed_device_ids
             if parsed_device_ids is not None
@@ -2158,6 +2172,10 @@ def _eval_single_node_parallel_dp_and_frontend(
                     f"but multi-port child rank {local_rank} requires slice [{start_idx}:{end_idx}] "
                     f"of width TP*PP={slice_width} (need at least {dpl_explicit * slice_width})"
                 )
+            _check_device_slice_uniform_type(
+                child_slice,
+                context=f"{context} (multi-port child rank {local_rank})",
+            )
             if len(set(child_slice)) != len(child_slice):
                 raise ValidationError(
                     f"{context}: --device-ids slice {child_slice} for multi-port child rank "
@@ -2271,18 +2289,23 @@ def _eval_single_node_parallel_dp_and_frontend(
             f"{context}: data_parallel_external_lb can only be set when data_parallel_size > 1"
         )
     if not serve_multi_port and parsed_device_ids is not None:
+        _check_device_slice_uniform_type(parsed_device_ids, context=context)
         if len(set(parsed_device_ids)) != len(parsed_device_ids):
             raise ValidationError(
                 f"{context}: --device-ids contains duplicate device IDs: {parsed_device_ids}"
             )
         expected_local_devs = (
-            max(world_within_dp // topo_nodes, 1)
-            if topo_nodes > 1 and world_within_dp > (cli_world // topo_nodes)
-            else dp_local_val * world_within_dp
+            dp_local_val
+            if dist_exec_backend == "ray"
+            else (
+                max(world_within_dp // topo_nodes, 1)
+                if topo_nodes > 1 and world_within_dp > (cli_world // topo_nodes)
+                else dp_local_val * world_within_dp
+            )
         )
-        if len(parsed_device_ids) != expected_local_devs:
+        if len(parsed_device_ids) < expected_local_devs:
             raise ValidationError(
-                f"{context}: --device-ids length ({len(parsed_device_ids)}) must match "
+                f"{context}: --device-ids length ({len(parsed_device_ids)}) is smaller than "
                 f"local device requirement ({expected_local_devs})"
             )
         if known_visible is not None:
@@ -2882,6 +2905,69 @@ def _canonical_pd_transfer_specs(
     )
 
 
+def _parse_positive_hisparse_pool_gib(raw_val: Any, *, context: str) -> float:
+    """Validate ``host_pool_gib`` matching pinned ``hisparse_host_pool_gib`` ``float()`` semantics."""
+    if (
+        raw_val is None
+        or isinstance(raw_val, bool)
+        or not isinstance(raw_val, int | float | str)
+        or (isinstance(raw_val, str) and not raw_val.strip())
+    ):
+        raise ValidationError(
+            f"{context}: HiSparseConnector requires positive "
+            f"kv_connector_extra_config.host_pool_gib, got {raw_val!r}"
+        )
+    try:
+        pool_val = float(raw_val)
+    except ValueError as exc:
+        raise ValidationError(
+            f"{context}: HiSparseConnector host_pool_gib must be convertible to a "
+            f"positive float, got {raw_val!r}"
+        ) from exc
+    if not math.isfinite(pool_val) or pool_val <= 0:
+        raise ValidationError(
+            f"{context}: HiSparseConnector requires positive "
+            f"kv_connector_extra_config.host_pool_gib, got {raw_val!r}"
+        )
+    return pool_val
+
+
+def _root_hisparse_host_pool_gib(
+    kv_obj: Mapping[str, Any] | None, *, context: str
+) -> float | None:
+    """Mirror pinned ``vllm.config.kv_transfer.hisparse_host_pool_gib`` root/direct-child lookup."""
+    if kv_obj is None:
+        return None
+    if kv_obj.get("kv_connector") == "MultiConnector":
+        raw_children = (kv_obj.get("kv_connector_extra_config") or {}).get(
+            "connectors"
+        ) or []
+        candidates = [
+            (f"{context}.connectors[{idx}]", sub)
+            for idx, sub in enumerate(raw_children)
+            if isinstance(sub, Mapping)
+        ]
+    else:
+        candidates = [(context, kv_obj)]
+
+    matched = [
+        (sub_ctx, sub_obj)
+        for sub_ctx, sub_obj in candidates
+        if sub_obj.get("kv_connector") == "HiSparseConnector"
+    ]
+    if len(matched) > 1:
+        raise ValidationError(
+            f"{matched[1][0]}: only one HiSparseConnector may be configured"
+        )
+    if not matched:
+        return None
+    hs_ctx, hs_obj = matched[0]
+    hs_extra = hs_obj.get("kv_connector_extra_config") or {}
+    return _parse_positive_hisparse_pool_gib(
+        hs_extra.get("host_pool_gib"), context=hs_ctx
+    )
+
+
 def _validate_mooncake_pd_leaf(
     kv_obj: Mapping[str, Any],
     *,
@@ -3279,25 +3365,28 @@ def _validate_resolved_topology_and_placeholders(
             allowed_roles=allowed_leaf_roles,
             context=context,
         )
-        hisparse_count = 0
+        hisparse_leaves = [
+            (leaf_ctx, leaf_obj)
+            for leaf_spec, _leaf_role, leaf_obj, leaf_ctx, _has_kv_port in leaves
+            if leaf_spec[:2] == ("builtin", "HiSparseConnector")
+        ]
+        if len(hisparse_leaves) > 1:
+            raise ValidationError(
+                f"{hisparse_leaves[1][0]}: only one HiSparseConnector may be configured"
+            )
+        if hisparse_leaves:
+            hs_ctx, hs_obj = hisparse_leaves[0]
+            hs_extra = hs_obj.get("kv_connector_extra_config") or {}
+            _parse_positive_hisparse_pool_gib(
+                hs_extra.get("host_pool_gib"), context=hs_ctx
+            )
+            if _root_hisparse_host_pool_gib(kv_obj, context=context) is None:
+                raise ValidationError(
+                    f"{hs_ctx}: HiSparseConnector must be configured at the root or as "
+                    f"a direct child of the root MultiConnector so "
+                    f"VllmConfig.hisparse_host_pool_gib can read host_pool_gib"
+                )
         for leaf_spec, _leaf_role, leaf_obj, leaf_ctx, has_kv_port in leaves:
-            if leaf_spec[:2] == ("builtin", "HiSparseConnector"):
-                hisparse_count += 1
-                if hisparse_count > 1:
-                    raise ValidationError(
-                        f"{leaf_ctx}: only one HiSparseConnector may be configured"
-                    )
-                hs_extra = leaf_obj.get("kv_connector_extra_config") or {}
-                pool_gib = hs_extra.get("host_pool_gib")
-                if (
-                    isinstance(pool_gib, bool)
-                    or not isinstance(pool_gib, int | float)
-                    or float(pool_gib) <= 0
-                ):
-                    raise ValidationError(
-                        f"{leaf_ctx}: HiSparseConnector requires positive "
-                        f"kv_connector_extra_config.host_pool_gib, got {pool_gib!r}"
-                    )
             if leaf_spec[:2] == ("builtin", "MooncakeConnector"):
                 _validate_mooncake_pd_leaf(
                     leaf_obj,
@@ -3305,6 +3394,24 @@ def _validate_resolved_topology_and_placeholders(
                     role=role,
                     context=leaf_ctx,
                     has_inert_kv_port=has_kv_port,
+                )
+
+    attn_raw = _flag_value(entries, "--attention-config")
+    if attn_raw is not None:
+        attn_obj = json.loads(attn_raw)
+        if (
+            isinstance(attn_obj, Mapping)
+            and attn_obj.get("hisparse_config") is not None
+        ):
+            kv_for_hs_raw = _flag_value(entries, "--kv-transfer-config")
+            kv_for_hs_obj = (
+                json.loads(kv_for_hs_raw) if kv_for_hs_raw is not None else None
+            )
+            if _root_hisparse_host_pool_gib(kv_for_hs_obj, context=context) is None:
+                raise ValidationError(
+                    f"{context}: --attention-config hisparse_config requires "
+                    f"HiSparseConnector at the root or as a direct child of the "
+                    f"root MultiConnector with positive host_pool_gib"
                 )
 
     sub_flags, sub_env = substitute_validation_placeholders(flags, server_env)
