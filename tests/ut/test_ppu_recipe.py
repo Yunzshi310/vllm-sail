@@ -141,6 +141,7 @@ def _sample_vllm_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reasoning-parser")
     parser.add_argument("--reasoning-config")
     parser.add_argument("--speculative-config")
+    parser.add_argument("--attention-config")
     parser.add_argument("--compilation-config")
     parser.add_argument("--seed", type=int)
     parser.add_argument("--enable-prefix-caching", action="store_true")
@@ -7070,13 +7071,27 @@ def test_pr462_r3_dp_supervisor_child_device_slices_and_port_bounds(
         ("dup_same_child", 2, 1, 4, ["--device-ids", "0,0,2,3,4,5,6,7"]),
         ("dup_across_children", 1, 1, 8, ["--device-ids", "0,1,2,3,4,5,6,0"]),
         ("mixed_int_uuid", 2, 1, 4, ["--device-ids", "0,GPU-example,2,3,4,5,6,7"]),
-        ("index_out_of_range", 2, 1, 4, ["--device-ids", "0,1,2,3,4,5,6,8"]),
     ):
         _write_multiport(tp, pp, n, bad_extra)
         with pytest.raises(ppu_recipe.ValidationError, match="--device-ids|device"):
             ppu_recipe.validate_paths([rec_path], vllm_parser_mode="skip")
         with pytest.raises(ppu_recipe.ValidationError, match="--device-ids|device"):
             ppu_recipe.resolve_recipe(rec_path, preset="decode_ep")
+
+    # Relative index 8: static catalog registration with unknown visible set passes,
+    # whereas an explicit 8-card CUDA_VISIBLE_DEVICES rejects index 8 at resolution time.
+    _write_multiport(2, 1, 4, ["--device-ids", "0,1,2,3,4,5,6,8"])
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    assert (
+        ppu_recipe.validate_paths([rec_path], vllm_parser_mode="skip")[
+            "checked_combinations"
+        ]
+        == 12
+    )
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1,2,3,4,5,6,7")
+    with pytest.raises(ppu_recipe.ValidationError, match="index 8 out of range"):
+        ppu_recipe.resolve_recipe(rec_path, preset="decode_ep")
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
 
     # Implicit multi-port allocation (omitted --device-ids) on 4 visible cards fails closed when
     # local_dp * TP * PP == 8 (rank 4 would consume index 4), while 8 visible cards passes.
@@ -7312,3 +7327,689 @@ def test_pr462_r3_runner_device_quota_after_overrides_and_scoped_ambient_dp(
             runner_fn(rdir)
         assert len(seen_launches) == 1
         assert seen_launches[0]["tp"] == "4" and seen_launches[0]["dp"] == "1"
+
+
+def _sim_resolve_physical_device_ids(
+    raw_csv: str,
+    *,
+    cvd: str | None,
+    uuid_inventory: dict[str, int] | None = None,
+) -> list[int]:
+    """Mirror pinned EngineArgs._resolve_device_ids on a synthetic CPU inventory."""
+    inv = uuid_inventory or {}
+    ids = [
+        int(tok) if tok.isdigit() else tok
+        for tok in (part.strip() for part in raw_csv.split(","))
+    ]
+    if len(set(ids)) != len(ids):
+        raise ValueError(f"--device-ids must not contain duplicates: {ids}")
+    if all(isinstance(i, str) for i in ids):
+        return [inv[str(i)] for i in ids]
+    if any(isinstance(i, str) for i in ids):
+        raise ValueError("--device-ids must not mix integer IDs and UUIDs")
+    int_ids = [int(i) for i in ids]
+    if cvd:
+        cvd_ids = [
+            int(x) if x.strip().isdigit() else inv[x.strip()]
+            for x in cvd.split(",")
+            if x.strip()
+        ]
+        for i in int_ids:
+            if not 0 <= i < len(cvd_ids):
+                raise ValueError(
+                    f"--device-ids index {i} is out of range for CUDA_VISIBLE_DEVICES={cvd}"
+                )
+        return [cvd_ids[i] for i in int_ids]
+    return int_ids
+
+
+def test_pr462_r4_1_ordinary_tp4_device_ids_map_lower_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(ppu_recipe, "_build_vllm_serve_parser", _sample_vllm_parser)
+    orig_recipe = yaml.safe_load(
+        (RECIPES_DIR / "zai-org" / "GLM-5.3.yaml").read_text(encoding="utf-8")
+    )
+    rec_path = tmp_path / "GLM-5.3-tp4-map-len.yaml"
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1,2,3,4,5,6,7")
+
+    for n_ids, expect_ok in ((4, True), (8, True), (3, False)):
+        doc = copy.deepcopy(orig_recipe)
+        slot = doc["presets"]["prefill"]
+        slot.update(
+            tp=4,
+            topology={"kind": "single_node", "nodes": 1, "devices_per_node": 8},
+        )
+        raw_ids = ",".join(str(i) for i in range(n_ids))
+        slot["args"].extend(["--device-ids", raw_ids])
+        rec_path.write_text(yaml.safe_dump(doc, sort_keys=False), encoding="utf-8")
+        if expect_ok:
+            assert (
+                ppu_recipe.validate_paths([rec_path], vllm_parser_mode="required")[
+                    "checked_combinations"
+                ]
+                == 12
+            )
+            res = ppu_recipe.resolve_recipe(rec_path, preset="prefill")
+            assert res["ppu_count"] == 4
+            phys = _sim_resolve_physical_device_ids(raw_ids, cvd="0,1,2,3,4,5,6,7")
+            assert len(phys) >= 4 and phys[:4] == [0, 1, 2, 3]
+        else:
+            with pytest.raises(ppu_recipe.ValidationError, match="--device-ids length"):
+                ppu_recipe.validate_paths([rec_path], vllm_parser_mode="skip")
+            with pytest.raises(ppu_recipe.ValidationError, match="--device-ids length"):
+                ppu_recipe.resolve_recipe(rec_path, preset="prefill")
+
+    # Ordinary mode continues to check full-list duplicates, mixed int/UUID, and visible bounds
+    for bad_ids in (
+        "0,1,2,2",
+        "0,1,2,3,4,5,6,0",
+        "0,1,2,GPU-00000000-0000-0000-0000-000000000003",
+        "0,1,2,8",
+    ):
+        bad_doc = copy.deepcopy(orig_recipe)
+        bad_doc["presets"]["prefill"].update(
+            tp=4,
+            topology={"kind": "single_node", "nodes": 1, "devices_per_node": 8},
+        )
+        bad_doc["presets"]["prefill"]["args"].extend(["--device-ids", bad_ids])
+        rec_path.write_text(yaml.safe_dump(bad_doc, sort_keys=False), encoding="utf-8")
+        with pytest.raises(ppu_recipe.ValidationError, match="--device-ids"):
+            ppu_recipe.resolve_recipe(rec_path, preset="prefill")
+
+
+def test_pr462_r4_2_device_ids_visible_indices_vs_declared_job_devices(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recipe_rel = Path("tests/ppu/recipes/zai-org/GLM-5.3.yaml")
+    pol_rel = Path("tests/ppu/policy/models/glm-5.3.yaml")
+    ds_rel = Path("tests/ppu/policy/datasets/gsm8k.yaml")
+
+    orig_recipe = yaml.safe_load((ROOT / recipe_rel).read_text(encoding="utf-8"))
+    for rel in (recipe_rel, pol_rel, ds_rel):
+        dst = tmp_path / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes((ROOT / rel).read_bytes())
+    rec_path = tmp_path / recipe_rel
+    pol_path = tmp_path / pol_rel
+
+    monkeypatch.setattr(ppu_e2e_select, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(ppu_recipe, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(ppu_recipe_runner, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(
+        ppu_recipe_runner, "resolve_local_checkpoint_dir", lambda *_a, **_kw: None
+    )
+    monkeypatch.setenv("GSM8K_DATASET_PATH", str(tmp_path / "gsm8k_sentinel"))
+
+    class _StopLaunch(BaseException):
+        pass
+
+    popen_count = 0
+
+    def _intercept_popen(*_a, **_kw):
+        nonlocal popen_count
+        popen_count += 1
+        raise _StopLaunch
+
+    monkeypatch.setattr(ppu_recipe_runner.subprocess, "Popen", _intercept_popen)
+
+    # 1. TP4, devices_per_node=4 with --device-ids 4,5,6,7:
+    #    - static catalog passes regardless of ambient CUDA_VISIBLE_DEVICES
+    #    - 8 visible cards (0..7) resolves ppu_count=4 -> physical [4,5,6,7], runners launch
+    #    - 4 visible cards (0..3) rejects before Popen across resolve_recipe and Fast/Model runners
+    upper_doc = copy.deepcopy(orig_recipe)
+    upper_doc["presets"]["prefill"].update(
+        tp=4,
+        topology={"kind": "single_node", "nodes": 1, "devices_per_node": 4},
+    )
+    upper_doc["presets"]["prefill"]["args"].extend(["--device-ids", "4,5,6,7"])
+    rec_path.write_text(yaml.safe_dump(upper_doc, sort_keys=False), encoding="utf-8")
+
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    assert (
+        ppu_recipe.validate_paths([rec_path], vllm_parser_mode="skip")[
+            "checked_combinations"
+        ]
+        == 12
+    )
+
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1,2,3,4,5,6,7")
+    assert (
+        ppu_recipe.validate_paths([rec_path], vllm_parser_mode="skip")[
+            "checked_combinations"
+        ]
+        == 12
+    )
+    assert ppu_recipe.resolve_recipe(rec_path, preset="prefill")["ppu_count"] == 4
+    assert _sim_resolve_physical_device_ids("4,5,6,7", cvd="0,1,2,3,4,5,6,7") == [
+        4,
+        5,
+        6,
+        7,
+    ]
+    popen_count = 0
+    with pytest.raises(_StopLaunch):
+        ppu_recipe_runner.run_fast_sanity(
+            recipe_path=rec_path,
+            policy_path=pol_path,
+            results_dir=tmp_path / "fs_upper_8vis",
+            preset="prefill",
+            layer_mode="full",
+            parser_mode="skip",
+        )
+    assert popen_count == 1
+
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1,2,3")
+    assert (
+        ppu_recipe.validate_paths([rec_path], vllm_parser_mode="skip")[
+            "checked_combinations"
+        ]
+        == 12
+    )
+    with pytest.raises(ppu_recipe.ValidationError, match="index 4 out of range"):
+        ppu_recipe.resolve_recipe(rec_path, preset="prefill")
+    for fn, rdir in (
+        (
+            lambda d: ppu_recipe_runner.run_fast_sanity(
+                recipe_path=rec_path,
+                policy_path=pol_path,
+                results_dir=d,
+                preset="prefill",
+                layer_mode="full",
+                parser_mode="skip",
+            ),
+            tmp_path / "fs_upper_4vis",
+        ),
+        (
+            lambda d: ppu_recipe_runner.run_model_sanity(
+                recipe_path=rec_path,
+                policy_path=pol_path,
+                results_dir=d,
+                preset="prefill",
+                parser_mode="skip",
+            ),
+            tmp_path / "ms_upper_4vis",
+        ),
+    ):
+        popen_count = 0
+        with pytest.raises(ppu_recipe.ValidationError, match="index 4 out of range"):
+            fn(rdir)
+        assert popen_count == 0
+
+    # 2. Opposite positive control: CUDA_VISIBLE_DEVICES="4,5,6,7" with --device-ids 0,1,2,3 -> physical [4,5,6,7]
+    low_doc = copy.deepcopy(orig_recipe)
+    low_doc["presets"]["prefill"].update(
+        tp=4,
+        topology={"kind": "single_node", "nodes": 1, "devices_per_node": 4},
+    )
+    low_doc["presets"]["prefill"]["args"].extend(["--device-ids", "0,1,2,3"])
+    rec_path.write_text(yaml.safe_dump(low_doc, sort_keys=False), encoding="utf-8")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "4,5,6,7")
+    assert ppu_recipe.resolve_recipe(rec_path, preset="prefill")["ppu_count"] == 4
+    assert _sim_resolve_physical_device_ids("0,1,2,3", cvd="4,5,6,7") == [4, 5, 6, 7]
+    popen_count = 0
+    with pytest.raises(_StopLaunch):
+        ppu_recipe_runner.run_fast_sanity(
+            recipe_path=rec_path,
+            policy_path=pol_path,
+            results_dir=tmp_path / "fs_low_on_4567",
+            preset="prefill",
+            layer_mode="full",
+            parser_mode="skip",
+        )
+    assert popen_count == 1
+
+
+def test_pr462_r4_3_supervisor_per_child_device_id_types_and_unused_tail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(ppu_recipe, "_build_vllm_serve_parser", _sample_vllm_parser)
+    orig_recipe = yaml.safe_load(
+        (RECIPES_DIR / "zai-org" / "GLM-5.3.yaml").read_text(encoding="utf-8")
+    )
+    rec_path = tmp_path / "GLM-5.3-sup-slice-types.yaml"
+    inventory = {f"GPU-00000000-0000-0000-0000-{i:012d}": i for i in range(8)}
+    uuids = list(inventory)
+
+    def _write_sup_dp4_tp2(id_tokens: list[str]) -> str:
+        doc = copy.deepcopy(orig_recipe)
+        flags = doc["presets"]["decode_ep"]["args"]
+        flags[flags.index("--data-parallel-size") + 1] = "16"
+        raw = ",".join(id_tokens)
+        flags.extend(
+            [
+                "--data-parallel-multi-port-external-lb",
+                "--data-parallel-size-local",
+                "4",
+                "--tensor-parallel-size",
+                "2",
+                "--device-ids",
+                raw,
+            ]
+        )
+        rec_path.write_text(yaml.safe_dump(doc, sort_keys=False), encoding="utf-8")
+        return raw
+
+    for label, ok_tokens in (
+        ("numeric", [str(i) for i in range(8)]),
+        ("uuids", uuids),
+        ("mixed_across", ["0", "1", *uuids[2:4], "4", "5", *uuids[6:8]]),
+        ("unused_uuid_tail", [*(str(i) for i in range(8)), uuids[0]]),
+    ):
+        raw = _write_sup_dp4_tp2(ok_tokens)
+        assert (
+            ppu_recipe.validate_paths([rec_path], vllm_parser_mode="required")[
+                "checked_combinations"
+            ]
+            == 12
+        ), label
+        child_phys = [
+            _sim_resolve_physical_device_ids(
+                ",".join(ok_tokens[r * 2 : (r + 1) * 2]),
+                cvd="0,1,2,3,4,5,6,7",
+                uuid_inventory=inventory,
+            )
+            for r in range(4)
+        ]
+        assert child_phys == [[0, 1], [2, 3], [4, 5], [6, 7]], (label, raw)
+
+    for _bad_label, bad_tokens in (
+        ("mixed_within_child0", ["0", uuids[1], "2", "3", "4", "5", "6", "7"]),
+        ("short_slice", ["0", "1", "2", "3", "4", "5", "6"]),
+        ("dup_in_slice", ["0", "0", "2", "3", "4", "5", "6", "7"]),
+        ("reuse_across_children_int", ["0", "1", "2", "3", "0", "5", "6", "7"]),
+        (
+            "reuse_across_children_uuid",
+            [
+                uuids[0],
+                uuids[1],
+                uuids[2],
+                uuids[3],
+                uuids[0],
+                uuids[5],
+                uuids[6],
+                uuids[7],
+            ],
+        ),
+    ):
+        _write_sup_dp4_tp2(bad_tokens)
+        with pytest.raises(ppu_recipe.ValidationError, match="--device-ids|device"):
+            ppu_recipe.validate_paths([rec_path], vllm_parser_mode="skip")
+        with pytest.raises(ppu_recipe.ValidationError, match="--device-ids|device"):
+            ppu_recipe.resolve_recipe(rec_path, preset="decode_ep")
+
+
+def test_pr462_r4_4_hisparse_host_pool_gib_numeric_and_string_float(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(ppu_recipe, "_build_vllm_serve_parser", _sample_vllm_parser)
+    orig_recipe = yaml.safe_load(
+        (RECIPES_DIR / "zai-org" / "GLM-5.3.yaml").read_text(encoding="utf-8")
+    )
+    rec_path = tmp_path / "GLM-5.3-hisparse-pool.yaml"
+
+    def _build_hisparse_doc(pool_val, *, include_key: bool = True) -> dict:
+        doc = copy.deepcopy(orig_recipe)
+        for slot in ("pd_prefill", "pd_decode"):
+            args = doc["presets"][slot]["args"]
+            args.extend(["--attention-config", '{"hisparse_config":{}}'])
+            idx = args.index("--kv-transfer-config") + 1
+            moon = json.loads(args[idx])
+            hs_extra = {"host_pool_gib": pool_val} if include_key else {}
+            args[idx] = json.dumps(
+                {
+                    "kv_connector": "MultiConnector",
+                    "kv_role": moon["kv_role"],
+                    "kv_connector_extra_config": {
+                        "connectors": [
+                            moon,
+                            {
+                                "kv_connector": "HiSparseConnector",
+                                "kv_role": "kv_both",
+                                "kv_connector_extra_config": hs_extra,
+                            },
+                        ]
+                    },
+                },
+                separators=(",", ":"),
+            )
+        return doc
+
+    for valid_val, expected_gib in ((4, 4.0), ("4", 4.0), ("4.5", 4.5)):
+        ok_doc = _build_hisparse_doc(valid_val)
+        rec_path.write_text(yaml.safe_dump(ok_doc, sort_keys=False), encoding="utf-8")
+        assert (
+            ppu_recipe.validate_paths([rec_path], vllm_parser_mode="required")[
+                "checked_combinations"
+            ]
+            == 12
+        )
+        assert float(valid_val) == expected_gib
+
+    for bad_doc in (
+        _build_hisparse_doc(None, include_key=False),
+        _build_hisparse_doc(None),
+        _build_hisparse_doc(0),
+        _build_hisparse_doc("0"),
+        _build_hisparse_doc(-1),
+        _build_hisparse_doc("-1"),
+        _build_hisparse_doc("invalid"),
+        _build_hisparse_doc(True),
+        _build_hisparse_doc("nan"),
+    ):
+        rec_path.write_text(yaml.safe_dump(bad_doc, sort_keys=False), encoding="utf-8")
+        with pytest.raises(ppu_recipe.ValidationError, match="host_pool_gib"):
+            ppu_recipe.validate_paths([rec_path], vllm_parser_mode="skip")
+
+
+def test_pr462_r4_5_hisparse_root_direct_child_depth_vs_nested_wrapper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(ppu_recipe, "_build_vllm_serve_parser", _sample_vllm_parser)
+    orig_recipe = yaml.safe_load(
+        (RECIPES_DIR / "zai-org" / "GLM-5.3.yaml").read_text(encoding="utf-8")
+    )
+    rec_path = tmp_path / "GLM-5.3-hisparse-depth.yaml"
+
+    def _wrap(child: dict, role: str | None = None) -> dict:
+        return {
+            "kv_connector": "MultiConnector",
+            "kv_role": role or child["kv_role"],
+            "kv_connector_extra_config": {"connectors": [child]},
+        }
+
+    # 1. Direct child Multi[Mooncake, HiSparse(4)] with --attention-config hisparse_config passes
+    direct_doc = copy.deepcopy(orig_recipe)
+    for slot in ("pd_prefill", "pd_decode"):
+        args = direct_doc["presets"][slot]["args"]
+        args.extend(["--attention-config", '{"hisparse_config":{}}'])
+        idx = args.index("--kv-transfer-config") + 1
+        moon = json.loads(args[idx])
+        parent = _wrap(moon)
+        parent["kv_connector_extra_config"]["connectors"].append(
+            {
+                "kv_connector": "HiSparseConnector",
+                "kv_role": "kv_both",
+                "kv_connector_extra_config": {"host_pool_gib": 4},
+            }
+        )
+        args[idx] = json.dumps(parent, separators=(",", ":"))
+    rec_path.write_text(yaml.safe_dump(direct_doc, sort_keys=False), encoding="utf-8")
+    assert (
+        ppu_recipe.validate_paths([rec_path], vllm_parser_mode="required")[
+            "checked_combinations"
+        ]
+        == 12
+    )
+
+    # 2. Nested Multi[Mooncake, Multi[HiSparse(4)]] fails because root hisparse_host_pool_gib reads None
+    nested_hs_doc = copy.deepcopy(orig_recipe)
+    for slot in ("pd_prefill", "pd_decode"):
+        args = nested_hs_doc["presets"][slot]["args"]
+        args.extend(["--attention-config", '{"hisparse_config":{}}'])
+        idx = args.index("--kv-transfer-config") + 1
+        moon = json.loads(args[idx])
+        parent = _wrap(moon)
+        parent["kv_connector_extra_config"]["connectors"].append(
+            _wrap(
+                {
+                    "kv_connector": "HiSparseConnector",
+                    "kv_role": "kv_both",
+                    "kv_connector_extra_config": {"host_pool_gib": 4},
+                }
+            )
+        )
+        args[idx] = json.dumps(parent, separators=(",", ":"))
+    rec_path.write_text(
+        yaml.safe_dump(nested_hs_doc, sort_keys=False), encoding="utf-8"
+    )
+    with pytest.raises(ppu_recipe.ValidationError, match="HiSparseConnector"):
+        ppu_recipe.validate_paths([rec_path], vllm_parser_mode="skip")
+    with pytest.raises(ppu_recipe.ValidationError, match="HiSparseConnector"):
+        ppu_recipe.resolve_recipe(rec_path, preset="pd_decode")
+
+    # 3. --attention-config hisparse_config without HiSparseConnector also fails closed
+    missing_hs_doc = copy.deepcopy(orig_recipe)
+    for slot in ("pd_prefill", "pd_decode"):
+        missing_hs_doc["presets"][slot]["args"].extend(
+            ["--attention-config", '{"hisparse_config":{}}']
+        )
+    rec_path.write_text(
+        yaml.safe_dump(missing_hs_doc, sort_keys=False), encoding="utf-8"
+    )
+    with pytest.raises(ppu_recipe.ValidationError, match="hisparse_config|HiSparse"):
+        ppu_recipe.validate_paths([rec_path], vllm_parser_mode="skip")
+
+
+def test_pr462_r4_6_multiport_slice_width_vs_pcp_worker_local_world_size(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(ppu_recipe, "_build_vllm_serve_parser", _sample_vllm_parser)
+    orig_recipe = yaml.safe_load(
+        (RECIPES_DIR / "zai-org" / "GLM-5.3.yaml").read_text(encoding="utf-8")
+    )
+    rec_path = tmp_path / "GLM-5.3-multiport-pcp.yaml"
+
+    def _write_sn_multiport(tp: int, pcp: int, extra: list[str] | None = None) -> None:
+        doc = copy.deepcopy(orig_recipe)
+        slot = doc["presets"]["prefill"]
+        slot.update(
+            tp=tp,
+            topology={"kind": "single_node", "nodes": 1, "devices_per_node": 8},
+        )
+        slot["args"].extend(
+            [
+                "--data-parallel-multi-port-external-lb",
+                "--data-parallel-size",
+                "4",
+                "--data-parallel-size-local",
+                "4",
+                "--prefill-context-parallel-size",
+                str(pcp),
+                *(extra or []),
+            ]
+        )
+        rec_path.write_text(yaml.safe_dump(doc, sort_keys=False), encoding="utf-8")
+
+    # TP2 x PCP1: child slice width 2 == child local_world_size 2 -> passes
+    _write_sn_multiport(2, 1)
+    assert (
+        ppu_recipe.validate_paths([rec_path], vllm_parser_mode="required")[
+            "checked_combinations"
+        ]
+        == 12
+    )
+    assert ppu_recipe.resolve_recipe(rec_path, preset="prefill")["ppu_count"] == 8
+
+    # TP1 x PCP2 (both implicit and explicit 8-device parent list): child slice width 1 < worker local_world_size 2 -> fails
+    for extra_ids in ([], ["--device-ids", "0,1,2,3,4,5,6,7"]):
+        _write_sn_multiport(1, 2, extra_ids)
+        with pytest.raises(
+            ppu_recipe.ValidationError,
+            match="prefill_context_parallel_size|local_world_size",
+        ):
+            ppu_recipe.validate_paths([rec_path], vllm_parser_mode="skip")
+        with pytest.raises(
+            ppu_recipe.ValidationError,
+            match="prefill_context_parallel_size|local_world_size",
+        ):
+            ppu_recipe.resolve_recipe(rec_path, preset="prefill")
+
+    # Ordinary (non-multi-port) single-node TP4 x PCP2 on 8 cards remains valid
+    ord_pcp_doc = copy.deepcopy(orig_recipe)
+    ord_pcp_doc["presets"]["prefill"].update(
+        tp=4,
+        topology={"kind": "single_node", "nodes": 1, "devices_per_node": 8},
+    )
+    ord_pcp_doc["presets"]["prefill"]["args"].extend(
+        ["--prefill-context-parallel-size", "2"]
+    )
+    rec_path.write_text(yaml.safe_dump(ord_pcp_doc, sort_keys=False), encoding="utf-8")
+    assert (
+        ppu_recipe.validate_paths([rec_path], vllm_parser_mode="required")[
+            "checked_combinations"
+        ]
+        == 12
+    )
+    assert ppu_recipe.resolve_recipe(rec_path, preset="prefill")["ppu_count"] == 8
+
+
+def test_pr462_r4_uuid_visible_devices_cross_child_and_worker_visibility(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R1 review catch: canonicalize int ordinals and UUIDs against UUID CUDA_VISIBLE_DEVICES."""
+    import ppu_e2e_select
+    import ppu_recipe_runner
+
+    real_root = ppu_recipe.REPO_ROOT
+    monkeypatch.setattr(ppu_recipe, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(ppu_e2e_select, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(ppu_recipe_runner, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(
+        ppu_recipe, "_build_vllm_serve_parser", lambda: _sample_vllm_parser()
+    )
+
+    rec_rel = Path("tests/ppu/recipes/zai-org/GLM-5.3.yaml")
+    pol_rel = Path("tests/ppu/policy/models/glm-5.3.yaml")
+    ds_rel = Path("tests/ppu/policy/datasets/gsm8k.yaml")
+    for rel in (rec_rel, pol_rel, ds_rel):
+        dst = tmp_path / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_text((real_root / rel).read_text(encoding="utf-8"), encoding="utf-8")
+    rec_path = tmp_path / rec_rel
+    pol_path = tmp_path / pol_rel
+    orig_recipe = yaml.safe_load(rec_path.read_text(encoding="utf-8"))
+    uuids = [f"GPU-00000000-0000-0000-0000-{i:012d}" for i in range(8)]
+
+    # 1. Multi-port supervisor under UUID CUDA_VISIBLE_DEVICES=U0..U7:
+    #    0,1,U2,U3,4,5,U6,U7 -> distinct slots 0..7 (passes)
+    #    0,1,U0,U3,4,5,U6,U7 -> child 0 slot 0 collides with child 1 U0 (rejected)
+    #    0,1,U2,GPU-missing,4,5,U6,U7 -> child 1 UUID not in visible set (rejected)
+    def _write_multiport_ids(tokens: list[str], *, use_equals: bool = False) -> None:
+        doc = copy.deepcopy(orig_recipe)
+        slot = doc["presets"]["prefill"]
+        slot.update(
+            tp=2,
+            topology={"kind": "single_node", "nodes": 1, "devices_per_node": 8},
+        )
+        raw = ",".join(tokens)
+        id_arg = [f"--device-ids={raw}"] if use_equals else ["--device-ids", raw]
+        slot["args"].extend(
+            [
+                "--data-parallel-multi-port-external-lb",
+                "--data-parallel-size",
+                "4",
+                "--data-parallel-size-local",
+                "4",
+                *id_arg,
+            ]
+        )
+        rec_path.write_text(yaml.safe_dump(doc, sort_keys=False), encoding="utf-8")
+
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", ",".join(uuids))
+    for eq in (False, True):
+        _write_multiport_ids(
+            ["0", "1", uuids[2], uuids[3], "4", "5", uuids[6], uuids[7]], use_equals=eq
+        )
+        assert (
+            ppu_recipe.validate_paths([rec_path], vllm_parser_mode="skip")[
+                "checked_combinations"
+            ]
+            == 12
+        )
+        assert ppu_recipe.resolve_recipe(rec_path, preset="prefill")["ppu_count"] == 8
+
+        _write_multiport_ids(
+            ["0", "1", uuids[0], uuids[3], "4", "5", uuids[6], uuids[7]], use_equals=eq
+        )
+        assert (
+            ppu_recipe.validate_paths([rec_path], vllm_parser_mode="skip")[
+                "checked_combinations"
+            ]
+            == 12
+        )
+        with pytest.raises(ppu_recipe.ValidationError, match="reuses device"):
+            ppu_recipe.resolve_recipe(rec_path, preset="prefill")
+
+        _write_multiport_ids(
+            ["0", "1", uuids[2], "GPU-not-visible", "4", "5", uuids[6], uuids[7]],
+            use_equals=eq,
+        )
+        with pytest.raises(ppu_recipe.ValidationError, match="not visible"):
+            ppu_recipe.resolve_recipe(rec_path, preset="prefill")
+
+    # 2. Ordinary TP4 with --device-ids U4..U7 under UUID CUDA_VISIBLE_DEVICES:
+    #    - static catalog passes (12)
+    #    - visible=U4,U5,U6,U7 -> resolve=4, selector includes, Fast/Model reach Popen
+    #    - visible=U4,U5,U6,U3 -> U7 invisible -> resolve fails, default scan skips,
+    #      named select fails, Fast/Model fail closed before Popen (Popen == 0)
+    monkeypatch.setenv("GSM8K_DATASET_PATH", str(tmp_path))
+    monkeypatch.setenv("PPU_CI_DEVICE_COUNT", "4")
+    for eq in (False, True):
+        ord_doc = copy.deepcopy(orig_recipe)
+        slot = ord_doc["presets"]["prefill"]
+        slot.update(
+            tp=4,
+            topology={"kind": "single_node", "nodes": 1, "devices_per_node": 4},
+        )
+        raw_u47 = ",".join(uuids[4:8])
+        slot["args"].extend(
+            [f"--device-ids={raw_u47}"] if eq else ["--device-ids", raw_u47]
+        )
+        rec_path.write_text(yaml.safe_dump(ord_doc, sort_keys=False), encoding="utf-8")
+
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", ",".join(uuids[4:8]))
+        assert (
+            ppu_recipe.validate_paths([rec_path], vllm_parser_mode="skip")[
+                "checked_combinations"
+            ]
+            == 12
+        )
+        assert ppu_recipe.resolve_recipe(rec_path, preset="prefill")["ppu_count"] == 4
+        assert (
+            len(ppu_e2e_select.build_recipe_matrix("", "fast_sanity")["include"]) == 1
+        )
+
+        monkeypatch.setenv(
+            "CUDA_VISIBLE_DEVICES", ",".join([uuids[4], uuids[5], uuids[6], uuids[3]])
+        )
+        assert (
+            ppu_recipe.validate_paths([rec_path], vllm_parser_mode="skip")[
+                "checked_combinations"
+            ]
+            == 12
+        )
+        with pytest.raises(ppu_recipe.ValidationError, match="not visible"):
+            ppu_recipe.resolve_recipe(rec_path, preset="prefill")
+        with pytest.raises(ppu_recipe.ValidationError, match="not visible"):
+            ppu_e2e_select.build_recipe_matrix("", "fast_sanity")
+        with pytest.raises(ppu_recipe.ValidationError, match="not visible"):
+            ppu_e2e_select.build_recipe_matrix("glm-5.3", "fast_sanity")
+
+        popen_calls = 0
+
+        def _never_popen(*_a: object, **_kw: object) -> object:
+            nonlocal popen_calls
+            popen_calls += 1
+            raise AssertionError("Popen should not be reached")
+
+        monkeypatch.setattr(ppu_recipe_runner.subprocess, "Popen", _never_popen)
+        for tier in ("fast_sanity", "model_sanity"):
+            with pytest.raises(ppu_recipe.ValidationError, match="not visible"):
+                ppu_recipe_runner.main(
+                    [
+                        "--recipe",
+                        str(rec_path),
+                        "--policy",
+                        str(pol_path),
+                        "--tier",
+                        tier,
+                        "--results-dir",
+                        str(tmp_path / f"res_{tier}_{int(eq)}"),
+                        "--layer-mode",
+                        "full",
+                        "--vllm-parser",
+                        "skip",
+                    ]
+                )
+        assert popen_calls == 0
