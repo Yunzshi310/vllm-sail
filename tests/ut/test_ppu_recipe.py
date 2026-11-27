@@ -99,6 +99,8 @@ def _sample_vllm_parser() -> argparse.ArgumentParser:
     parser.add_argument("--uds")
     parser.add_argument("--ssl-keyfile")
     parser.add_argument("--ssl-certfile")
+    parser.add_argument("--ssl-ca-certs")
+    parser.add_argument("--device-ids")
     parser.add_argument("--runner")
     parser.add_argument("--convert")
     parser.add_argument("--task")
@@ -4025,9 +4027,9 @@ def test_single_node_dp_requires_all_ranks_local_and_admits_dp8_local8_control(
     assert len(explicit_items) == 1 and explicit_items[0]["ppu_count"] == 8
 
     # 3. Inherited os.environ VLLM_RAY_DP_PACK_STRATEGY=span with --data-parallel-backend ray
-    #    and omitted --data-parallel-size-local is consistently rejected across validation,
-    #    resolve_recipe, automatic/explicit selector, and _launch_resolved_server, whereas
-    #    overriding VLLM_RAY_DP_PACK_STRATEGY=fill in recipe env passes.
+    #    and omitted --data-parallel-size-local does not pollute deterministic static catalog
+    #    validation, while selected-target resolve_recipe, automatic/explicit selector, and
+    #    _launch_resolved_server reject it unless overridden in recipe env (e.g. fill).
     ray_doc = copy.deepcopy(m3_doc_orig)
     ray_doc["presets"]["dp_ep_low_latency"]["args"] = [
         *ray_doc["presets"]["dp_ep_low_latency"]["args"],
@@ -4041,11 +4043,7 @@ def test_single_node_dp_requires_all_ranks_local_and_admits_dp8_local8_control(
     assert pre_resolved_ray["dp_size_local"] == 8
 
     monkeypatch.setenv("VLLM_RAY_DP_PACK_STRATEGY", "span")
-    with pytest.raises(
-        ppu_recipe.ValidationError,
-        match=r"effective local DP size \(1\) to equal global DP size \(8\)",
-    ):
-        ppu_recipe.validate_serving_recipe_structure(ray_doc, context="ray_env_span")
+    ppu_recipe.validate_serving_recipe_structure(ray_doc, context="ray_env_span")
     with pytest.raises(
         ppu_recipe.ValidationError,
         match=r"effective local DP size \(1\) to equal global DP size \(8\)",
@@ -5692,7 +5690,7 @@ def test_pr462_r2_single_node_sanity_preset_override_and_probe_contracts(
         )
     assert len(popen_argvs) == 1 and "--port" in popen_argvs[0]
 
-    # 2. Static-valid non-probe endpoints (pooling/embed, TLS, --skip-tokenizer-init, API key)
+    # 2. Static-valid non-probe endpoints (pooling/embed, TLS, --skip-tokenizer-init)
     #    pass recipe catalog validation but are rejected by selector & runner before Popen.
     model_pol_path.unlink()
     for extra_args, extra_env, err_sub in (
@@ -5707,8 +5705,6 @@ def test_pr462_r2_single_node_sanity_preset_override_and_probe_contracts(
             "enables TLS",
         ),
         (["--skip-tokenizer-init"], {}, "sets --skip-tokenizer-init"),
-        (["--api-key", "example-only"], {}, "requires API key authentication"),
-        ([], {"VLLM_API_KEY": "example-only"}, "requires API key authentication"),
     ):
         doc = copy.deepcopy(orig_recipe)
         doc["presets"]["decode"]["args"].extend(extra_args)
@@ -5733,6 +5729,82 @@ def test_pr462_r2_single_node_sanity_preset_override_and_probe_contracts(
                 res_probe, log_path=tmp_path / "never_spawned.log"
             )
         assert popen_argvs == []
+
+    # 2b. Authentication fields (--api-key / VLLM_API_KEY) are forbidden in serving recipes
+    #     and public catalog rendering, while ambient VLLM_API_KEY or direct launch flags
+    #     still fail closed before Popen in selector/runner.
+    rec_path.write_text(yaml.safe_dump(orig_recipe, sort_keys=False), encoding="utf-8")
+    monkeypatch.setenv("VLLM_API_KEY", "example-only")
+    assert (
+        ppu_recipe.validate_paths([rec_path], vllm_parser_mode="skip")[
+            "checked_combinations"
+        ]
+        == 12
+    )
+    assert ppu_e2e_select.build_recipe_matrix("", "fast_sanity")["include"] == []
+    with pytest.raises(ValueError, match="requires API key authentication"):
+        ppu_e2e_select.build_recipe_matrix("glm-5.3-decode", "fast_sanity")
+    clean_decode_res = ppu_recipe.resolve_recipe(
+        rec_path, policy_path=fast_pol_path, tier="fast_sanity"
+    )
+    popen_argvs.clear()
+    with pytest.raises(
+        ppu_recipe.ValidationError, match="requires API key authentication"
+    ):
+        ppu_recipe_runner._launch_resolved_server(
+            clean_decode_res, log_path=tmp_path / "never_spawned_env_auth.log"
+        )
+    assert popen_argvs == []
+    monkeypatch.delenv("VLLM_API_KEY", raising=False)
+
+    direct_flag_auth = copy.deepcopy(clean_decode_res)
+    direct_flag_auth["flags"] = [
+        *clean_decode_res["flags"],
+        "--api-key",
+        "example-only",
+    ]
+    popen_argvs.clear()
+    with pytest.raises(ppu_recipe.ValidationError, match="api-key|API key"):
+        ppu_recipe_runner._launch_resolved_server(
+            direct_flag_auth, log_path=tmp_path / "never_spawned_flag_auth.log"
+        )
+    assert popen_argvs == []
+
+    kimi_orig = yaml.safe_load(
+        (RECIPES_DIR / "moonshotai" / "Kimi-K2.6.yaml").read_text(encoding="utf-8")
+    )
+    for base_doc, slot_name in (
+        (kimi_orig, "eval_longctx"),
+        (orig_recipe, "pd_decode"),
+    ):
+        for auth_args, auth_env in (
+            (["--api-key", "example-only"], {}),
+            ([], {"VLLM_API_KEY": "example-only"}),
+        ):
+            bad_auth_doc = copy.deepcopy(base_doc)
+            bad_auth_doc["presets"][slot_name].setdefault("args", []).extend(auth_args)
+            bad_auth_doc["presets"][slot_name].setdefault("env", {}).update(auth_env)
+            auth_rec_path = (
+                tmp_path / "tests" / "ppu" / "recipes" / f"bad_auth_{slot_name}.yaml"
+            )
+            auth_rec_path.write_text(
+                yaml.safe_dump(bad_auth_doc, sort_keys=False), encoding="utf-8"
+            )
+            try:
+                with pytest.raises(
+                    ppu_recipe.ValidationError, match="--api-key|VLLM_API_KEY"
+                ):
+                    ppu_recipe.validate_paths([auth_rec_path], vllm_parser_mode="skip")
+                with pytest.raises(
+                    ppu_recipe.ValidationError, match="--api-key|VLLM_API_KEY"
+                ):
+                    ppu_recipe.resolve_recipe(auth_rec_path, preset=slot_name)
+            finally:
+                auth_rec_path.unlink(missing_ok=True)
+    with pytest.raises(ppu_recipe.ValidationError, match="--api-key|VLLM_API_KEY"):
+        ppu_recipe._format_flags_and_env(["--api-key", "example-only"], {})
+    with pytest.raises(ppu_recipe.ValidationError, match="--api-key|VLLM_API_KEY"):
+        ppu_recipe._format_flags_and_env([], {"VLLM_API_KEY": "example-only"})
 
     # 3. Loopback HTTP probe contract: health=200 alone fails /v1/models 401 when auth is enabled,
     #    whereas plain unauthenticated HTTP passes /health, /v1/models, and /v1/chat/completions.
@@ -6433,3 +6505,810 @@ def test_resolved_command_diff_and_pr_template(
     assert proc.returncode == 1
     assert fake_cred not in proc.stdout
     assert fake_cred not in proc.stderr
+
+
+def test_pr462_r3_tls_combined_pem_vs_multiport_supervisor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(ppu_recipe, "_build_vllm_serve_parser", _sample_vllm_parser)
+    recipe_rel = Path("tests/ppu/recipes/zai-org/GLM-5.3.yaml")
+    pol_rel = Path("tests/ppu/policy/models/glm-5.3.yaml")
+    decode_pol_rel = Path("tests/ppu/policy/models/glm-5.3-decode.yaml")
+    ds_rel = Path("tests/ppu/policy/datasets/gsm8k.yaml")
+
+    orig_recipe = yaml.safe_load((ROOT / recipe_rel).read_text(encoding="utf-8"))
+    for rel in (recipe_rel, pol_rel, decode_pol_rel, ds_rel):
+        dst = tmp_path / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes((ROOT / rel).read_bytes())
+    rec_path = tmp_path / recipe_rel
+    pol_path = tmp_path / pol_rel
+
+    monkeypatch.setattr(ppu_e2e_select, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(ppu_recipe, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(ppu_recipe_runner, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(
+        ppu_recipe_runner, "resolve_local_checkpoint_dir", lambda *_a, **_kw: None
+    )
+
+    class _StopLaunch(BaseException):
+        pass
+
+    popen_calls: list[list[str]] = []
+
+    def _intercept_popen(argv, **_kw):
+        popen_calls.append(list(argv))
+        raise _StopLaunch
+
+    monkeypatch.setattr(ppu_recipe_runner.subprocess, "Popen", _intercept_popen)
+    monkeypatch.setenv("GSM8K_DATASET_PATH", str(tmp_path / "gsm8k_sentinel"))
+
+    # 1. Ordinary serve: combined PEM (--ssl-certfile alone), two-same PEM, and split cert+key
+    #    are valid in catalog, skipped ONLY for the affected policy in default matrix scan,
+    #    and rejected before Popen on explicit selection and direct Fast/Model runners.
+    for label, tls_args in (
+        ("combined_cert_only", ["--ssl-certfile=combined.pem"]),
+        (
+            "two_same_pem",
+            ["--ssl-certfile", "combined.pem", "--ssl-keyfile", "combined.pem"],
+        ),
+        (
+            "split_cert_key",
+            ["--ssl-certfile=server.pem", "--ssl-keyfile", "server.key"],
+        ),
+    ):
+        doc = copy.deepcopy(orig_recipe)
+        doc["presets"]["prefill"]["args"].extend(tls_args)
+        rec_path.write_text(yaml.safe_dump(doc, sort_keys=False), encoding="utf-8")
+        report = ppu_recipe.validate_paths([rec_path], vllm_parser_mode="required")
+        assert report["checked_combinations"] == 12, label
+        # glm-5.3 (prefill) skipped by default scan; glm-5.3-decode (decode, plain HTTP) kept
+        assert [
+            r["key"]
+            for r in ppu_e2e_select.build_recipe_matrix("", "fast_sanity")["include"]
+        ] == ["glm-5.3-decode"], label
+        with pytest.raises(ValueError, match="enables TLS"):
+            ppu_e2e_select.build_recipe_matrix("glm-5.3", "fast_sanity")
+
+        popen_calls.clear()
+        with pytest.raises(ppu_recipe.ValidationError, match="enables TLS"):
+            ppu_recipe_runner.run_fast_sanity(
+                recipe_path=rec_path,
+                policy_path=pol_path,
+                results_dir=tmp_path / f"fs_{label}",
+                preset="prefill",
+                layer_mode="full",
+                parser_mode="skip",
+            )
+        assert popen_calls == [], label
+
+        popen_calls.clear()
+        with pytest.raises(ppu_recipe.ValidationError, match="enables TLS"):
+            ppu_recipe_runner.run_model_sanity(
+                recipe_path=rec_path,
+                policy_path=pol_path,
+                results_dir=tmp_path / f"ms_{label}",
+                preset="prefill",
+                parser_mode="skip",
+            )
+        assert popen_calls == [], label
+
+    # 2. --ssl-ca-certs alone stays plaintext HTTP across catalog, selector, and both runners
+    ca_doc = copy.deepcopy(orig_recipe)
+    ca_doc["presets"]["prefill"]["args"].append("--ssl-ca-certs=ca.pem")
+    rec_path.write_text(yaml.safe_dump(ca_doc, sort_keys=False), encoding="utf-8")
+    assert (
+        ppu_recipe.validate_paths([rec_path], vllm_parser_mode="required")[
+            "checked_combinations"
+        ]
+        == 12
+    )
+    assert "glm-5.3" in [
+        r["key"]
+        for r in ppu_e2e_select.build_recipe_matrix("", "fast_sanity")["include"]
+    ]
+    popen_calls.clear()
+    with pytest.raises(_StopLaunch):
+        ppu_recipe_runner.run_fast_sanity(
+            recipe_path=rec_path,
+            policy_path=pol_path,
+            results_dir=tmp_path / "fs_ca_only",
+            preset="prefill",
+            layer_mode="full",
+            parser_mode="skip",
+        )
+    assert len(popen_calls) == 1
+    popen_calls.clear()
+    with pytest.raises(_StopLaunch):
+        ppu_recipe_runner.run_model_sanity(
+            recipe_path=rec_path,
+            policy_path=pol_path,
+            results_dir=tmp_path / "ms_ca_only",
+            preset="prefill",
+            parser_mode="skip",
+        )
+    assert len(popen_calls) == 1
+
+    # 3. --ssl-keyfile without --ssl-certfile and empty CA path remain invalid on ordinary serve
+    for bad_tls in (["--ssl-keyfile", "server.key"], ["--ssl-ca-certs", ""]):
+        bad_doc = copy.deepcopy(orig_recipe)
+        bad_doc["presets"]["decode"]["args"].extend(bad_tls)
+        rec_path.write_text(yaml.safe_dump(bad_doc, sort_keys=False), encoding="utf-8")
+        with pytest.raises(ppu_recipe.ValidationError, match="--ssl-"):
+            ppu_recipe.validate_paths([rec_path], vllm_parser_mode="skip")
+
+    # 4. Multi-port supervisor still requires --ssl-keyfile and --ssl-certfile as a pair
+    for bad_sup_tls in (
+        ["--ssl-certfile=combined.pem"],
+        ["--ssl-keyfile", "server.key"],
+    ):
+        sup_bad = copy.deepcopy(orig_recipe)
+        sup_bad["presets"]["decode_ep"]["args"].extend(
+            [
+                "--data-parallel-multi-port-external-lb",
+                "--data-parallel-size-local",
+                "8",
+                *bad_sup_tls,
+            ]
+        )
+        rec_path.write_text(yaml.safe_dump(sup_bad, sort_keys=False), encoding="utf-8")
+        with pytest.raises(
+            ppu_recipe.ValidationError,
+            match="--ssl-keyfile and --ssl-certfile",
+        ):
+            ppu_recipe.validate_paths([rec_path], vllm_parser_mode="skip")
+
+    for ok_sup_tls in (
+        [],
+        ["--ssl-ca-certs=ca.pem"],
+        ["--ssl-keyfile", "server.key", "--ssl-certfile=server.pem"],
+    ):
+        sup_ok = copy.deepcopy(orig_recipe)
+        sup_ok["presets"]["decode_ep"]["args"].extend(
+            [
+                "--data-parallel-multi-port-external-lb",
+                "--data-parallel-size-local",
+                "8",
+                *ok_sup_tls,
+            ]
+        )
+        rec_path.write_text(yaml.safe_dump(sup_ok, sort_keys=False), encoding="utf-8")
+        assert (
+            ppu_recipe.validate_paths([rec_path], vllm_parser_mode="required")[
+                "checked_combinations"
+            ]
+            == 12
+        )
+
+
+def test_pr462_r3_pd_nested_multiconnector_roles_and_child_engine_id(
+    tmp_path: Path,
+) -> None:
+    orig_recipe = yaml.safe_load(
+        (RECIPES_DIR / "zai-org" / "GLM-5.3.yaml").read_text(encoding="utf-8")
+    )
+    rec_path = tmp_path / "GLM-5.3-pd-r3-roles.yaml"
+
+    def _wrap(child: dict, role: str | None = None) -> dict:
+        return {
+            "kv_connector": "MultiConnector",
+            "kv_role": role or child["kv_role"],
+            "kv_connector_extra_config": {"connectors": [child]},
+        }
+
+    def _mutate(doc: dict, slot: str, fn) -> None:
+        args = doc["presets"][slot]["args"]
+        idx = args.index("--kv-transfer-config") + 1
+        args[idx] = json.dumps(fn(json.loads(args[idx])), separators=(",", ":"))
+
+    for role in ("prefill", "decode"):
+        target_slot = f"pd_{role}"
+        # Positive controls: aligned middle role, kv_both middle role, and top-level engine_id
+        for ok_label in ("aligned_middle", "both_middle", "root_engine_id"):
+            doc_ok = copy.deepcopy(orig_recipe)
+            for s in ("pd_prefill", "pd_decode"):
+
+                def _mk_ok(c: dict, s_cur: str = s, lbl: str = ok_label) -> dict:
+                    r = c["kv_role"]
+                    if lbl == "aligned_middle":
+                        return _wrap(_wrap(c, r), r)
+                    if lbl == "both_middle":
+                        return _wrap(_wrap(c, "kv_both"), r)
+                    return {**_wrap(c, r), "engine_id": f"engine-{s_cur}"}
+
+                _mutate(doc_ok, s, _mk_ok)
+            rec_path.write_text(
+                yaml.safe_dump(doc_ok, sort_keys=False), encoding="utf-8"
+            )
+            assert (
+                ppu_recipe.validate_paths([rec_path], vllm_parser_mode="skip")[
+                    "checked_combinations"
+                ]
+                == 12
+            ), f"{role}_{ok_label}"
+
+        # Counterexample 1: root MultiConnector immediate child has opposite role -> scheduler
+        # KVTransferConfig._connector_roles() hides consumer/producer capability at the root
+        doc_bad_mid = copy.deepcopy(orig_recipe)
+        for s in ("pd_prefill", "pd_decode"):
+
+            def _mk_bad_mid(c: dict, s_cur: str = s, ts: str = target_slot) -> dict:
+                r = c["kv_role"]
+                mid_role = (
+                    ("kv_consumer" if r == "kv_producer" else "kv_producer")
+                    if s_cur == ts
+                    else r
+                )
+                return _wrap(_wrap(c, mid_role), r)
+
+            _mutate(doc_bad_mid, s, _mk_bad_mid)
+        rec_path.write_text(
+            yaml.safe_dump(doc_bad_mid, sort_keys=False), encoding="utf-8"
+        )
+        with pytest.raises(ppu_recipe.ValidationError, match="kv_role"):
+            ppu_recipe.validate_paths([rec_path], vllm_parser_mode="skip")
+
+        # Counterexample 2: explicit engine_id on a MultiConnector child collides with
+        # MultiConnector._get_connector_classes_and_configs(KVTransferConfig(**ktc, engine_id=...))
+        doc_child_eid = copy.deepcopy(orig_recipe)
+        for s in ("pd_prefill", "pd_decode"):
+
+            def _mk_child_eid(c: dict, s_cur: str = s, ts: str = target_slot) -> dict:
+                if s_cur == ts:
+                    return _wrap({**c, "engine_id": f"child-{s_cur}"})
+                return _wrap(c)
+
+            _mutate(doc_child_eid, s, _mk_child_eid)
+        rec_path.write_text(
+            yaml.safe_dump(doc_child_eid, sort_keys=False), encoding="utf-8"
+        )
+        with pytest.raises(
+            ppu_recipe.ValidationError, match=r"\.connectors\[0\].*engine_id"
+        ):
+            ppu_recipe.validate_paths([rec_path], vllm_parser_mode="skip")
+
+
+def test_pr462_r3_pd_remote_transport_one_side_wrapper_aux_and_dotted_flags(
+    tmp_path: Path,
+) -> None:
+    orig_recipe = yaml.safe_load(
+        (RECIPES_DIR / "zai-org" / "GLM-5.3.yaml").read_text(encoding="utf-8")
+    )
+    rec_path = tmp_path / "GLM-5.3-pd-r3-transport.yaml"
+
+    def _wrap(child: dict, role: str | None = None) -> dict:
+        return {
+            "kv_connector": "MultiConnector",
+            "kv_role": role or child["kv_role"],
+            "kv_connector_extra_config": {"connectors": [child]},
+        }
+
+    def _mutate(doc: dict, slot: str, fn) -> None:
+        args = doc["presets"][slot]["args"]
+        idx = args.index("--kv-transfer-config") + 1
+        args[idx] = json.dumps(fn(json.loads(args[idx])), separators=(",", ":"))
+
+    # 1. ExampleHiddenStatesConnector and HiSparseConnector cannot satisfy cross-instance PD alone
+    #    or as sole MultiConnector child, via registry name or official kv_connector_module_path.
+    for conn_name, mod_suffix in (
+        ("ExampleHiddenStatesConnector", "example_hidden_states_connector"),
+        ("HiSparseConnector", "hisparse.connector"),
+    ):
+        for explicit_mod in (False, True):
+            for wrapped in (False, True):
+                bad_doc = copy.deepcopy(orig_recipe)
+                for s in ("pd_prefill", "pd_decode"):
+
+                    def _mk_local_only(
+                        c: dict,
+                        cn: str = conn_name,
+                        ms: str = mod_suffix,
+                        exp: bool = explicit_mod,
+                        wr: bool = wrapped,
+                    ) -> dict:
+                        c2 = dict(c, kv_connector=cn)
+                        if exp:
+                            c2["kv_connector_module_path"] = (
+                                f"vllm.distributed.kv_transfer.kv_connector.v1.{ms}"
+                            )
+                        return _wrap(c2) if wr else c2
+
+                    _mutate(bad_doc, s, _mk_local_only)
+                rec_path.write_text(
+                    yaml.safe_dump(bad_doc, sort_keys=False), encoding="utf-8"
+                )
+                with pytest.raises(
+                    ppu_recipe.ValidationError,
+                    match="cross-instance KV transfer connector",
+                ):
+                    ppu_recipe.validate_paths([rec_path], vllm_parser_mode="skip")
+
+    # 2. One-sided MultiConnector wrapper around matching Mooncake RDMA passes; RDMA/TCP mismatch fails
+    for wrapped_slot in ("pd_prefill", "pd_decode"):
+        one_side_ok = copy.deepcopy(orig_recipe)
+        _mutate(one_side_ok, wrapped_slot, _wrap)
+        rec_path.write_text(
+            yaml.safe_dump(one_side_ok, sort_keys=False), encoding="utf-8"
+        )
+        assert (
+            ppu_recipe.validate_paths([rec_path], vllm_parser_mode="skip")[
+                "checked_combinations"
+            ]
+            == 12
+        )
+
+        one_side_mismatch = copy.deepcopy(one_side_ok)
+        _mutate(
+            one_side_mismatch,
+            "pd_decode",
+            lambda c: (
+                {
+                    **c,
+                    "kv_connector_extra_config": {
+                        "connectors": [
+                            {
+                                **c["kv_connector_extra_config"]["connectors"][0],
+                                "kv_connector_extra_config": {
+                                    **c["kv_connector_extra_config"]["connectors"][0][
+                                        "kv_connector_extra_config"
+                                    ],
+                                    "mooncake_protocol": "tcp",
+                                },
+                            }
+                        ]
+                    },
+                }
+                if c["kv_connector"] == "MultiConnector"
+                else {
+                    **c,
+                    "kv_connector_extra_config": {
+                        **c["kv_connector_extra_config"],
+                        "mooncake_protocol": "tcp",
+                    },
+                }
+            ),
+        )
+        one_side_mismatch["presets"]["pd_decode"]["env"]["MOONCAKE_PROTOCOL"] = "tcp"
+        rec_path.write_text(
+            yaml.safe_dump(one_side_mismatch, sort_keys=False), encoding="utf-8"
+        )
+        with pytest.raises(
+            ppu_recipe.ValidationError, match="incompatible KV transfer connector"
+        ):
+            ppu_recipe.validate_paths([rec_path], vllm_parser_mode="skip")
+
+    # 3. Auxiliary local connectors coexisting with MooncakeConnector pass when prerequisites hold
+    for aux_cfg in (
+        {"kv_connector": "SimpleCPUOffloadConnector"},
+        {
+            "kv_connector": "HiSparseConnector",
+            "kv_connector_extra_config": {"host_pool_gib": 4},
+        },
+        {"kv_connector": "ExampleHiddenStatesConnector"},
+    ):
+        aux_ok = copy.deepcopy(orig_recipe)
+        for s in ("pd_prefill", "pd_decode"):
+
+            def _mk_aux(c: dict, base_aux: dict = aux_cfg) -> dict:
+                r = c["kv_role"]
+                opp = "kv_producer" if r == "kv_consumer" else "kv_consumer"
+                wrapped = _wrap(c)
+                wrapped["kv_connector_extra_config"]["connectors"].insert(
+                    0, {**copy.deepcopy(base_aux), "kv_role": opp}
+                )
+                return wrapped
+
+            _mutate(aux_ok, s, _mk_aux)
+        rec_path.write_text(yaml.safe_dump(aux_ok, sort_keys=False), encoding="utf-8")
+        assert (
+            ppu_recipe.validate_paths([rec_path], vllm_parser_mode="skip")[
+                "checked_combinations"
+            ]
+            == 12
+        )
+
+    # HiSparseConnector missing positive host_pool_gib fails even alongside MooncakeConnector
+    hisparse_bad = copy.deepcopy(orig_recipe)
+    _mutate(
+        hisparse_bad,
+        "pd_decode",
+        lambda c: {
+            "kv_connector": "MultiConnector",
+            "kv_role": "kv_consumer",
+            "kv_connector_extra_config": {
+                "connectors": [
+                    {"kv_connector": "HiSparseConnector", "kv_role": "kv_both"},
+                    c,
+                ]
+            },
+        },
+    )
+    rec_path.write_text(yaml.safe_dump(hisparse_bad, sort_keys=False), encoding="utf-8")
+    with pytest.raises(ppu_recipe.ValidationError, match="host_pool_gib"):
+        ppu_recipe.validate_paths([rec_path], vllm_parser_mode="skip")
+
+    # 4. Multi-transport order semantics preserved: [CustomA, Mooncake] vs [Mooncake, CustomA] fails
+    multi_order_ok = copy.deepcopy(orig_recipe)
+    for s in ("pd_prefill", "pd_decode"):
+        _mutate(
+            multi_order_ok,
+            s,
+            lambda c: {
+                "kv_connector": "MultiConnector",
+                "kv_role": c["kv_role"],
+                "kv_connector_extra_config": {
+                    "connectors": [
+                        {
+                            "kv_connector": "CustomConnectorA",
+                            "kv_connector_module_path": "my_ext.conn_a",
+                            "kv_role": c["kv_role"],
+                        },
+                        c,
+                    ]
+                },
+            },
+        )
+    rec_path.write_text(
+        yaml.safe_dump(multi_order_ok, sort_keys=False), encoding="utf-8"
+    )
+    assert (
+        ppu_recipe.validate_paths([rec_path], vllm_parser_mode="skip")[
+            "checked_combinations"
+        ]
+        == 12
+    )
+
+    multi_order_swapped = copy.deepcopy(multi_order_ok)
+    _mutate(
+        multi_order_swapped,
+        "pd_decode",
+        lambda c: {
+            **c,
+            "kv_connector_extra_config": {
+                "connectors": list(
+                    reversed(c["kv_connector_extra_config"]["connectors"])
+                )
+            },
+        },
+    )
+    rec_path.write_text(
+        yaml.safe_dump(multi_order_swapped, sort_keys=False), encoding="utf-8"
+    )
+    with pytest.raises(
+        ppu_recipe.ValidationError, match="incompatible KV transfer connector"
+    ):
+        ppu_recipe.validate_paths([rec_path], vllm_parser_mode="skip")
+
+    # 5. Dotted --kv-transfer-config.* args (pure dotted, JSON+DecodeBench override, JSON+safe dotted) rejected
+    for dotted_mode in ("full_dotted", "json_plus_decodebench", "json_plus_safe"):
+        dotted_doc = copy.deepcopy(orig_recipe)
+        args = dotted_doc["presets"]["pd_decode"]["args"]
+        idx = args.index("--kv-transfer-config")
+        direct = json.loads(args[idx + 1])
+        if dotted_mode == "full_dotted":
+            del args[idx : idx + 2]
+            args.extend(
+                [
+                    "--kv-transfer-config.kv_connector",
+                    direct["kv_connector"],
+                    "--kv-transfer-config.kv_role",
+                    direct["kv_role"],
+                    "--kv-transfer-config.kv_connector_extra_config",
+                    json.dumps(direct["kv_connector_extra_config"]),
+                ]
+            )
+        elif dotted_mode == "json_plus_decodebench":
+            args.extend(["--kv-transfer-config.kv_connector", "DecodeBenchConnector"])
+        else:
+            args.append(f"--kv-transfer-config.kv_role={direct['kv_role']}")
+        rec_path.write_text(
+            yaml.safe_dump(dotted_doc, sort_keys=False), encoding="utf-8"
+        )
+        with pytest.raises(ppu_recipe.ValidationError, match="dotted CLI flag"):
+            ppu_recipe.validate_paths([rec_path], vllm_parser_mode="skip")
+        with pytest.raises(ppu_recipe.ValidationError, match="dotted CLI flag"):
+            ppu_recipe.resolve_recipe(rec_path, preset="pd_decode")
+
+
+def test_pr462_r3_dp_supervisor_child_device_slices_and_port_bounds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(ppu_recipe, "_build_vllm_serve_parser", _sample_vllm_parser)
+    orig_recipe = yaml.safe_load(
+        (RECIPES_DIR / "zai-org" / "GLM-5.3.yaml").read_text(encoding="utf-8")
+    )
+    rec_path = tmp_path / "GLM-5.3-dp-slices.yaml"
+
+    def _write_multiport(tp: int, pp: int, local_dp: int, extra: list[str]) -> None:
+        doc = copy.deepcopy(orig_recipe)
+        flags = doc["presets"]["decode_ep"]["args"]
+        flags[flags.index("--data-parallel-size") + 1] = str(32 // (tp * pp))
+        flags.extend(
+            [
+                "--data-parallel-multi-port-external-lb",
+                "--data-parallel-size-local",
+                str(local_dp),
+                "--tensor-parallel-size",
+                str(tp),
+                "--pipeline-parallel-size",
+                str(pp),
+                *extra,
+            ]
+        )
+        rec_path.write_text(yaml.safe_dump(doc, sort_keys=False), encoding="utf-8")
+
+    # Positive controls: implicit allocation, reordered IDs (space & '=' spellings), PP2, and port 65528..65535
+    for label, tp, pp, n, extra in (
+        ("implicit", 1, 1, 8, []),
+        ("reordered_space", 2, 1, 4, ["--device-ids", "7,6,5,4,3,2,1,0"]),
+        ("reordered_eq", 2, 1, 4, ["--device-ids=7,6,5,4,3,2,1,0"]),
+        ("pp2_ok", 1, 2, 4, ["--device-ids", "0,1,2,3,4,5,6,7"]),
+    ):
+        _write_multiport(tp, pp, n, extra)
+        assert (
+            ppu_recipe.validate_paths([rec_path], vllm_parser_mode="required")[
+                "checked_combinations"
+            ]
+            == 12
+        ), label
+
+    _write_multiport(1, 1, 8, [])
+    assert (
+        ppu_recipe.resolve_recipe(rec_path, preset="decode_ep", port=65528)["ppu_count"]
+        == 32
+    )
+    with pytest.raises(ppu_recipe.ValidationError, match="65536"):
+        ppu_recipe.resolve_recipe(rec_path, preset="decode_ep", port=65529)
+
+    # Counterexamples: DP8 with 4 IDs (space & '='), short TP2/PP2 slice, duplicate within child,
+    # reuse across children, mixed int/UUID, and out-of-range relative index 8 on 8-card node
+    for _bad_label, tp, pp, n, bad_extra in (
+        ("dp8_4ids_space", 1, 1, 8, ["--device-ids", "0,1,2,3"]),
+        ("dp8_4ids_eq", 1, 1, 8, ["--device-ids=0,1,2,3"]),
+        ("short_tp2", 2, 1, 4, ["--device-ids", "0,1,2,3,4,5,6"]),
+        ("short_pp2", 1, 2, 4, ["--device-ids", "0,1,2,3,4,5,6"]),
+        ("dup_same_child", 2, 1, 4, ["--device-ids", "0,0,2,3,4,5,6,7"]),
+        ("dup_across_children", 1, 1, 8, ["--device-ids", "0,1,2,3,4,5,6,0"]),
+        ("mixed_int_uuid", 2, 1, 4, ["--device-ids", "0,GPU-example,2,3,4,5,6,7"]),
+        ("index_out_of_range", 2, 1, 4, ["--device-ids", "0,1,2,3,4,5,6,8"]),
+    ):
+        _write_multiport(tp, pp, n, bad_extra)
+        with pytest.raises(ppu_recipe.ValidationError, match="--device-ids|device"):
+            ppu_recipe.validate_paths([rec_path], vllm_parser_mode="skip")
+        with pytest.raises(ppu_recipe.ValidationError, match="--device-ids|device"):
+            ppu_recipe.resolve_recipe(rec_path, preset="decode_ep")
+
+    # Implicit multi-port allocation (omitted --device-ids) on 4 visible cards fails closed when
+    # local_dp * TP * PP == 8 (rank 4 would consume index 4), while 8 visible cards passes.
+    _write_multiport(1, 1, 8, [])
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1,2,3")
+    assert (
+        ppu_recipe.validate_paths([rec_path], vllm_parser_mode="skip")[
+            "checked_combinations"
+        ]
+        == 12
+    )
+    with pytest.raises(ppu_recipe.ValidationError, match="visible device"):
+        ppu_recipe.resolve_recipe(rec_path, preset="decode_ep")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1,2,3,4,5,6,7")
+    assert ppu_recipe.resolve_recipe(rec_path, preset="decode_ep")["ppu_count"] == 32
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+
+
+def test_pr462_r3_runner_device_quota_after_overrides_and_scoped_ambient_dp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recipe_rel = Path("tests/ppu/recipes/zai-org/GLM-5.3.yaml")
+    pol_rel = Path("tests/ppu/policy/models/glm-5.3.yaml")
+    decode_pol_rel = Path("tests/ppu/policy/models/glm-5.3-decode.yaml")
+    ds_rel = Path("tests/ppu/policy/datasets/gsm8k.yaml")
+
+    orig_recipe = yaml.safe_load((ROOT / recipe_rel).read_text(encoding="utf-8"))
+    for rel in (recipe_rel, pol_rel, decode_pol_rel, ds_rel):
+        dst = tmp_path / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes((ROOT / rel).read_bytes())
+    rec_path = tmp_path / recipe_rel
+    pol_path = tmp_path / pol_rel
+
+    monkeypatch.setattr(ppu_e2e_select, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(ppu_recipe, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(ppu_recipe_runner, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(
+        ppu_recipe_runner, "resolve_local_checkpoint_dir", lambda *_a, **_kw: None
+    )
+    monkeypatch.setenv("GSM8K_DATASET_PATH", str(tmp_path / "gsm8k_sentinel"))
+
+    class _StopLaunch(BaseException):
+        pass
+
+    seen_launches: list[dict[str, str | None]] = []
+
+    def _capture_launch(argv, **opts):
+        tp = (
+            argv[argv.index("--tensor-parallel-size") + 1]
+            if "--tensor-parallel-size" in argv
+            else "1"
+        )
+        seen_launches.append(
+            {
+                "tp": tp,
+                "visible": opts["env"].get("CUDA_VISIBLE_DEVICES"),
+                "dp": opts["env"].get("VLLM_DP_SIZE"),
+            }
+        )
+        raise _StopLaunch
+
+    monkeypatch.setattr(ppu_recipe_runner.subprocess, "Popen", _capture_launch)
+
+    # 1. Unmodified GLM-5.3 policy allocates 4 cards for prefill; overriding --preset decode
+    #    or --variant fp8 raises effective TP to 8 and must fail closed (Popen=0) when allocated 4,
+    #    while 4->4 and 8->8 remain runnable across both fast_sanity and model_sanity.
+    for tier in ("fast_sanity", "model_sanity"):
+        mat = {
+            x["key"]: x["ppu_count"]
+            for x in ppu_e2e_select.build_recipe_matrix("glm-5.3", tier)["include"]
+        }
+        assert mat == {"glm-5.3": 4}
+
+        for allocated, preset_ov, variant_ov, expect_launch, expected_tp in (
+            (4, None, None, True, "4"),
+            (4, "decode", None, False, "8"),
+            (4, None, "fp8", False, "8"),
+            (8, "decode", None, True, "8"),
+            (8, None, "fp8", True, "8"),
+        ):
+            cli_args = [
+                "--recipe",
+                str(rec_path),
+                "--policy",
+                str(pol_path),
+                "--tier",
+                tier,
+                "--results-dir",
+                str(tmp_path / f"res_{tier}_{allocated}_{preset_ov}_{variant_ov}"),
+                "--layer-mode",
+                "full",
+                "--vllm-parser",
+                "skip",
+            ]
+            if preset_ov is not None:
+                cli_args.extend(["--preset", preset_ov])
+            if variant_ov is not None:
+                cli_args.extend(["--variant", variant_ov])
+
+            visible_csv = ",".join(str(i) for i in range(allocated))
+            monkeypatch.setenv("CUDA_VISIBLE_DEVICES", visible_csv)
+            monkeypatch.delenv("PPU_CI_DEVICE_COUNT", raising=False)
+            seen_launches.clear()
+            if expect_launch:
+                with pytest.raises(_StopLaunch):
+                    ppu_recipe_runner.main(cli_args)
+                assert len(seen_launches) == 1
+                assert seen_launches[0]["tp"] == expected_tp
+                assert seen_launches[0]["visible"] == visible_csv
+            else:
+                with pytest.raises(
+                    ppu_recipe.ValidationError, match="requires 8 devices"
+                ):
+                    ppu_recipe_runner.main(cli_args)
+                assert seen_launches == []
+
+                # Explicit --max-devices 8 cannot override a narrower 4-card job quota or visible set
+                monkeypatch.setenv("PPU_CI_DEVICE_COUNT", "4")
+                seen_launches.clear()
+                with pytest.raises(
+                    ppu_recipe.ValidationError, match="requires 8 devices"
+                ):
+                    ppu_recipe_runner.main([*cli_args, "--max-devices", "8"])
+                assert seen_launches == []
+
+                over_res = ppu_recipe.resolve_recipe(
+                    rec_path,
+                    policy_path=pol_path,
+                    tier=tier,
+                    preset=preset_ov,
+                    variant=variant_ov,
+                )
+                seen_launches.clear()
+                with pytest.raises(
+                    ppu_recipe.ValidationError, match="requires 8 devices"
+                ):
+                    ppu_recipe_runner._launch_resolved_server(
+                        over_res,
+                        log_path=tmp_path / f"launch_over_{tier}.log",
+                        max_devices=8,
+                    )
+                assert seen_launches == []
+
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+
+    # 2. Default M890 8-card limit rejects TP16 even when CUDA_VISIBLE_DEVICES is unset,
+    #    while explicit max_devices=16 admits TP16 in both selector and runner.
+    tp16_doc = copy.deepcopy(orig_recipe)
+    tp16_doc["presets"]["prefill"]["topology"] = {
+        "kind": "single_node",
+        "nodes": 1,
+        "devices_per_node": 16,
+    }
+    tp16_doc["presets"]["prefill"]["tp"] = 16
+    rec_path.write_text(yaml.safe_dump(tp16_doc, sort_keys=False), encoding="utf-8")
+    with pytest.raises(ValueError, match="requires 16 devices"):
+        ppu_e2e_select.build_recipe_matrix("glm-5.3", "fast_sanity")
+    assert (
+        ppu_e2e_select.build_recipe_matrix("glm-5.3", "fast_sanity", max_devices=16)[
+            "include"
+        ][0]["ppu_count"]
+        == 16
+    )
+
+    seen_launches.clear()
+    with pytest.raises(ppu_recipe.ValidationError, match="requires 16 devices"):
+        ppu_recipe_runner.run_fast_sanity(
+            recipe_path=rec_path,
+            policy_path=pol_path,
+            results_dir=tmp_path / "fs_tp16_default8",
+            layer_mode="full",
+            parser_mode="skip",
+        )
+    assert seen_launches == []
+
+    seen_launches.clear()
+    with pytest.raises(_StopLaunch):
+        ppu_recipe_runner.run_fast_sanity(
+            recipe_path=rec_path,
+            policy_path=pol_path,
+            results_dir=tmp_path / "fs_tp16_max16",
+            layer_mode="full",
+            parser_mode="skip",
+            max_devices=16,
+        )
+    assert len(seen_launches) == 1 and seen_launches[0]["tp"] == "16"
+
+    # 3. Ambient VLLM_DP_SIZE=2 does NOT falsely break static catalog validation or a selected
+    #    preset that explicitly pins VLLM_DP_SIZE="1".
+    env_doc = copy.deepcopy(orig_recipe)
+    env_doc["presets"]["prefill"].setdefault("env", {})["VLLM_DP_SIZE"] = "1"
+    rec_path.write_text(yaml.safe_dump(env_doc, sort_keys=False), encoding="utf-8")
+    monkeypatch.setenv("VLLM_DP_SIZE", "2")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1,2,3")
+
+    assert (
+        ppu_recipe.validate_paths([rec_path, pol_path], vllm_parser_mode="skip")[
+            "checked_combinations"
+        ]
+        == 12
+    )
+    assert [
+        (r["key"], r["ppu_count"])
+        for r in ppu_e2e_select.build_recipe_matrix("glm-5.3", "fast_sanity")["include"]
+    ] == [("glm-5.3", 4)]
+
+    for runner_fn, rdir in (
+        (
+            lambda d: ppu_recipe_runner.run_fast_sanity(
+                recipe_path=rec_path,
+                policy_path=pol_path,
+                results_dir=d,
+                preset="prefill",
+                layer_mode="full",
+                parser_mode="skip",
+            ),
+            tmp_path / "fs_ambient_dp2",
+        ),
+        (
+            lambda d: ppu_recipe_runner.run_model_sanity(
+                recipe_path=rec_path,
+                policy_path=pol_path,
+                results_dir=d,
+                preset="prefill",
+                parser_mode="skip",
+            ),
+            tmp_path / "ms_ambient_dp2",
+        ),
+    ):
+        seen_launches.clear()
+        with pytest.raises(_StopLaunch):
+            runner_fn(rdir)
+        assert len(seen_launches) == 1
+        assert seen_launches[0]["tp"] == "4" and seen_launches[0]["dp"] == "1"
