@@ -43,7 +43,10 @@ VARIANT_ISOLATED_FIELDS: tuple[str, ...] = (
     "served_name",
 )
 _STRAY_SERVING_SCHEMA_RE = re.compile(
-    r"(?m)^\s*schema_version\s*:\s*['\"]?ppu-serving/v1['\"]?\s*(?:#.*)?$"
+    r"""(?m)^\s*['"]?schema_version['"]?\s*:\s*(['"]?)([^\r\n#]+?)\1\s*(?:#.*)?$"""
+)
+_YAML_ESCAPE_RE = re.compile(
+    r"\\(?:u([0-9a-fA-F]{4})|U([0-9a-fA-F]{8})|x([0-9a-fA-F]{2}))"
 )
 _STRAY_SCAN_PRUNE_DIRS = frozenset(
     {
@@ -2033,6 +2036,62 @@ def _validate_resolved_topology_and_placeholders(
     return sub_flags, sub_env
 
 
+def _validate_assets_map_variant_isolation(
+    ppu_blk: Mapping[str, Any],
+    model_blk: Mapping[str, Any],
+    variants_blk: Mapping[str, Any],
+    assets_map: Mapping[str, str],
+    *,
+    context: str,
+) -> None:
+    """Reject multi-variant assets_map collisions that merge distinct variants into one checkpoint."""
+    if not assets_map or len(variants_blk) <= 1:
+        return
+    top_id = _effective_variant_identity(ppu_blk, model_blk, {})
+    eff_ids = {
+        vn: _effective_variant_identity(ppu_blk, model_blk, vc)
+        for vn, vc in variants_blk.items()
+    }
+
+    def _resolved_ckpt(ident: Mapping[str, Any]) -> str:
+        asset_key = ident["assets"]["model"]
+        return assets_map.get(asset_key, ident["hf_model_id"])
+
+    top_asset = top_id["assets"]["model"]
+    top_ckpt = _resolved_ckpt(top_id)
+    for vname, vcfg in variants_blk.items():
+        if vname == "default":
+            continue
+        exempt = set(vcfg.get("allow_shared_fields", []))
+        if "assets" in exempt:
+            continue
+        vid = eff_ids[vname]
+        v_asset = vid["assets"]["model"]
+        v_ckpt = _resolved_ckpt(vid)
+        if (v_asset in assets_map or top_asset in assets_map) and v_ckpt == top_ckpt:
+            raise ValidationError(
+                f"{context}.variants.{vname}: assets_map resolves model asset {v_asset!r} "
+                f"to {v_ckpt!r}, colliding with default/top-level checkpoint "
+                "(use distinct mapped paths or declare allow_shared_fields: [assets])"
+            )
+        for other_name, other_id in eff_ids.items():
+            if other_name == vname:
+                continue
+            o_asset = other_id["assets"]["model"]
+            o_ckpt = _resolved_ckpt(other_id)
+            if (v_asset in assets_map or o_asset in assets_map) and v_ckpt == o_ckpt:
+                target = (
+                    "default/top-level checkpoint"
+                    if other_name == "default"
+                    else f"variant {other_name!r}"
+                )
+                raise ValidationError(
+                    f"{context}.variants.{vname}: assets_map resolves model asset {v_asset!r} "
+                    f"to {v_ckpt!r}, colliding with {target} "
+                    "(use distinct mapped paths or declare allow_shared_fields: [assets])"
+                )
+
+
 def _effective_variant_identity(
     ppu_blk: Mapping[str, Any],
     model_blk: Mapping[str, Any],
@@ -2245,6 +2304,13 @@ def _resolve_recipe_from_doc(
 
     # 6. assets-map + runtime endpoint resolution
     assets_map = _load_assets_map(assets_map_path)
+    _validate_assets_map_variant_isolation(
+        ppu_blk,
+        model_blk,
+        variants_blk,
+        assets_map,
+        context=recipe_label,
+    )
     eff_identity = _effective_variant_identity(ppu_blk, model_blk, var_blk)
     eff_assets = eff_identity["assets"]
     asset_name = eff_assets["model"]
@@ -3592,6 +3658,60 @@ def _iter_repo_yaml_files(repo_root: Path) -> list[Path]:
     return walked
 
 
+def _unescape_yaml_scalar_text(raw: str) -> str:
+    return _YAML_ESCAPE_RE.sub(
+        lambda m: chr(int(m.group(1) or m.group(2) or m.group(3), 16)),
+        raw,
+    )
+
+
+def _text_has_stray_serving_schema(text: str) -> bool:
+    for match in _STRAY_SERVING_SCHEMA_RE.finditer(text):
+        raw_val = match.group(2).strip()
+        if len(raw_val) >= 2 and raw_val[0] == raw_val[-1] and raw_val[0] in {"'", '"'}:
+            raw_val = raw_val[1:-1]
+        if (
+            raw_val == SERVING_SCHEMA
+            or _unescape_yaml_scalar_text(raw_val) == SERVING_SCHEMA
+        ):
+            return True
+    return False
+
+
+def _mapping_node_has_serving_schema(
+    node: yaml.Node,
+    seen: set[int] | None = None,
+) -> bool:
+    if not isinstance(node, yaml.MappingNode):
+        return False
+    visited = seen if seen is not None else set()
+    node_id = id(node)
+    if node_id in visited:
+        return False
+    visited.add(node_id)
+    for k_node, v_node in node.value:
+        if (
+            isinstance(k_node, yaml.ScalarNode)
+            and k_node.value == "schema_version"
+            and isinstance(v_node, yaml.ScalarNode)
+            and v_node.value == SERVING_SCHEMA
+        ):
+            return True
+        if (
+            isinstance(k_node, yaml.ScalarNode)
+            and k_node.tag == "tag:yaml.org,2002:merge"
+        ):
+            if isinstance(
+                v_node, yaml.MappingNode
+            ) and _mapping_node_has_serving_schema(v_node, visited):
+                return True
+            if isinstance(v_node, yaml.SequenceNode) and any(
+                _mapping_node_has_serving_schema(item, visited) for item in v_node.value
+            ):
+                return True
+    return False
+
+
 def scan_stray_serving_recipes(repo_root: Path | None = None) -> list[Path]:
     """Fail closed if any ``ppu-serving/v1`` YAML exists outside ``tests/ppu/recipes/*.yaml``."""
     root = (repo_root or REPO_ROOT).resolve()
@@ -3602,15 +3722,21 @@ def scan_stray_serving_recipes(repo_root: Path | None = None) -> list[Path]:
         text = path.read_text(encoding="utf-8", errors="replace")
         matched = False
         try:
-            for doc in yaml.safe_load_all(text):
-                if (
-                    isinstance(doc, Mapping)
-                    and doc.get("schema_version") == SERVING_SCHEMA
-                ):
+            for doc_node in yaml.compose_all(text):
+                if doc_node is not None and _mapping_node_has_serving_schema(doc_node):
                     matched = True
                     break
         except yaml.YAMLError:
-            matched = bool(_STRAY_SERVING_SCHEMA_RE.search(text))
+            for chunk in re.split(r"(?m)^---(?:\s*(?:#.*)?)$", text):
+                try:
+                    doc_node = yaml.compose(chunk)
+                except yaml.YAMLError:
+                    continue
+                if doc_node is not None and _mapping_node_has_serving_schema(doc_node):
+                    matched = True
+                    break
+        if not matched and _text_has_stray_serving_schema(text):
+            matched = True
         if matched:
             stray.append(path)
     if stray:

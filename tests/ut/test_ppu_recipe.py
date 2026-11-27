@@ -4653,6 +4653,105 @@ def test_multivariant_isolation_guard_and_allow_shared_fields() -> None:
         )
 
 
+def test_multivariant_assets_map_runtime_collision_isolation(tmp_path: Path) -> None:
+    glm_path = RECIPES_DIR / "zai-org" / "GLM-5.3.yaml"
+    glm_doc = yaml.safe_load(glm_path.read_text(encoding="utf-8"))
+    rec_path = tmp_path / "GLM-5.3.yaml"
+    rec_path.write_text(yaml.safe_dump(glm_doc, sort_keys=False), encoding="utf-8")
+
+    # 1. Colliding runtime assets_map between w8a8_int8 and fp8_channel fails closed across resolve entries.
+    colliding_map = tmp_path / "colliding_assets.yaml"
+    colliding_map.write_text(
+        yaml.safe_dump(
+            {
+                "glm-5.3-mxfp4": "/models/glm-5.3-mxfp4",
+                "glm-5.3-fp8-channel": "/models/glm-5.3-fp8",
+                "glm-5.3-w8a8-int8": "/models/glm-5.3-fp8",
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    for variant_name in ("default", "fp8_channel", "w8a8_int8"):
+        with pytest.raises(
+            ppu_recipe.ValidationError,
+            match=r"assets_map resolves model asset.*colliding with",
+        ):
+            ppu_recipe.resolve_recipe(
+                rec_path,
+                variant=variant_name,
+                assets_map_path=colliding_map,
+            )
+
+    # 2. Distinct runtime paths pass as positive control.
+    distinct_map = tmp_path / "distinct_assets.yaml"
+    distinct_map.write_text(
+        yaml.safe_dump(
+            {
+                "glm-5.3-mxfp4": "/models/glm-5.3-mxfp4",
+                "glm-5.3-fp8-channel": "/models/glm-5.3-fp8",
+                "glm-5.3-w8a8-int8": "/models/glm-5.3-int8",
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    res_int8 = ppu_recipe.resolve_recipe(
+        rec_path,
+        variant="w8a8_int8",
+        assets_map_path=distinct_map,
+    )
+    assert res_int8["argv"][2] == "/models/glm-5.3-int8"
+
+    # 3. Exempted variant may share checkpoint via assets_map, while unexempted sibling colliding with it fails.
+    exempt_rec = copy.deepcopy(glm_doc)
+    exempt_rec["variants"]["fp8_channel"]["allow_shared_fields"] = ["assets"]
+    exempt_path = tmp_path / "GLM-5.3-exempt.yaml"
+    exempt_path.write_text(
+        yaml.safe_dump(exempt_rec, sort_keys=False), encoding="utf-8"
+    )
+    shared_ok_map = tmp_path / "shared_ok_assets.yaml"
+    shared_ok_map.write_text(
+        yaml.safe_dump(
+            {
+                "glm-5.3-mxfp4": "/models/glm-5.3-shared",
+                "glm-5.3-fp8-channel": "/models/glm-5.3-shared",
+                "glm-5.3-w8a8-int8": "/models/glm-5.3-int8",
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    res_fp8_shared = ppu_recipe.resolve_recipe(
+        exempt_path,
+        variant="fp8_channel",
+        assets_map_path=shared_ok_map,
+    )
+    assert res_fp8_shared["argv"][2] == "/models/glm-5.3-shared"
+
+    shared_collide_map = tmp_path / "shared_collide_assets.yaml"
+    shared_collide_map.write_text(
+        yaml.safe_dump(
+            {
+                "glm-5.3-mxfp4": "/models/glm-5.3-mxfp4",
+                "glm-5.3-fp8-channel": "/models/glm-5.3-shared",
+                "glm-5.3-w8a8-int8": "/models/glm-5.3-shared",
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"w8a8_int8: assets_map resolves.*colliding with variant 'fp8_channel'",
+    ):
+        ppu_recipe.resolve_recipe(
+            exempt_path,
+            variant="w8a8_int8",
+            assets_map_path=shared_collide_map,
+        )
+
+
 def test_stray_serving_recipe_scan_blocks_wild_copies_and_allows_repo(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -4727,6 +4826,48 @@ def test_stray_serving_recipe_scan_blocks_wild_copies_and_allows_repo(
     with pytest.raises(ppu_recipe.ValidationError, match=r"\.hidden\.yaml"):
         ppu_recipe.scan_stray_serving_recipes(tmp_path)
     hidden.unlink()
+
+    # 6. Multi-doc with leading custom YAML tag (!Ref) + quoted/escaped subsequent recipe fails closed across all entrypoints.
+    quoted_unescaped = valid_recipe.replace(
+        "schema_version: ppu-serving/v1",
+        '"schema_version": ppu-serving/v1',
+        1,
+    )
+    quoted_escaped = valid_recipe.replace(
+        "schema_version: ppu-serving/v1",
+        '"schema_version": "ppu-serving\\u002fv1"',
+        1,
+    )
+    for rel, body in (
+        (
+            "configs/tag_unescaped.yml",
+            "---\nref: !Ref CommonSetting\n---\n" + quoted_unescaped,
+        ),
+        (
+            "configs/tag_escaped.yaml",
+            "---\nref: !Ref CommonSetting\n---\n" + quoted_escaped,
+        ),
+        ("configs/jinja_broken.yml", "---\nfoo: {{ broken }\n---\n" + quoted_escaped),
+    ):
+        target = tmp_path / rel
+        target.write_text(body, encoding="utf-8")
+        with pytest.raises(ppu_recipe.ValidationError, match=rel):
+            ppu_recipe.scan_stray_serving_recipes(tmp_path)
+        with pytest.raises(ppu_recipe.ValidationError, match=rel):
+            ppu_recipe.main(["validate", "--vllm-parser", "skip"])
+        with pytest.raises(ppu_recipe.ValidationError, match=rel):
+            ppu_recipe.main(["validate", "--all", "--vllm-parser", "skip"])
+        target.unlink()
+
+    # Positive control: multi-doc with custom !Ref tag and non-serving schema passes.
+    benign_tag = tmp_path / "configs/tag_benign.yaml"
+    benign_tag.write_text(
+        '---\nref: !Ref CommonSetting\n---\n"schema_version": custom/v1\n',
+        encoding="utf-8",
+    )
+    assert ppu_recipe.scan_stray_serving_recipes(tmp_path) == []
+    assert ppu_recipe.main(["validate", "--all", "--vllm-parser", "skip"]) == 0
+    benign_tag.unlink()
 
 
 def test_resolved_command_diff_and_pr_template(
