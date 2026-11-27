@@ -4072,6 +4072,32 @@ def test_recipe_validate_workflow_runs_guardrails_and_command_diff(tmp_path):
     assert "scripts/ci/ppu_e2e_models.json" in pr_trigger["paths"]
     assert "scripts/ci/ppu_recipe.py" in pr_trigger["paths"]
 
+    def _matches_actions_glob(rel_path: str, pattern: str) -> bool:
+        escaped = re.escape(pattern)
+        regex_str = (
+            escaped.replace(r"\*\*/", "(?:.*/)?")
+            .replace(r"\*\*", ".*")
+            .replace(r"\*", "[^/]*")
+            .replace(r"\?", "[^/]")
+        )
+        return re.fullmatch(regex_str, rel_path) is not None
+
+    def _matches_pr_paths(rel_path: str) -> bool:
+        return any(_matches_actions_glob(rel_path, pat) for pat in pr_trigger["paths"])
+
+    for should_match in (
+        "configs/copied-model.yaml",
+        "configs/copied-model.yml",
+        "copied-model.yaml",
+        ".github/workflows/recipe-validate.yaml",
+        "tests/ppu/recipes/Qwen/Qwen3.8-27B.yaml",
+        "tests/e2e/models/test_dummy.py",
+        "scripts/ci/ppu_recipe.py",
+    ):
+        assert _matches_pr_paths(should_match), should_match
+    for should_skip in ("README.md", "vllm_sail/platform.py"):
+        assert not _matches_pr_paths(should_skip), should_skip
+
     job = cfg["jobs"]["validate"]
     assert job["runs-on"] == "ubuntu-latest"
     checkout = checkouts(job)[0]
@@ -4138,3 +4164,61 @@ def test_recipe_validate_workflow_runs_guardrails_and_command_diff(tmp_path):
     assert res.returncode == 0, res.stderr
     assert "::notice title=Model Recipe Sign-off Checklist::" in res.stdout
     assert "Model Recipe Sign-off Reminder" in summary_file.read_text()
+
+    # Positive control: ordinary non-recipe YAML under configs/ passes with empty summary.
+    ordinary_base = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=repo, text=True
+    ).strip()
+    (repo / "configs").mkdir(parents=True, exist_ok=True)
+    (repo / "configs/ordinary.yaml").write_text("kind: ordinary_config\n")
+    subprocess.run(["git", "add", "configs/ordinary.yaml"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "--no-verify", "-m", "ordinary yaml"],
+        cwd=repo,
+        check=True,
+    )
+    ordinary_summary = tmp_path / "ordinary-summary.md"
+    ordinary_res = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", step["run"]],
+        cwd=repo,
+        env={
+            **os.environ,
+            "BASE_SHA": ordinary_base,
+            "GITHUB_STEP_SUMMARY": str(ordinary_summary),
+            "PATH": f"{Path(sys.executable).parent}:{os.environ['PATH']}",
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert ordinary_res.returncode == 0, ordinary_res.stderr
+    assert ordinary_summary.read_text() == ""
+
+    # Counterexample: stray ppu-serving/v1 YAML copied under configs/ fails the workflow step.
+    shutil.copy2(
+        repo / "tests/ppu/recipes/Qwen/Qwen3.8-27B.yaml",
+        repo / "configs/copied-model.yaml",
+    )
+    subprocess.run(["git", "add", "configs/copied-model.yaml"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "--no-verify", "-m", "stray copied recipe"],
+        cwd=repo,
+        check=True,
+    )
+    stray_summary = tmp_path / "stray-summary.md"
+    stray_res = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", step["run"]],
+        cwd=repo,
+        env={
+            **os.environ,
+            "BASE_SHA": ordinary_base,
+            "GITHUB_STEP_SUMMARY": str(stray_summary),
+            "PATH": f"{Path(sys.executable).parent}:{os.environ['PATH']}",
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert stray_res.returncode != 0
+    assert (
+        "stray 'ppu-serving/v1' recipe file(s) outside tests/ppu/recipes/*.yaml: "
+        "configs/copied-model.yaml"
+    ) in (stray_res.stdout + stray_res.stderr)

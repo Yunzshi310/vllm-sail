@@ -4,12 +4,15 @@ on:
   pull_request:
     branches: [main, 'releases/**']
     paths:
+      - "*.yaml"
+      - "*.yml"
+      - "**/*.yaml"
+      - "**/*.yml"
       - "tests/ppu/**"
       - "tests/e2e/models/**"
       - "scripts/ci/ppu_e2e_models.json"
       - "scripts/ci/ppu_recipe.py"
       - "tests/ut/test_ppu_recipe.py"
-      - ".github/workflows/recipe-validate.yaml"
 
 permissions:
   contents: read
