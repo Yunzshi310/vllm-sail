@@ -32,6 +32,9 @@ DATASET_SCHEMA = "ppu-dataset/v1"
 POLICY_SCHEMA = "ppu-test-policy/v1"
 POLICY_TIERS = frozenset({"fast_sanity", "model_sanity", "nightly", "release"})
 SUPPORTED_HARDWARE = frozenset({"zhenwu_m890", "zhenwu_810e"})
+SINGLE_NODE_MAX_DEVICES_BY_HARDWARE: dict[str, int] = {
+    "zhenwu_m890": 8,
+}
 _M890_PRECISION_RE = re.compile(
     r"^(?:(?:mx)?fp4(?:_fp8)?|fp8(?:_[a-z0-9]+)?|w4a4_mxfp4|w8a8_fp8)$"
 )
@@ -258,6 +261,8 @@ _BUILTIN_MODULE_CLASS_TO_CONNECTOR: dict[tuple[str, str], str] = {
 _NON_PD_TRANSFER_CONNECTORS = frozenset(
     {
         "DecodeBenchConnector",
+        "ExampleHiddenStatesConnector",
+        "HiSparseConnector",
         "OffloadingConnector",
         "SimpleCPUOffloadConnector",
     }
@@ -1577,6 +1582,60 @@ def _effective_bool_flag(
     return state
 
 
+def _reject_dotted_cli_flags(
+    entries: Sequence[tuple[str, str | None, bool]], *, context: str
+) -> None:
+    for flag, _val, _ in entries:
+        if flag.startswith("-") and "." in flag:
+            root_flag = flag.split(".", 1)[0]
+            raise ValidationError(
+                f"{context}: dotted CLI flag {flag!r} is unsupported in ppu-serving/v1; "
+                f"specify a single complete JSON object for {root_flag}"
+            )
+
+
+def _parse_device_ids_flag(raw: str | None, *, context: str) -> list[int | str]:
+    """Parse ``--device-ids`` CSV matching pinned ``EngineArgs``."""
+    if raw is None or not raw.strip():
+        raise ValidationError(
+            f"{context}: --device-ids requires comma-separated device indices or UUIDs"
+        )
+    parts = [part.strip() for part in raw.split(",")]
+    if any(not part for part in parts):
+        raise ValidationError(
+            f"{context}: --device-ids contains an empty entry: {raw!r}"
+        )
+    parsed: list[int | str] = []
+    for part in parts:
+        if part.isdigit():
+            parsed.append(int(part))
+        elif part.startswith("-") and part[1:].isdigit():
+            raise ValidationError(
+                f"{context}: --device-ids integer index must be >= 0, got {part!r}"
+            )
+        else:
+            parsed.append(part)
+    has_int = any(type(item) is int for item in parsed)
+    has_str = any(type(item) is str for item in parsed)
+    if has_int and has_str:
+        raise ValidationError(
+            f"{context}: --device-ids cannot mix integer device indices and UUID strings: {raw!r}"
+        )
+    return parsed
+
+
+def _known_visible_device_count(
+    effective_env: Mapping[str, str],
+    topo_devices_per_node: int | None,
+) -> int | None:
+    if "CUDA_VISIBLE_DEVICES" in effective_env:
+        cvd_raw = effective_env["CUDA_VISIBLE_DEVICES"].strip()
+        if cvd_raw in {"", "-1", "void", "none", "NoDevFiles"}:
+            return 0
+        return len([tok.strip() for tok in cvd_raw.split(",") if tok.strip()])
+    return topo_devices_per_node
+
+
 def _validate_topology_flag_and_placeholder_wiring(
     flags: Sequence[str],
     server_env: Mapping[str, Any],
@@ -1588,6 +1647,7 @@ def _validate_topology_flag_and_placeholder_wiring(
     """Validate topology-specific launch flags and consuming-flag placeholder wiring."""
     str_env = {str(k): str(v) for k, v in server_env.items()}
     entries = _parse_flag_entries(list(flags))
+    _reject_dotted_cli_flags(entries, context=context)
     flag_names = {name for name, _, _ in entries}
     placeholders = _extract_placeholders_from_flags_and_env(flags, str_env)
     unknown = sorted(placeholders - set(TOPOLOGY_PLACEHOLDERS))
@@ -1755,8 +1815,10 @@ def _eval_single_node_parallel_dp_and_frontend(
     context: str,
     base_env: Mapping[str, str] | None = None,
     http_port: int = 9985,
+    topo_devices_per_node: int | None = None,
 ) -> tuple[tuple[int, int, int, int | None, int, bool, str, int], tuple[int, ...]]:
     """Evaluate per-node parallelism, LB mode, frontend contract, and DP rank slice."""
+    _reject_dotted_cli_flags(entries, context=context)
     effective_env: dict[str, str] = dict(os.environ if base_env is None else base_env)
     effective_env.update({k: str(v) for k, v in server_env.items()})
 
@@ -1895,16 +1957,25 @@ def _eval_single_node_parallel_dp_and_frontend(
 
     ssl_keyfile_present = any(flag == "--ssl-keyfile" for flag, _, _ in entries)
     ssl_certfile_present = any(flag == "--ssl-certfile" for flag, _, _ in entries)
+    ssl_ca_present = any(flag == "--ssl-ca-certs" for flag, _, _ in entries)
     ssl_keyfile = _flag_value(entries, "--ssl-keyfile")
     ssl_certfile = _flag_value(entries, "--ssl-certfile")
+    ssl_ca_certs = _flag_value(entries, "--ssl-ca-certs")
     if ssl_keyfile_present and (ssl_keyfile is None or not ssl_keyfile.strip()):
         raise ValidationError(f"{context}: --ssl-keyfile requires a non-empty path")
     if ssl_certfile_present and (ssl_certfile is None or not ssl_certfile.strip()):
         raise ValidationError(f"{context}: --ssl-certfile requires a non-empty path")
-    if bool(ssl_keyfile) != bool(ssl_certfile):
-        raise ValidationError(
-            f"{context}: --ssl-keyfile and --ssl-certfile must be provided together"
-        )
+    if ssl_ca_present and (ssl_ca_certs is None or not ssl_ca_certs.strip()):
+        raise ValidationError(f"{context}: --ssl-ca-certs requires a non-empty path")
+
+    device_ids_present = any(flag == "--device-ids" for flag, _, _ in entries)
+    device_ids_raw = _flag_value(entries, "--device-ids")
+    parsed_device_ids = (
+        _parse_device_ids_flag(device_ids_raw, context=context)
+        if device_ids_present
+        else None
+    )
+    known_visible = _known_visible_device_count(effective_env, topo_devices_per_node)
 
     runner_present = any(flag == "--runner" for flag, _, _ in entries)
     runner_val = _flag_value(entries, "--runner")
@@ -2021,6 +2092,11 @@ def _eval_single_node_parallel_dp_and_frontend(
         )
 
     if serve_multi_port:
+        if bool(ssl_keyfile) != bool(ssl_certfile):
+            raise ValidationError(
+                f"{context}: --data-parallel-multi-port-external-lb requires "
+                f"--ssl-keyfile and --ssl-certfile to be provided together"
+            )
         if grpc or uds_present:
             raise ValidationError(
                 f"{context}: --data-parallel-multi-port-external-lb cannot be combined with --grpc or --uds"
@@ -2042,10 +2118,16 @@ def _eval_single_node_parallel_dp_and_frontend(
                 f"{context}: --data-parallel-size ({cli_dp_val}) must be divisible by "
                 f"--data-parallel-size-local ({dpl_explicit})"
             )
-        if http_port <= supervisor_port <= http_port + dpl_explicit - 1:
+        last_child_port = http_port + dpl_explicit - 1
+        if http_port < 1 or last_child_port > 65535:
+            raise ValidationError(
+                f"{context}: multi-port child rank ports [{http_port}, {last_child_port}] "
+                f"exceed valid TCP port range [1, 65535]"
+            )
+        if http_port <= supervisor_port <= last_child_port:
             raise ValidationError(
                 f"{context}: --data-parallel-supervisor-port ({supervisor_port}) overlaps with "
-                f"child rank ports [{http_port}, {http_port + dpl_explicit - 1}]"
+                f"child rank ports [{http_port}, {last_child_port}]"
             )
         sup_start_rank = (
             dp_start_rank_val
@@ -2057,6 +2139,45 @@ def _eval_single_node_parallel_dp_and_frontend(
                 f"{context}: multi-port supervised ranks [{sup_start_rank}, "
                 f"{sup_start_rank + dpl_explicit - 1}] exceed --data-parallel-size ({cli_dp_val})"
             )
+        if parsed_device_ids is not None:
+            slice_width = tp_val * pp_val
+            seen_child_devs: dict[int | str, int] = {}
+            for local_rank in range(dpl_explicit):
+                start_idx = local_rank * slice_width
+                end_idx = start_idx + slice_width
+                child_slice = parsed_device_ids[start_idx:end_idx]
+                if len(child_slice) < slice_width:
+                    raise ValidationError(
+                        f"{context}: --device-ids provides {len(parsed_device_ids)} device(s), "
+                        f"but multi-port child rank {local_rank} requires slice [{start_idx}:{end_idx}] "
+                        f"of width TP*PP={slice_width} (need at least {dpl_explicit * slice_width})"
+                    )
+                if len(set(child_slice)) != len(child_slice):
+                    raise ValidationError(
+                        f"{context}: --device-ids slice {child_slice} for multi-port child rank "
+                        f"{local_rank} contains duplicate device IDs"
+                    )
+                for dev in child_slice:
+                    if dev in seen_child_devs:
+                        raise ValidationError(
+                            f"{context}: --device-ids reuses device {dev!r} across local DP child "
+                            f"ranks ({seen_child_devs[dev]} and {local_rank})"
+                        )
+                    seen_child_devs[dev] = local_rank
+                    if (
+                        type(dev) is int
+                        and known_visible is not None
+                        and not (0 <= dev < known_visible)
+                    ):
+                        raise ValidationError(
+                            f"{context}: --device-ids index {dev} out of range for "
+                            f"{known_visible} visible device(s)"
+                        )
+    elif ssl_keyfile and not ssl_certfile:
+        raise ValidationError(
+            f"{context}: --ssl-keyfile requires --ssl-certfile "
+            f"(ordinary vllm serve also accepts a combined PEM via --ssl-certfile alone)"
+        )
 
     if topo_nodes > 1 and dp_backend != "mp":
         raise ValidationError(
@@ -2138,6 +2259,28 @@ def _eval_single_node_parallel_dp_and_frontend(
         raise ValidationError(
             f"{context}: data_parallel_external_lb can only be set when data_parallel_size > 1"
         )
+    if not serve_multi_port and parsed_device_ids is not None:
+        if len(set(parsed_device_ids)) != len(parsed_device_ids):
+            raise ValidationError(
+                f"{context}: --device-ids contains duplicate device IDs: {parsed_device_ids}"
+            )
+        expected_local_devs = (
+            max(world_within_dp // topo_nodes, 1)
+            if topo_nodes > 1 and world_within_dp > (cli_world // topo_nodes)
+            else dp_local_val * world_within_dp
+        )
+        if len(parsed_device_ids) != expected_local_devs:
+            raise ValidationError(
+                f"{context}: --device-ids length ({len(parsed_device_ids)}) must match "
+                f"local device requirement ({expected_local_devs})"
+            )
+        if known_visible is not None:
+            for dev in parsed_device_ids:
+                if type(dev) is int and not (0 <= dev < known_visible):
+                    raise ValidationError(
+                        f"{context}: --device-ids index {dev} out of range for "
+                        f"{known_visible} visible device(s)"
+                    )
 
     def _parse_dp_env_int(var_name: str, *, positive: bool = False) -> int:
         raw = effective_env[var_name]
@@ -2315,6 +2458,7 @@ def _compute_single_node_parallel_dp_and_frontend(
     context: str,
     base_env: Mapping[str, str] | None = None,
     http_port: int = 9985,
+    topo_devices_per_node: int | None = None,
 ) -> tuple[int, int, int, int | None, int, bool, str, int]:
     """Evaluate per-node parallelism, LB mode, and ServeSubcommand frontend contract."""
     res, _ = _eval_single_node_parallel_dp_and_frontend(
@@ -2325,6 +2469,7 @@ def _compute_single_node_parallel_dp_and_frontend(
         context=context,
         base_env=base_env,
         http_port=http_port,
+        topo_devices_per_node=topo_devices_per_node,
     )
     return res
 
@@ -2337,6 +2482,7 @@ def _compute_parallel_dp_and_frontend(
     context: str,
     base_env: Mapping[str, str] | None = None,
     http_port: int = 9985,
+    topo_devices_per_node: int | None = None,
     validate_cluster_layout: bool = True,
 ) -> tuple[int, int, int, int | None, int, bool, str, int]:
     """Evaluate parallelism, DP layout, and ServeSubcommand frontend across all nodes."""
@@ -2362,6 +2508,7 @@ def _compute_parallel_dp_and_frontend(
             context=context,
             base_env=base_env,
             http_port=http_port,
+            topo_devices_per_node=topo_devices_per_node,
         )
         node_results.append(node_res)
         node_slices.append(node_slice)
@@ -2432,12 +2579,24 @@ def _canonical_kv_connector_dict_spec(
     *,
     context: str,
     require_role: bool = False,
+    is_child: bool = False,
 ) -> tuple[Any, ...]:
     extra_keys = sorted(set(kv_obj) - _ALLOWED_KV_TRANSFER_CONFIG_KEYS)
     if extra_keys:
         raise ValidationError(
             f"{context}: unexpected KVTransferConfig field(s): {', '.join(extra_keys)}"
         )
+    if "engine_id" in kv_obj:
+        if is_child:
+            raise ValidationError(
+                f"{context}: MultiConnector child must not set explicit engine_id; "
+                f"MultiConnector forwards the parent engine_id and rejects duplicate 'engine_id'"
+            )
+        eid = kv_obj["engine_id"]
+        if eid is not None and (not isinstance(eid, str) or not eid.strip()):
+            raise ValidationError(
+                f"{context}: KVTransferConfig engine_id must be a non-empty string or null"
+            )
     connector = kv_obj.get("kv_connector")
     if not isinstance(connector, str) or not connector:
         raise ValidationError(
@@ -2543,6 +2702,7 @@ def _canonical_kv_connector_dict_spec(
                     server_env,
                     context=f"{context}.connectors[{idx}]",
                     require_role=True,
+                    is_child=True,
                 )
             )
         return ("builtin", "MultiConnector", tuple(child_specs))
@@ -2574,10 +2734,15 @@ def _collect_kv_connector_leaves(
     *,
     context: str,
     ancestor_has_kv_port: bool = False,
+    is_child: bool = False,
 ) -> list[tuple[tuple[Any, ...], str, Mapping[str, Any], str, bool]]:
     """Flatten a validated KVTransferConfig tree into leaf connector records."""
     spec = _canonical_kv_connector_dict_spec(
-        kv_obj, server_env, context=context, require_role=True
+        kv_obj,
+        server_env,
+        context=context,
+        require_role=True,
+        is_child=is_child,
     )
     has_kv_port = ancestor_has_kv_port or ("kv_port" in kv_obj)
     if spec[:2] == ("builtin", "MultiConnector"):
@@ -2590,10 +2755,120 @@ def _collect_kv_connector_leaves(
                     server_env,
                     context=f"{context}.connectors[{idx}]",
                     ancestor_has_kv_port=has_kv_port,
+                    is_child=True,
                 )
             )
         return leaves
     return [(spec, str(kv_obj["kv_role"]), kv_obj, context, has_kv_port)]
+
+
+def _kv_config_exposes_roles(kv_obj: Mapping[str, Any]) -> tuple[bool, bool]:
+    """Match pinned ``KVTransferConfig._connector_roles()`` -> ``(is_kv_producer, is_kv_consumer)``."""
+    roles: set[str] = set()
+    top_role = kv_obj.get("kv_role")
+    if isinstance(top_role, str):
+        roles.add(top_role)
+    connector = kv_obj.get("kv_connector")
+    mod_path = kv_obj.get("kv_connector_module_path")
+    is_multi = connector == "MultiConnector" and (
+        not mod_path
+        or _BUILTIN_MODULE_CLASS_TO_CONNECTOR.get((mod_path, connector))
+        == "MultiConnector"
+    )
+    if is_multi:
+        roles.clear()
+        extra = kv_obj.get("kv_connector_extra_config") or {}
+        for sub in extra.get("connectors", []):
+            if isinstance(sub, Mapping) and isinstance(sub.get("kv_role"), str):
+                roles.add(sub["kv_role"])
+    return (
+        bool(roles & {"kv_producer", "kv_both"}),
+        bool(roles & {"kv_consumer", "kv_both"}),
+    )
+
+
+def _validate_pd_kv_role_tree(
+    kv_obj: Mapping[str, Any],
+    server_env: Mapping[str, Any],
+    *,
+    role: str | None,
+    allowed_roles: set[str],
+    context: str,
+    is_child: bool = False,
+) -> bool:
+    """Validate scheduler- and connector-visible ``kv_role`` along remote PD transfer branches."""
+    spec = _canonical_kv_connector_dict_spec(
+        kv_obj,
+        server_env,
+        context=context,
+        require_role=True,
+        is_child=is_child,
+    )
+    if spec[:2] == ("builtin", "MultiConnector"):
+        children = (kv_obj.get("kv_connector_extra_config") or {})["connectors"]
+        child_has_transfer = [
+            _validate_pd_kv_role_tree(
+                child,
+                server_env,
+                role=role,
+                allowed_roles=allowed_roles,
+                context=f"{context}.connectors[{idx}]",
+                is_child=True,
+            )
+            for idx, child in enumerate(children)
+        ]
+        has_transfer = any(child_has_transfer)
+        if has_transfer:
+            node_role = kv_obj.get("kv_role")
+            if node_role not in allowed_roles:
+                raise ValidationError(
+                    f"{context}: pd_disagg role {role!r} requires MultiConnector "
+                    f"kv_role in {sorted(allowed_roles)}, got {node_role!r}"
+                )
+            is_prod, is_cons = _kv_config_exposes_roles(kv_obj)
+            if role == "prefill" and not is_prod:
+                raise ValidationError(
+                    f"{context}: pd_disagg role 'prefill' requires immediate MultiConnector "
+                    f"children to expose kv_role in ['kv_both', 'kv_producer'] "
+                    f"(KVTransferConfig.is_kv_producer=False)"
+                )
+            if role == "decode" and not is_cons:
+                raise ValidationError(
+                    f"{context}: pd_disagg role 'decode' requires immediate MultiConnector "
+                    f"children to expose kv_role in ['kv_both', 'kv_consumer'] "
+                    f"(KVTransferConfig.is_kv_consumer=False)"
+                )
+        return has_transfer
+
+    is_transfer = spec[0] == "custom" or spec[1] not in _NON_PD_TRANSFER_CONNECTORS
+    if is_transfer and kv_obj.get("kv_role") not in allowed_roles:
+        raise ValidationError(
+            f"{context}: pd_disagg role {role!r} requires effective connector "
+            f"kv_role in {sorted(allowed_roles)}, got {kv_obj.get('kv_role')!r}"
+        )
+    return is_transfer
+
+
+def _canonical_pd_transfer_specs(
+    flags: Sequence[str],
+    server_env: Mapping[str, Any],
+    *,
+    context: str,
+) -> tuple[tuple[Any, ...], ...]:
+    """Return ordered canonical specs of cross-instance KV transfer leaves."""
+    entries = _parse_flag_entries(list(flags))
+    kv_raw = _flag_value(entries, "--kv-transfer-config")
+    if kv_raw is None:
+        raise ValidationError(
+            f"{context}: pd_disagg preset requires --kv-transfer-config"
+        )
+    kv_obj = json.loads(kv_raw)
+    leaves = _collect_kv_connector_leaves(kv_obj, server_env, context=context)
+    return tuple(
+        item[0]
+        for item in leaves
+        if item[0][0] == "custom" or item[0][1] not in _NON_PD_TRANSFER_CONNECTORS
+    )
 
 
 def _validate_mooncake_pd_leaf(
@@ -2719,6 +2994,9 @@ def check_single_node_sanity_compatibility(
 
     if "flags" in resolved:
         entries = _parse_flag_entries(list(resolved["flags"]))
+        topo_dev_per_node = (
+            int(topo["devices_per_node"]) if "devices_per_node" in topo else None
+        )
         (
             calc_ppu,
             calc_dp,
@@ -2735,6 +3013,7 @@ def check_single_node_sanity_compatibility(
             context="single_node_sanity",
             base_env=effective_env,
             http_port=http_port,
+            topo_devices_per_node=topo_dev_per_node,
         )
         eff_ppu_count = max(int(resolved.get("ppu_count", calc_ppu)), calc_ppu)
         dp_global = calc_dp
@@ -2829,7 +3108,8 @@ def _validate_resolved_topology_and_placeholders(
     topo = resolved["topology"]
     topo_kind = topo["kind"]
     topo_nodes = int(topo["nodes"])
-    topo_capacity = topo_nodes * int(topo["devices_per_node"])
+    topo_devices_per_node = int(topo["devices_per_node"])
+    topo_capacity = topo_nodes * topo_devices_per_node
     preset_name = resolved.get("preset")
 
     placeholders = _validate_topology_flag_and_placeholder_wiring(
@@ -2858,6 +3138,7 @@ def _validate_resolved_topology_and_placeholders(
         context=context,
         base_env=base_env,
         http_port=http_port,
+        topo_devices_per_node=topo_devices_per_node,
         validate_cluster_layout=False,
     )
     ppu_count = max(int(resolved["ppu_count"]), calc_ppu_count)
@@ -2915,6 +3196,7 @@ def _validate_resolved_topology_and_placeholders(
             context=context,
             base_env=base_env,
             http_port=http_port,
+            topo_devices_per_node=topo_devices_per_node,
             validate_cluster_layout=True,
         )
     if topo_kind == "pd_disagg":
@@ -2979,13 +3261,32 @@ def _validate_resolved_topology_and_placeholders(
             if role == "prefill"
             else ({"kv_consumer", "kv_both"} if role == "decode" else _ALLOWED_KV_ROLES)
         )
-        for _leaf_spec, leaf_role, _leaf_obj, leaf_ctx, _has_kv_port in transfer_leaves:
-            if leaf_role not in allowed_leaf_roles:
-                raise ValidationError(
-                    f"{leaf_ctx}: pd_disagg role {role!r} requires effective connector "
-                    f"kv_role in {sorted(allowed_leaf_roles)}, got {leaf_role!r}"
-                )
+        _validate_pd_kv_role_tree(
+            kv_obj,
+            server_env,
+            role=role,
+            allowed_roles=allowed_leaf_roles,
+            context=context,
+        )
+        hisparse_count = 0
         for leaf_spec, _leaf_role, leaf_obj, leaf_ctx, has_kv_port in leaves:
+            if leaf_spec[:2] == ("builtin", "HiSparseConnector"):
+                hisparse_count += 1
+                if hisparse_count > 1:
+                    raise ValidationError(
+                        f"{leaf_ctx}: only one HiSparseConnector may be configured"
+                    )
+                hs_extra = leaf_obj.get("kv_connector_extra_config") or {}
+                pool_gib = hs_extra.get("host_pool_gib")
+                if (
+                    isinstance(pool_gib, bool)
+                    or not isinstance(pool_gib, int | float)
+                    or float(pool_gib) <= 0
+                ):
+                    raise ValidationError(
+                        f"{leaf_ctx}: HiSparseConnector requires positive "
+                        f"kv_connector_extra_config.host_pool_gib, got {pool_gib!r}"
+                    )
             if leaf_spec[:2] == ("builtin", "MooncakeConnector"):
                 _validate_mooncake_pd_leaf(
                     leaf_obj,
@@ -3022,6 +3323,7 @@ def _resolve_recipe_from_doc(
     host: str = "127.0.0.1",
     port: int = 9985,
     served_model_name: str | None = None,
+    base_env: Mapping[str, str] | None = None,
     _check_pd_pair: bool = True,
 ) -> dict[str, Any]:
     """Resolve an already structurally validated recipe dict (+ optional policy dict)."""
@@ -3271,7 +3573,9 @@ def _resolve_recipe_from_doc(
         server_env,
         topo_nodes=int(eff_topology["nodes"]),
         context=recipe_label,
+        base_env=base_env,
         http_port=port,
+        topo_devices_per_node=int(eff_topology["devices_per_node"]),
         validate_cluster_layout=False,
     )
 
@@ -3327,7 +3631,9 @@ def _resolve_recipe_from_doc(
         "layer_override": eff_layers,
         "dummy_weights": eff_dummy,
     }
-    _validate_resolved_topology_and_placeholders(result, context=resolved_ctx)
+    _validate_resolved_topology_and_placeholders(
+        result, context=resolved_ctx, base_env=base_env
+    )
     if _check_pd_pair and eff_preset in {"pd_prefill", "pd_decode"}:
         peer_preset = "pd_decode" if eff_preset == "pd_prefill" else "pd_prefill"
         peer_res = _resolve_recipe_from_doc(
@@ -3337,13 +3643,14 @@ def _resolve_recipe_from_doc(
             hardware=eff_hardware,
             preset=peer_preset,
             cache=None,
+            base_env=base_env,
             _check_pd_pair=False,
         )
-        self_spec = _canonical_kv_connector_spec(
+        self_spec = _canonical_pd_transfer_specs(
             result["flags"], result["server_env"], context=resolved_ctx
         )
         peer_ctx = f"{recipe_label}:{eff_variant}:{peer_preset}"
-        peer_spec = _canonical_kv_connector_spec(
+        peer_spec = _canonical_pd_transfer_specs(
             peer_res["flags"], peer_res["server_env"], context=peer_ctx
         )
         if self_spec != peer_spec:
@@ -3376,6 +3683,7 @@ def resolve_recipe(
     host: str = "127.0.0.1",
     port: int = 9985,
     served_model_name: str | None = None,
+    base_env: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Resolve recipe + optional policy tier into effective vLLM argv, env, and digest."""
     recipe = _load_yaml(recipe_path)
@@ -3405,6 +3713,7 @@ def resolve_recipe(
         host=host,
         port=port,
         served_model_name=served_model_name,
+        base_env=base_env,
     )
 
 
@@ -3500,7 +3809,9 @@ def _validate_flag_list(
     tokens: Any, *, context: str, allow_policy_flags: bool = False
 ) -> None:
     raw = _check_str_list(tokens, context=context)
-    for flag, val, _ in _parse_flag_entries(raw):
+    parsed_entries = _parse_flag_entries(raw)
+    _reject_dotted_cli_flags(parsed_entries, context=context)
+    for flag, val, _ in parsed_entries:
         if not allow_policy_flags and flag in FORBIDDEN_RECIPE_FLAGS:
             raise ValidationError(
                 f"{context}: policy/runtime flag {flag!r} must not be hardcoded in recipe"
@@ -3950,6 +4261,7 @@ def validate_serving_recipe_structure(
                 hardware=target_hw,
                 preset=pname,
                 cache=None,
+                base_env={},
             )
 
 
@@ -4201,6 +4513,7 @@ def validate_policy_structure(
                     preset=fs.get("preset"),
                     cache=fs.get("cache"),
                     tier="fast_sanity",
+                    base_env={},
                 )
         if "model_sanity" in tiers:
             ms = _check_keys(
@@ -4257,6 +4570,7 @@ def validate_policy_structure(
                         preset=stage.get("preset"),
                         cache=stage.get("cache"),
                         tier="model_sanity",
+                        base_env={},
                     )
                     flags = resolved["flags"]
                 _validate_stage_cache_rules(
@@ -4392,6 +4706,7 @@ def iter_recipe_catalog_entries(
             hardware=target_hw,
             preset=pname,
             cache=None,
+            base_env={},
         )
         entries.append(
             {
@@ -4427,7 +4742,7 @@ def _collect_all_recipe_flag_sets(
             else f"{recipe_path.name}:{vname}:{hw}:{pname}"
         )
         sub_flags, _ = _validate_resolved_topology_and_placeholders(
-            item["resolved"], context=label
+            item["resolved"], context=label, base_env={}
         )
         sets.append((label, sub_flags))
         if (
@@ -4443,9 +4758,10 @@ def _collect_all_recipe_flag_sets(
                 cache="enabled",
                 dummy_weights=True,
                 layer_override=2,
+                base_env={},
             )
             fs_flags, _ = _validate_resolved_topology_and_placeholders(
-                fs_res, context=f"{recipe_path.name}:{hw}:fast_sanity_2l"
+                fs_res, context=f"{recipe_path.name}:{hw}:fast_sanity_2l", base_env={}
             )
             sets.append((f"{recipe_path.name}:{hw}:fast_sanity_2l", fs_flags))
 
