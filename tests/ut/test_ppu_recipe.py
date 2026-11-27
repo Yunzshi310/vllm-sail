@@ -7218,3 +7218,164 @@ def test_pr462_r4_6_multiport_slice_width_vs_pcp_worker_local_world_size(
         == 12
     )
     assert ppu_recipe.resolve_recipe(rec_path, preset="prefill")["ppu_count"] == 8
+
+
+def test_pr462_r4_uuid_visible_devices_cross_child_and_worker_visibility(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R1 review catch: canonicalize int ordinals and UUIDs against UUID CUDA_VISIBLE_DEVICES."""
+    import ppu_e2e_select
+    import ppu_recipe_runner
+
+    real_root = ppu_recipe.REPO_ROOT
+    monkeypatch.setattr(ppu_recipe, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(ppu_e2e_select, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(ppu_recipe_runner, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(
+        ppu_recipe, "_build_vllm_serve_parser", lambda: _sample_vllm_parser()
+    )
+
+    rec_rel = Path("tests/ppu/recipes/zai-org/GLM-5.3.yaml")
+    pol_rel = Path("tests/ppu/policy/models/glm-5.3.yaml")
+    ds_rel = Path("tests/ppu/policy/datasets/gsm8k.yaml")
+    for rel in (rec_rel, pol_rel, ds_rel):
+        dst = tmp_path / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_text((real_root / rel).read_text(encoding="utf-8"), encoding="utf-8")
+    rec_path = tmp_path / rec_rel
+    pol_path = tmp_path / pol_rel
+    orig_recipe = yaml.safe_load(rec_path.read_text(encoding="utf-8"))
+    uuids = [f"GPU-00000000-0000-0000-0000-{i:012d}" for i in range(8)]
+
+    # 1. Multi-port supervisor under UUID CUDA_VISIBLE_DEVICES=U0..U7:
+    #    0,1,U2,U3,4,5,U6,U7 -> distinct slots 0..7 (passes)
+    #    0,1,U0,U3,4,5,U6,U7 -> child 0 slot 0 collides with child 1 U0 (rejected)
+    #    0,1,U2,GPU-missing,4,5,U6,U7 -> child 1 UUID not in visible set (rejected)
+    def _write_multiport_ids(tokens: list[str], *, use_equals: bool = False) -> None:
+        doc = copy.deepcopy(orig_recipe)
+        slot = doc["presets"]["prefill"]
+        slot.update(
+            tp=2,
+            topology={"kind": "single_node", "nodes": 1, "devices_per_node": 8},
+        )
+        raw = ",".join(tokens)
+        id_arg = [f"--device-ids={raw}"] if use_equals else ["--device-ids", raw]
+        slot["args"].extend(
+            [
+                "--data-parallel-multi-port-external-lb",
+                "--data-parallel-size",
+                "4",
+                "--data-parallel-size-local",
+                "4",
+                *id_arg,
+            ]
+        )
+        rec_path.write_text(yaml.safe_dump(doc, sort_keys=False), encoding="utf-8")
+
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", ",".join(uuids))
+    for eq in (False, True):
+        _write_multiport_ids(
+            ["0", "1", uuids[2], uuids[3], "4", "5", uuids[6], uuids[7]], use_equals=eq
+        )
+        assert (
+            ppu_recipe.validate_paths([rec_path], vllm_parser_mode="skip")[
+                "checked_combinations"
+            ]
+            == 12
+        )
+        assert ppu_recipe.resolve_recipe(rec_path, preset="prefill")["ppu_count"] == 8
+
+        _write_multiport_ids(
+            ["0", "1", uuids[0], uuids[3], "4", "5", uuids[6], uuids[7]], use_equals=eq
+        )
+        assert (
+            ppu_recipe.validate_paths([rec_path], vllm_parser_mode="skip")[
+                "checked_combinations"
+            ]
+            == 12
+        )
+        with pytest.raises(ppu_recipe.ValidationError, match="reuses device"):
+            ppu_recipe.resolve_recipe(rec_path, preset="prefill")
+
+        _write_multiport_ids(
+            ["0", "1", uuids[2], "GPU-not-visible", "4", "5", uuids[6], uuids[7]],
+            use_equals=eq,
+        )
+        with pytest.raises(ppu_recipe.ValidationError, match="not visible"):
+            ppu_recipe.resolve_recipe(rec_path, preset="prefill")
+
+    # 2. Ordinary TP4 with --device-ids U4..U7 under UUID CUDA_VISIBLE_DEVICES:
+    #    - static catalog passes (12)
+    #    - visible=U4,U5,U6,U7 -> resolve=4, selector includes, Fast/Model reach Popen
+    #    - visible=U4,U5,U6,U3 -> U7 invisible -> resolve fails, default scan skips,
+    #      named select fails, Fast/Model fail closed before Popen (Popen == 0)
+    monkeypatch.setenv("GSM8K_DATASET_PATH", str(tmp_path))
+    monkeypatch.setenv("PPU_CI_DEVICE_COUNT", "4")
+    for eq in (False, True):
+        ord_doc = copy.deepcopy(orig_recipe)
+        slot = ord_doc["presets"]["prefill"]
+        slot.update(
+            tp=4,
+            topology={"kind": "single_node", "nodes": 1, "devices_per_node": 4},
+        )
+        raw_u47 = ",".join(uuids[4:8])
+        slot["args"].extend(
+            [f"--device-ids={raw_u47}"] if eq else ["--device-ids", raw_u47]
+        )
+        rec_path.write_text(yaml.safe_dump(ord_doc, sort_keys=False), encoding="utf-8")
+
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", ",".join(uuids[4:8]))
+        assert (
+            ppu_recipe.validate_paths([rec_path], vllm_parser_mode="skip")[
+                "checked_combinations"
+            ]
+            == 12
+        )
+        assert ppu_recipe.resolve_recipe(rec_path, preset="prefill")["ppu_count"] == 4
+        assert (
+            len(ppu_e2e_select.build_recipe_matrix("", "fast_sanity")["include"]) == 1
+        )
+
+        monkeypatch.setenv(
+            "CUDA_VISIBLE_DEVICES", ",".join([uuids[4], uuids[5], uuids[6], uuids[3]])
+        )
+        assert (
+            ppu_recipe.validate_paths([rec_path], vllm_parser_mode="skip")[
+                "checked_combinations"
+            ]
+            == 12
+        )
+        with pytest.raises(ppu_recipe.ValidationError, match="not visible"):
+            ppu_recipe.resolve_recipe(rec_path, preset="prefill")
+        with pytest.raises(ppu_recipe.ValidationError, match="not visible"):
+            ppu_e2e_select.build_recipe_matrix("", "fast_sanity")
+        with pytest.raises(ppu_recipe.ValidationError, match="not visible"):
+            ppu_e2e_select.build_recipe_matrix("glm-5.3", "fast_sanity")
+
+        popen_calls = 0
+
+        def _never_popen(*_a: object, **_kw: object) -> object:
+            nonlocal popen_calls
+            popen_calls += 1
+            raise AssertionError("Popen should not be reached")
+
+        monkeypatch.setattr(ppu_recipe_runner.subprocess, "Popen", _never_popen)
+        for tier in ("fast_sanity", "model_sanity"):
+            with pytest.raises(ppu_recipe.ValidationError, match="not visible"):
+                ppu_recipe_runner.main(
+                    [
+                        "--recipe",
+                        str(rec_path),
+                        "--policy",
+                        str(pol_path),
+                        "--tier",
+                        tier,
+                        "--results-dir",
+                        str(tmp_path / f"res_{tier}_{int(eq)}"),
+                        "--layer-mode",
+                        "full",
+                        "--vllm-parser",
+                        "skip",
+                    ]
+                )
+        assert popen_calls == 0

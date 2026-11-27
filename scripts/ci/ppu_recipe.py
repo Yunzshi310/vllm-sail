@@ -1632,16 +1632,25 @@ def _check_device_slice_uniform_type(
         )
 
 
+def _known_visible_device_tokens(
+    effective_env: Mapping[str, str],
+) -> tuple[list[str] | None, bool]:
+    if "CUDA_VISIBLE_DEVICES" not in effective_env:
+        return None, False
+    cvd_raw = effective_env["CUDA_VISIBLE_DEVICES"].strip()
+    if cvd_raw == "":
+        return [], False
+    if cvd_raw in {"-1", "void", "none", "NoDevFiles"}:
+        return [], True
+    return [tok.strip() for tok in cvd_raw.split(",") if tok.strip()], False
+
+
 def _known_visible_device_count(
     effective_env: Mapping[str, str],
     _topo_devices_per_node: int | None = None,
 ) -> int | None:
-    if "CUDA_VISIBLE_DEVICES" in effective_env:
-        cvd_raw = effective_env["CUDA_VISIBLE_DEVICES"].strip()
-        if cvd_raw in {"", "-1", "void", "none", "NoDevFiles"}:
-            return 0
-        return len([tok.strip() for tok in cvd_raw.split(",") if tok.strip()])
-    return None
+    tokens, _disabled = _known_visible_device_tokens(effective_env)
+    return len(tokens) if tokens is not None else None
 
 
 def _validate_topology_flag_and_placeholder_wiring(
@@ -1983,7 +1992,12 @@ def _eval_single_node_parallel_dp_and_frontend(
         if device_ids_present
         else None
     )
-    known_visible = _known_visible_device_count(effective_env, topo_devices_per_node)
+    cvd_tokens, cvd_disabled = _known_visible_device_tokens(effective_env)
+    known_visible = len(cvd_tokens) if cvd_tokens is not None else None
+    cvd_enumerates_uuids = cvd_disabled or (
+        bool(cvd_tokens) and all(not tok.lstrip("-").isdigit() for tok in cvd_tokens)
+    )
+    cvd_token_set = set(cvd_tokens) if cvd_tokens is not None else set()
 
     runner_present = any(flag == "--runner" for flag, _, _ in entries)
     runner_val = _flag_value(entries, "--runner")
@@ -2161,7 +2175,7 @@ def _eval_single_node_parallel_dp_and_frontend(
             if parsed_device_ids is not None
             else list(range(dpl_explicit * slice_width))
         )
-        seen_child_devs: dict[int | str, int] = {}
+        seen_child_devs: dict[tuple[str, int | str], int] = {}
         for local_rank in range(dpl_explicit):
             start_idx = local_rank * slice_width
             end_idx = start_idx + slice_width
@@ -2182,12 +2196,6 @@ def _eval_single_node_parallel_dp_and_frontend(
                     f"{local_rank} contains duplicate device IDs"
                 )
             for dev in child_slice:
-                if dev in seen_child_devs:
-                    raise ValidationError(
-                        f"{context}: --device-ids reuses device {dev!r} across local DP child "
-                        f"ranks ({seen_child_devs[dev]} and {local_rank})"
-                    )
-                seen_child_devs[dev] = local_rank
                 if (
                     type(dev) is int
                     and known_visible is not None
@@ -2202,6 +2210,35 @@ def _eval_single_node_parallel_dp_and_frontend(
                         f"{context}: {source_desc} {dev} out of range for "
                         f"{known_visible} visible device(s)"
                     )
+                if (
+                    type(dev) is str
+                    and cvd_enumerates_uuids
+                    and dev not in cvd_token_set
+                ):
+                    raise ValidationError(
+                        f"{context}: --device-ids UUID {dev!r} is not visible in CUDA_VISIBLE_DEVICES"
+                    )
+                if (
+                    type(dev) is int
+                    and cvd_tokens is not None
+                    and 0 <= dev < len(cvd_tokens)
+                ):
+                    mapped_tok = cvd_tokens[dev]
+                    canon_dev: tuple[str, int | str] = (
+                        ("int", int(mapped_tok))
+                        if mapped_tok.isdigit()
+                        else ("uuid", mapped_tok)
+                    )
+                elif type(dev) is int:
+                    canon_dev = ("int", dev)
+                else:
+                    canon_dev = ("uuid", dev)
+                if canon_dev in seen_child_devs:
+                    raise ValidationError(
+                        f"{context}: --device-ids reuses device {dev!r} across local DP child "
+                        f"ranks ({seen_child_devs[canon_dev]} and {local_rank})"
+                    )
+                seen_child_devs[canon_dev] = local_rank
     elif ssl_keyfile and not ssl_certfile:
         raise ValidationError(
             f"{context}: --ssl-keyfile requires --ssl-certfile "
@@ -2314,6 +2351,12 @@ def _eval_single_node_parallel_dp_and_frontend(
                     raise ValidationError(
                         f"{context}: --device-ids index {dev} out of range for "
                         f"{known_visible} visible device(s)"
+                    )
+        if dist_exec_backend != "ray" and cvd_enumerates_uuids:
+            for dev in parsed_device_ids[:expected_local_devs]:
+                if type(dev) is str and dev not in cvd_token_set:
+                    raise ValidationError(
+                        f"{context}: --device-ids UUID {dev!r} is not visible in CUDA_VISIBLE_DEVICES"
                     )
 
     def _parse_dp_env_int(var_name: str, *, positive: bool = False) -> int:
