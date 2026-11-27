@@ -115,6 +115,7 @@ INVERSE_BOOLEAN_GROUPS: tuple[tuple[str, ...], ...] = (
         "--no-data-parallel-multi-port-external-lb",
     ),
     ("--tokens-only", "--no-tokens-only"),
+    ("--skip-tokenizer-init", "--no-skip-tokenizer-init"),
 )
 FORBIDDEN_RECIPE_FLAGS = frozenset(
     {
@@ -161,28 +162,122 @@ _MASTER_ADDR_ALLOWED_FLAGS = frozenset({"--master-addr", "--data-parallel-addres
 _MASTER_ADDR_ALLOWED_ENV = frozenset({"VLLM_DP_MASTER_IP"})
 _MASTER_PORT_ALLOWED_FLAGS = frozenset({"--master-port", "--data-parallel-rpc-port"})
 _MASTER_PORT_ALLOWED_ENV = frozenset({"VLLM_DP_MASTER_PORT"})
-_PINNED_VLLM_KV_CONNECTORS = frozenset(
+_PINNED_VLLM_KV_CONNECTOR_MODULES: dict[str, tuple[str, str]] = {
+    "DecodeBenchConnector": (
+        "vllm.distributed.kv_transfer.kv_connector.v1.decode_bench_connector",
+        "DecodeBenchConnector",
+    ),
+    "ExampleConnector": (
+        "vllm.distributed.kv_transfer.kv_connector.v1.example_connector",
+        "ExampleConnector",
+    ),
+    "ExampleHiddenStatesConnector": (
+        "vllm.distributed.kv_transfer.kv_connector.v1.example_hidden_states_connector",
+        "ExampleHiddenStatesConnector",
+    ),
+    "FlexKVConnectorV1": (
+        "vllm.distributed.kv_transfer.kv_connector.v1.flexkv_connector",
+        "FlexKVConnectorV1",
+    ),
+    "HF3FSKVConnector": (
+        "vllm.distributed.kv_transfer.kv_connector.v1.hf3fs.hf3fs_connector",
+        "HF3FSKVConnector",
+    ),
+    "HiSparseConnector": (
+        "vllm.distributed.kv_transfer.kv_connector.v1.hisparse.connector",
+        "HiSparseConnector",
+    ),
+    "LMCacheConnectorV1": (
+        "vllm.distributed.kv_transfer.kv_connector.v1.lmcache_connector",
+        "LMCacheConnectorV1",
+    ),
+    "LMCacheMPConnector": (
+        "vllm.distributed.kv_transfer.kv_connector.v1.lmcache_mp_connector",
+        "LMCacheMPConnector",
+    ),
+    "MoRIIOConnector": (
+        "vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_connector",
+        "MoRIIOConnector",
+    ),
+    "MooncakeConnector": (
+        "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector",
+        "MooncakeConnector",
+    ),
+    "MooncakeStoreConnector": (
+        "vllm.distributed.kv_transfer.kv_connector.v1.mooncake_store.connector",
+        "MooncakeStoreConnector",
+    ),
+    "MultiConnector": (
+        "vllm.distributed.kv_transfer.kv_connector.v1.multi_connector",
+        "MultiConnector",
+    ),
+    "NixlConnector": (
+        "vllm.distributed.kv_transfer.kv_connector.v1.nixl",
+        "NixlConnector",
+    ),
+    "NixlPullConnector": (
+        "vllm.distributed.kv_transfer.kv_connector.v1.nixl",
+        "NixlPullConnector",
+    ),
+    "NixlPushConnector": (
+        "vllm.distributed.kv_transfer.kv_connector.v1.nixl",
+        "NixlPushConnector",
+    ),
+    "OffloadingConnector": (
+        "vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector",
+        "OffloadingConnector",
+    ),
+    "SimpleCPUOffloadConnector": (
+        "vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload_connector",
+        "SimpleCPUOffloadConnector",
+    ),
+    "UMBPStoreConnector": (
+        "vllm.distributed.kv_transfer.kv_connector.v1.umbp",
+        "UMBPStoreConnector",
+    ),
+}
+_PINNED_VLLM_KV_CONNECTORS = frozenset(_PINNED_VLLM_KV_CONNECTOR_MODULES)
+_BUILTIN_MODULE_CLASS_TO_CONNECTOR: dict[tuple[str, str], str] = {
+    **{
+        (mod, cls_name): reg_name
+        for reg_name, (mod, cls_name) in _PINNED_VLLM_KV_CONNECTOR_MODULES.items()
+    },
+    (
+        "vllm.distributed.kv_transfer.kv_connector.v1.nixl.connector",
+        "NixlConnector",
+    ): "NixlConnector",
+    (
+        "vllm.distributed.kv_transfer.kv_connector.v1.nixl.connector",
+        "NixlPullConnector",
+    ): "NixlPullConnector",
+    (
+        "vllm.distributed.kv_transfer.kv_connector.v1.nixl.connector",
+        "NixlPushConnector",
+    ): "NixlPushConnector",
+}
+_NON_PD_TRANSFER_CONNECTORS = frozenset(
     {
         "DecodeBenchConnector",
-        "ExampleConnector",
-        "ExampleHiddenStatesConnector",
-        "FlexKVConnectorV1",
-        "HF3FSKVConnector",
-        "HiSparseConnector",
-        "LMCacheConnectorV1",
-        "LMCacheMPConnector",
-        "MoRIIOConnector",
-        "MooncakeConnector",
-        "MooncakeStoreConnector",
-        "MultiConnector",
-        "NixlConnector",
-        "NixlPullConnector",
-        "NixlPushConnector",
         "OffloadingConnector",
         "SimpleCPUOffloadConnector",
-        "UMBPStoreConnector",
     }
 )
+_ALLOWED_KV_ROLES = frozenset({"kv_producer", "kv_consumer", "kv_both"})
+_ALLOWED_KV_TRANSFER_CONFIG_KEYS = frozenset(
+    {
+        "kv_connector",
+        "engine_id",
+        "kv_buffer_device",
+        "kv_role",
+        "kv_port",
+        "kv_connector_extra_config",
+        "kv_connector_module_path",
+        "enable_permute_local_kv",
+        "kv_load_failure_policy",
+    }
+)
+_ALLOWED_RUNNER_MODES = frozenset({"auto", "generate", "pooling", "draft"})
+_ALLOWED_CONVERT_MODES = frozenset({"auto", "none", "embed", "classify"})
 PD_DISAGG_PREFILL_REQUIRED_PLACEHOLDERS = frozenset({"kv_ip", "kv_port", "ib_devices"})
 PD_DISAGG_DECODE_REQUIRED_PLACEHOLDERS = frozenset({"kv_ip", "ib_devices"})
 PD_DISAGG_REQUIRED_PLACEHOLDERS = PD_DISAGG_PREFILL_REQUIRED_PLACEHOLDERS
@@ -1651,7 +1746,7 @@ def _validate_topology_flag_and_placeholder_wiring(
     return placeholders
 
 
-def _compute_single_node_parallel_dp_and_frontend(
+def _eval_single_node_parallel_dp_and_frontend(
     entries: list[tuple[str, str | None, bool]],
     server_env: Mapping[str, Any],
     *,
@@ -1659,8 +1754,9 @@ def _compute_single_node_parallel_dp_and_frontend(
     node_idx: int,
     context: str,
     base_env: Mapping[str, str] | None = None,
-) -> tuple[int, int, int, int | None, int, bool, str, int]:
-    """Evaluate per-node parallelism, LB mode, and ServeSubcommand frontend contract."""
+    http_port: int = 9985,
+) -> tuple[tuple[int, int, int, int | None, int, bool, str, int], tuple[int, ...]]:
+    """Evaluate per-node parallelism, LB mode, frontend contract, and DP rank slice."""
     effective_env: dict[str, str] = dict(os.environ if base_env is None else base_env)
     effective_env.update({k: str(v) for k, v in server_env.items()})
 
@@ -1789,6 +1885,58 @@ def _compute_single_node_parallel_dp_and_frontend(
         default=False,
         context=context,
     )
+    _effective_bool_flag(
+        entries,
+        "--skip-tokenizer-init",
+        ("--no-skip-tokenizer-init",),
+        default=False,
+        context=context,
+    )
+
+    ssl_keyfile_present = any(flag == "--ssl-keyfile" for flag, _, _ in entries)
+    ssl_certfile_present = any(flag == "--ssl-certfile" for flag, _, _ in entries)
+    ssl_keyfile = _flag_value(entries, "--ssl-keyfile")
+    ssl_certfile = _flag_value(entries, "--ssl-certfile")
+    if ssl_keyfile_present and (ssl_keyfile is None or not ssl_keyfile.strip()):
+        raise ValidationError(f"{context}: --ssl-keyfile requires a non-empty path")
+    if ssl_certfile_present and (ssl_certfile is None or not ssl_certfile.strip()):
+        raise ValidationError(f"{context}: --ssl-certfile requires a non-empty path")
+    if bool(ssl_keyfile) != bool(ssl_certfile):
+        raise ValidationError(
+            f"{context}: --ssl-keyfile and --ssl-certfile must be provided together"
+        )
+
+    runner_present = any(flag == "--runner" for flag, _, _ in entries)
+    runner_val = _flag_value(entries, "--runner")
+    if runner_present and (
+        runner_val is None or runner_val not in _ALLOWED_RUNNER_MODES
+    ):
+        raise ValidationError(
+            f"{context}: --runner must be one of {sorted(_ALLOWED_RUNNER_MODES)}, got {runner_val!r}"
+        )
+    convert_present = any(flag == "--convert" for flag, _, _ in entries)
+    convert_val = _flag_value(entries, "--convert")
+    if convert_present and (
+        convert_val is None or convert_val not in _ALLOWED_CONVERT_MODES
+    ):
+        raise ValidationError(
+            f"{context}: --convert must be one of {sorted(_ALLOWED_CONVERT_MODES)}, got {convert_val!r}"
+        )
+
+    sup_port_present = any(
+        flag == "--data-parallel-supervisor-port" for flag, _, _ in entries
+    )
+    sup_port_raw = _flag_value(entries, "--data-parallel-supervisor-port")
+    supervisor_port = 9256
+    if sup_port_present:
+        if sup_port_raw is None:
+            raise ValidationError(
+                f"{context}: --data-parallel-supervisor-port must be an integer"
+            )
+        _validate_port_value(
+            sup_port_raw, context=f"{context}.--data-parallel-supervisor-port"
+        )
+        supervisor_port = int(sup_port_raw)
 
     grpc_port_present = any(flag == "--grpc-port" for flag, _, _ in entries)
     grpc_port_raw = _flag_value(entries, "--grpc-port")
@@ -1872,12 +2020,51 @@ def _compute_single_node_parallel_dp_and_frontend(
             f"(multi-port external, external, or hybrid)"
         )
 
+    if serve_multi_port:
+        if grpc or uds_present:
+            raise ValidationError(
+                f"{context}: --data-parallel-multi-port-external-lb cannot be combined with --grpc or --uds"
+            )
+        if headless or (asc_explicit is not None and asc_explicit != 1):
+            raise ValidationError(
+                f"{context}: --data-parallel-multi-port-external-lb requires --api-server-count=1 and cannot use --headless"
+            )
+        if cli_dp_val < 2:
+            raise ValidationError(
+                f"{context}: --data-parallel-multi-port-external-lb requires --data-parallel-size >= 2, got {cli_dp_val}"
+            )
+        if dpl_explicit is None or dpl_explicit < 2:
+            raise ValidationError(
+                f"{context}: --data-parallel-multi-port-external-lb requires explicit --data-parallel-size-local >= 2"
+            )
+        if cli_dp_val % dpl_explicit != 0:
+            raise ValidationError(
+                f"{context}: --data-parallel-size ({cli_dp_val}) must be divisible by "
+                f"--data-parallel-size-local ({dpl_explicit})"
+            )
+        if http_port <= supervisor_port <= http_port + dpl_explicit - 1:
+            raise ValidationError(
+                f"{context}: --data-parallel-supervisor-port ({supervisor_port}) overlaps with "
+                f"child rank ports [{http_port}, {http_port + dpl_explicit - 1}]"
+            )
+        sup_start_rank = (
+            dp_start_rank_val
+            if dp_start_rank_val is not None
+            else node_idx * dpl_explicit
+        )
+        if sup_start_rank < 0 or sup_start_rank + dpl_explicit > cli_dp_val:
+            raise ValidationError(
+                f"{context}: multi-port supervised ranks [{sup_start_rank}, "
+                f"{sup_start_rank + dpl_explicit - 1}] exceed --data-parallel-size ({cli_dp_val})"
+            )
+
     if topo_nodes > 1 and dp_backend != "mp":
         raise ValidationError(
             f"{context}: multi-node topology (nodes={topo_nodes}) requires "
             f"--data-parallel-backend mp, got {dp_backend!r}"
         )
 
+    inferred_dp_rank = 0
     if topo_nodes > 1:
         if cli_world % topo_nodes != 0:
             raise ValidationError(
@@ -1885,6 +2072,7 @@ def _compute_single_node_parallel_dp_and_frontend(
                 f"vLLM world size ({cli_world})"
             )
         local_world = cli_world // topo_nodes
+        inferred_dp_rank = (node_idx * local_world) // world_within_dp
         if cli_dp_val > 1 and ext_lb_flag:
             if dp_rank_val is None:
                 if topo_nodes % cli_dp_val != 0:
@@ -1918,6 +2106,12 @@ def _compute_single_node_parallel_dp_and_frontend(
         if hybrid_lb and dp_local_val == 1:
             ext_lb = True
             hybrid_lb = False
+            if dp_rank_val is None:
+                dp_rank_val = (
+                    dp_start_rank_val
+                    if dp_start_rank_val is not None
+                    else inferred_dp_rank
+                )
         if (
             dp_start_rank_val is not None
             and cli_dp_val > 1
@@ -2031,6 +2225,46 @@ def _compute_single_node_parallel_dp_and_frontend(
                     f"by nodes per DP replica ({nnodes_within_dp})"
                 )
 
+    if serve_multi_port:
+        assert dpl_explicit is not None
+        eff_start_rank = (
+            dp_start_rank_val
+            if dp_start_rank_val is not None
+            else node_idx * dpl_explicit
+        )
+        dp_rank_slice = tuple(range(eff_start_rank, eff_start_rank + dpl_explicit))
+    elif ext_lb:
+        assert dp_rank_val is not None
+        if not 0 <= dp_rank_val < dp_val:
+            raise ValidationError(
+                f"{context}: effective external DP rank ({dp_rank_val}) must be in [0, {dp_val - 1}]"
+            )
+        dp_rank_slice = (dp_rank_val,)
+    else:
+        eff_start_rank = (
+            dp_start_rank_val
+            if dp_start_rank_val is not None
+            else (inferred_dp_rank if topo_nodes > 1 else env_dp_rank)
+        )
+        expected_node_dpl = (
+            max((ppu_count // topo_nodes) // world_within_dp, 1)
+            if topo_nodes > 1
+            else dp_local_val
+        )
+        if (
+            hybrid_lb
+            or dp_start_rank_val is not None
+            or dp_local_val <= expected_node_dpl
+        ):
+            if eff_start_rank < 0 or eff_start_rank + dp_local_val > dp_val:
+                raise ValidationError(
+                    f"{context}: data-parallel rank slice [{eff_start_rank}, {eff_start_rank + dp_local_val - 1}] "
+                    f"exceeds --data-parallel-size ({dp_val})"
+                )
+            dp_rank_slice = tuple(range(eff_start_rank, eff_start_rank + dp_local_val))
+        else:
+            dp_rank_slice = ()
+
     if grpc:
         eff_api_server_count = 0
         frontend_mode = "grpc"
@@ -2058,15 +2292,41 @@ def _compute_single_node_parallel_dp_and_frontend(
             frontend_mode = "http"
 
     return (
-        ppu_count,
-        dp_val,
-        dp_local_val,
-        dpl_explicit,
-        world_within_dp,
-        ext_lb,
-        frontend_mode,
-        eff_api_server_count,
+        (
+            ppu_count,
+            dp_val,
+            dp_local_val,
+            dpl_explicit,
+            world_within_dp,
+            ext_lb,
+            frontend_mode,
+            eff_api_server_count,
+        ),
+        dp_rank_slice,
     )
+
+
+def _compute_single_node_parallel_dp_and_frontend(
+    entries: list[tuple[str, str | None, bool]],
+    server_env: Mapping[str, Any],
+    *,
+    topo_nodes: int,
+    node_idx: int,
+    context: str,
+    base_env: Mapping[str, str] | None = None,
+    http_port: int = 9985,
+) -> tuple[int, int, int, int | None, int, bool, str, int]:
+    """Evaluate per-node parallelism, LB mode, and ServeSubcommand frontend contract."""
+    res, _ = _eval_single_node_parallel_dp_and_frontend(
+        entries,
+        server_env,
+        topo_nodes=topo_nodes,
+        node_idx=node_idx,
+        context=context,
+        base_env=base_env,
+        http_port=http_port,
+    )
+    return res
 
 
 def _compute_parallel_dp_and_frontend(
@@ -2076,11 +2336,14 @@ def _compute_parallel_dp_and_frontend(
     topo_nodes: int,
     context: str,
     base_env: Mapping[str, str] | None = None,
+    http_port: int = 9985,
+    validate_cluster_layout: bool = True,
 ) -> tuple[int, int, int, int | None, int, bool, str, int]:
     """Evaluate parallelism, DP layout, and ServeSubcommand frontend across all nodes."""
     raw_flags = _render_entries(entries)
     str_env = {str(k): str(v) for k, v in server_env.items()}
-    first_result: tuple[int, int, int, int | None, int, bool, str, int] | None = None
+    node_results: list[tuple[int, int, int, int | None, int, bool, str, int]] = []
+    node_slices: list[tuple[int, ...]] = []
     for node_idx in range(max(topo_nodes, 1)):
         if topo_nodes > 1:
             sub_flags, sub_env = substitute_validation_placeholders(
@@ -2091,17 +2354,56 @@ def _compute_parallel_dp_and_frontend(
         else:
             node_entries = entries
             node_env = server_env
-        node_res = _compute_single_node_parallel_dp_and_frontend(
+        node_res, node_slice = _eval_single_node_parallel_dp_and_frontend(
             node_entries,
             node_env,
             topo_nodes=topo_nodes,
             node_idx=node_idx,
             context=context,
             base_env=base_env,
+            http_port=http_port,
         )
-        if first_result is None:
-            first_result = node_res
-    assert first_result is not None
+        node_results.append(node_res)
+        node_slices.append(node_slice)
+
+    first_result = node_results[0]
+    if topo_nodes > 1 and validate_cluster_layout:
+        if all(res[6] == "headless" for res in node_results):
+            raise ValidationError(
+                f"{context}: multi-node serving recipe (nodes={topo_nodes}) leaves zero active "
+                f"API/supervisor entrypoints across all nodes"
+            )
+        ppu_count_0, dp_val_0, _, _, world_within_dp_0, *_ = first_result
+        local_world_0 = ppu_count_0 // topo_nodes
+        if world_within_dp_0 > local_world_0:
+            if world_within_dp_0 % local_world_0 != 0:
+                raise ValidationError(
+                    f"{context}: per-replica world size ({world_within_dp_0}) must be a multiple of "
+                    f"per-node world size ({local_world_0})"
+                )
+            nodes_per_replica = world_within_dp_0 // local_world_0
+        else:
+            nodes_per_replica = 1
+        if topo_nodes % nodes_per_replica != 0:
+            raise ValidationError(
+                f"{context}: topology.nodes ({topo_nodes}) must be divisible by "
+                f"nodes per DP replica ({nodes_per_replica})"
+            )
+        group_slices: list[tuple[int, ...]] = []
+        for g_start in range(0, topo_nodes, nodes_per_replica):
+            grp = node_slices[g_start : g_start + nodes_per_replica]
+            if len(set(grp)) != 1:
+                raise ValidationError(
+                    f"{context}: cross-node replica group nodes [{g_start}..{g_start + nodes_per_replica - 1}] "
+                    f"disagree on DP rank assignment: {grp}"
+                )
+            group_slices.append(grp[0])
+        covered_ranks = [r for sl in group_slices for r in sl]
+        if len(covered_ranks) != dp_val_0 or set(covered_ranks) != set(range(dp_val_0)):
+            raise ValidationError(
+                f"{context}: multi-node DP layout across {topo_nodes} nodes covers ranks "
+                f"{covered_ranks}, expected an exact partition of 0..{dp_val_0 - 1}"
+            )
     return first_result
 
 
@@ -2129,7 +2431,13 @@ def _canonical_kv_connector_dict_spec(
     server_env: Mapping[str, Any],
     *,
     context: str,
+    require_role: bool = False,
 ) -> tuple[Any, ...]:
+    extra_keys = sorted(set(kv_obj) - _ALLOWED_KV_TRANSFER_CONFIG_KEYS)
+    if extra_keys:
+        raise ValidationError(
+            f"{context}: unexpected KVTransferConfig field(s): {', '.join(extra_keys)}"
+        )
     connector = kv_obj.get("kv_connector")
     if not isinstance(connector, str) or not connector:
         raise ValidationError(
@@ -2139,6 +2447,17 @@ def _canonical_kv_connector_dict_spec(
         raise ValidationError(
             f"{context}: kv_connector must not contain leading/trailing whitespace: {connector!r}"
         )
+    kv_role = kv_obj.get("kv_role")
+    if require_role:
+        if kv_role not in _ALLOWED_KV_ROLES:
+            raise ValidationError(
+                f"{context}: KVTransferConfig requires kv_role in {sorted(_ALLOWED_KV_ROLES)}, got {kv_role!r}"
+            )
+    elif kv_role is not None and kv_role not in _ALLOWED_KV_ROLES:
+        raise ValidationError(
+            f"{context}: KVTransferConfig kv_role must be in {sorted(_ALLOWED_KV_ROLES)}, got {kv_role!r}"
+        )
+
     module_path = kv_obj.get("kv_connector_module_path")
     if module_path is not None:
         if not isinstance(module_path, str) or not module_path:
@@ -2157,13 +2476,28 @@ def _canonical_kv_connector_dict_spec(
     extra = extra or {}
 
     if module_path:
-        return ("custom", module_path, connector)
-    if connector not in _PINNED_VLLM_KV_CONNECTORS:
-        raise ValidationError(
-            f"{context}: unsupported builtin kv_connector {connector!r} "
-            f"(set kv_connector_module_path for external connectors)"
+        canonical_builtin = _BUILTIN_MODULE_CLASS_TO_CONNECTOR.get(
+            (module_path, connector)
         )
-    if connector == "NixlConnector":
+        if canonical_builtin is None:
+            return ("custom", module_path, connector)
+        if canonical_builtin == "NixlConnector":
+            mode = extra.get("transfer_mode", "pull")
+            if type(mode) is not str or mode != "pull":
+                raise ValidationError(
+                    f"{context}: explicit {module_path}.NixlConnector ignores non-'pull' "
+                    f"transfer_mode={mode!r}; use NixlPushConnector or omit kv_connector_module_path"
+                )
+            return ("builtin", "NixlPullConnector")
+    else:
+        if connector not in _PINNED_VLLM_KV_CONNECTORS:
+            raise ValidationError(
+                f"{context}: unsupported builtin kv_connector {connector!r} "
+                f"(set kv_connector_module_path for external connectors)"
+            )
+        canonical_builtin = connector
+
+    if canonical_builtin == "NixlConnector":
         mode = extra.get("transfer_mode", "pull")
         if type(mode) is not str or mode not in ("pull", "push"):
             raise ValidationError(
@@ -2171,7 +2505,7 @@ def _canonical_kv_connector_dict_spec(
                 f"(expected exact 'pull' or 'push')"
             )
         return ("builtin", f"Nixl{mode.capitalize()}Connector")
-    if connector == "MooncakeConnector":
+    if canonical_builtin == "MooncakeConnector":
         protocol = extra.get("mooncake_protocol", "rdma")
         if (
             type(protocol) is not str
@@ -2191,7 +2525,7 @@ def _canonical_kv_connector_dict_spec(
                 f"reads kv_connector_extra_config.mooncake_protocol (default 'rdma')"
             )
         return ("builtin", "MooncakeConnector", protocol)
-    if connector == "MultiConnector":
+    if canonical_builtin == "MultiConnector":
         children = extra.get("connectors")
         if not isinstance(children, list) or not children:
             raise ValidationError(
@@ -2205,11 +2539,14 @@ def _canonical_kv_connector_dict_spec(
                 )
             child_specs.append(
                 _canonical_kv_connector_dict_spec(
-                    child, server_env, context=f"{context}.connectors[{idx}]"
+                    child,
+                    server_env,
+                    context=f"{context}.connectors[{idx}]",
+                    require_role=True,
                 )
             )
         return ("builtin", "MultiConnector", tuple(child_specs))
-    return ("builtin", connector)
+    return ("builtin", canonical_builtin)
 
 
 def _canonical_kv_connector_spec(
@@ -2226,7 +2563,258 @@ def _canonical_kv_connector_spec(
             f"{context}: pd_disagg preset requires --kv-transfer-config"
         )
     kv_obj = json.loads(kv_raw)
-    return _canonical_kv_connector_dict_spec(kv_obj, server_env, context=context)
+    return _canonical_kv_connector_dict_spec(
+        kv_obj, server_env, context=context, require_role=True
+    )
+
+
+def _collect_kv_connector_leaves(
+    kv_obj: Mapping[str, Any],
+    server_env: Mapping[str, Any],
+    *,
+    context: str,
+    ancestor_has_kv_port: bool = False,
+) -> list[tuple[tuple[Any, ...], str, Mapping[str, Any], str, bool]]:
+    """Flatten a validated KVTransferConfig tree into leaf connector records."""
+    spec = _canonical_kv_connector_dict_spec(
+        kv_obj, server_env, context=context, require_role=True
+    )
+    has_kv_port = ancestor_has_kv_port or ("kv_port" in kv_obj)
+    if spec[:2] == ("builtin", "MultiConnector"):
+        children = (kv_obj.get("kv_connector_extra_config") or {})["connectors"]
+        leaves: list[tuple[tuple[Any, ...], str, Mapping[str, Any], str, bool]] = []
+        for idx, child in enumerate(children):
+            leaves.extend(
+                _collect_kv_connector_leaves(
+                    child,
+                    server_env,
+                    context=f"{context}.connectors[{idx}]",
+                    ancestor_has_kv_port=has_kv_port,
+                )
+            )
+        return leaves
+    return [(spec, str(kv_obj["kv_role"]), kv_obj, context, has_kv_port)]
+
+
+def _validate_mooncake_pd_leaf(
+    kv_obj: Mapping[str, Any],
+    *,
+    server_env: Mapping[str, Any],
+    role: str | None,
+    context: str,
+    has_inert_kv_port: bool,
+) -> None:
+    extra = kv_obj.get("kv_connector_extra_config")
+    if extra is not None and not isinstance(extra, dict):
+        raise ValidationError(
+            f"{context}: MooncakeConnector kv_connector_extra_config must be a JSON object"
+        )
+    extra = extra or {}
+    if has_inert_kv_port:
+        raise ValidationError(
+            f"{context}: MooncakeConnector does not read KVTransferConfig.kv_port; "
+            f"wire {{kv_port}} via VLLM_MOONCAKE_BOOTSTRAP_PORT or "
+            f"kv_connector_extra_config.bootstrap_server_address"
+        )
+    if "kv_ip" in extra:
+        raise ValidationError(
+            f"{context}: MooncakeConnector does not read kv_connector_extra_config.kv_ip; "
+            f"wire {{kv_ip}} via VLLM_HOST_IP (and optional bootstrap_server_address)"
+        )
+    dev_name = extra.get("device_name")
+    if not isinstance(dev_name, str) or "{ib_devices}" not in dev_name:
+        raise ValidationError(
+            f"{context}: MooncakeConnector requires kv_connector_extra_config.device_name "
+            f"to wire {{ib_devices}}"
+        )
+    host_ip_env = server_env.get("VLLM_HOST_IP")
+    if not isinstance(host_ip_env, str) or "{kv_ip}" not in host_ip_env:
+        raise ValidationError(
+            f"{context}: MooncakeConnector requires env VLLM_HOST_IP to wire {{kv_ip}}"
+        )
+    bootstrap_addr = extra.get("bootstrap_server_address")
+    bootstrap_port_env = server_env.get("VLLM_MOONCAKE_BOOTSTRAP_PORT")
+    if role == "prefill":
+        if bootstrap_addr is not None and bootstrap_port_env is not None:
+            raise ValidationError(
+                f"{context}: MooncakeConnector prefill must not set both "
+                f"bootstrap_server_address and VLLM_MOONCAKE_BOOTSTRAP_PORT"
+            )
+        if bootstrap_addr is not None:
+            if not isinstance(bootstrap_addr, str) or "{kv_port}" not in bootstrap_addr:
+                raise ValidationError(
+                    f"{context}: MooncakeConnector bootstrap_server_address must "
+                    f"be a 'host:port' string wiring {{kv_port}}"
+                )
+            sub_addr = _substitute_placeholders_in_str(bootstrap_addr)
+            _parse_mooncake_host_port(
+                sub_addr,
+                context=f"{context}.bootstrap_server_address",
+            )
+        else:
+            if (
+                not isinstance(bootstrap_port_env, str)
+                or "{kv_port}" not in bootstrap_port_env
+            ):
+                raise ValidationError(
+                    f"{context}: MooncakeConnector prefill requires env "
+                    f"VLLM_MOONCAKE_BOOTSTRAP_PORT (or kv_connector_extra_config."
+                    f"bootstrap_server_address) to wire {{kv_port}}"
+                )
+            _validate_port_value(
+                _substitute_placeholders_in_str(bootstrap_port_env),
+                context=f"{context}.VLLM_MOONCAKE_BOOTSTRAP_PORT",
+            )
+    elif role == "decode":
+        if bootstrap_addr is not None or bootstrap_port_env is not None:
+            raise ValidationError(
+                f"{context}: MooncakeConnector decode (kv_consumer) does not read "
+                f"bootstrap_server_address or VLLM_MOONCAKE_BOOTSTRAP_PORT; "
+                f"decoders receive remote_bootstrap_addr via kv_transfer_params"
+            )
+
+
+def _extract_argv_http_port(argv: Sequence[str], *, default: int = 9985) -> int:
+    for idx, tok in enumerate(argv):
+        if tok == "--port" and idx + 1 < len(argv):
+            try:
+                return int(argv[idx + 1])
+            except ValueError:
+                return default
+        if tok.startswith("--port="):
+            try:
+                return int(tok.split("=", 1)[1])
+            except ValueError:
+                return default
+    return default
+
+
+def check_single_node_sanity_compatibility(
+    resolved: Mapping[str, Any],
+    *,
+    hardware: str | None = None,
+    max_devices: int | None = None,
+    base_env: Mapping[str, str] | None = None,
+) -> str | None:
+    """Return ``None`` if ``resolved`` is runnable by single-node HTTP chat sanity, else a reason."""
+    topo = resolved.get("topology") or {"kind": "single_node", "nodes": 1}
+    if (
+        int(topo.get("nodes", 1)) > 1
+        or topo.get("kind", "single_node") != "single_node"
+    ):
+        return (
+            f"requires topology {topo.get('kind')!r} (nodes={topo.get('nodes')}), "
+            f"which is not runnable on single-node CI"
+        )
+    if hardware is not None and resolved.get("hardware") != hardware:
+        return (
+            f"targets hardware {resolved.get('hardware')!r}, "
+            f"which is not runnable on single-node {hardware!r} CI"
+        )
+
+    server_env = dict(resolved.get("server_env", {}))
+    effective_env: dict[str, str] = dict(os.environ if base_env is None else base_env)
+    effective_env.update({k: str(v) for k, v in server_env.items()})
+    http_port = _extract_argv_http_port(resolved.get("argv", ()), default=9985)
+
+    if "flags" in resolved:
+        entries = _parse_flag_entries(list(resolved["flags"]))
+        (
+            calc_ppu,
+            calc_dp,
+            calc_dp_local,
+            _,
+            _,
+            _,
+            eff_frontend,
+            eff_asc,
+        ) = _compute_parallel_dp_and_frontend(
+            entries,
+            server_env,
+            topo_nodes=int(topo.get("nodes", 1)),
+            context="single_node_sanity",
+            base_env=effective_env,
+            http_port=http_port,
+        )
+        eff_ppu_count = max(int(resolved.get("ppu_count", calc_ppu)), calc_ppu)
+        dp_global = calc_dp
+        dp_local = calc_dp_local
+    else:
+        entries = []
+        eff_ppu_count = int(resolved.get("ppu_count", 1))
+        dp_global = int(resolved.get("dp_size", 1))
+        dp_local = int(resolved.get("dp_size_local", 1))
+        eff_frontend = str(resolved.get("frontend_mode", "http"))
+        eff_asc = resolved.get("api_server_count", 1)
+
+    if dp_local != dp_global:
+        return (
+            f"has effective local DP size {dp_local} != global DP size {dp_global}, "
+            f"which cannot become ready in a single-server CI launch"
+        )
+
+    declared_frontend = str(resolved.get("frontend_mode", eff_frontend))
+    if eff_frontend != "http" or declared_frontend != "http":
+        bad_mode = eff_frontend if eff_frontend != "http" else declared_frontend
+        return (
+            f"resolves to frontend_mode={bad_mode!r} (api_server_count={eff_asc!r}), "
+            f"which does not expose an OpenAI HTTP server"
+        )
+
+    if entries:
+        ssl_certfile = _flag_value(entries, "--ssl-certfile")
+        ssl_keyfile = _flag_value(entries, "--ssl-keyfile")
+        if ssl_certfile or ssl_keyfile:
+            return (
+                "enables TLS (--ssl-certfile/--ssl-keyfile), which is incompatible with "
+                "plaintext HTTP sanity probes"
+            )
+        runner_mode = _flag_value(entries, "--runner")
+        convert_mode = _flag_value(entries, "--convert")
+        task_mode = _flag_value(entries, "--task")
+        if (
+            (runner_mode is not None and runner_mode not in {"auto", "generate"})
+            or (convert_mode is not None and convert_mode not in {"auto", "none"})
+            or (task_mode is not None and task_mode not in {"auto", "generate"})
+        ):
+            return (
+                f"configures non-generative endpoint (runner={runner_mode!r}, "
+                f"convert={convert_mode!r}), which does not serve /v1/chat/completions"
+            )
+        if _effective_bool_flag(
+            entries,
+            "--skip-tokenizer-init",
+            ("--no-skip-tokenizer-init",),
+            default=False,
+            context="single_node_sanity",
+        ):
+            return (
+                "sets --skip-tokenizer-init, which cannot render text messages for "
+                "/v1/chat/completions sanity probes"
+            )
+        api_key_present = any(flag == "--api-key" for flag, _, _ in entries)
+        api_key_val = _flag_value(entries, "--api-key")
+        if api_key_present and api_key_val is None:
+            raise ValidationError("single_node_sanity: --api-key requires a value")
+        if (api_key_present and bool(api_key_val)) or bool(
+            effective_env.get("VLLM_API_KEY", "").strip()
+        ):
+            return (
+                "requires API key authentication (--api-key / VLLM_API_KEY), which "
+                "unauthenticated sanity probes do not send"
+            )
+    elif bool(effective_env.get("VLLM_API_KEY", "").strip()):
+        return (
+            "requires API key authentication (--api-key / VLLM_API_KEY), which "
+            "unauthenticated sanity probes do not send"
+        )
+
+    if max_devices is not None and eff_ppu_count > max_devices:
+        return (
+            f"requires {eff_ppu_count} devices, exceeding single-node "
+            f"{hardware or resolved.get('hardware')!r} CI runner limit ({max_devices})"
+        )
+    return None
 
 
 def _validate_resolved_topology_and_placeholders(
@@ -2253,6 +2841,7 @@ def _validate_resolved_topology_and_placeholders(
     )
 
     entries = _parse_flag_entries(flags)
+    http_port = _extract_argv_http_port(resolved.get("argv", ()), default=9985)
     (
         calc_ppu_count,
         dp_val,
@@ -2268,6 +2857,8 @@ def _validate_resolved_topology_and_placeholders(
         topo_nodes=topo_nodes,
         context=context,
         base_env=base_env,
+        http_port=http_port,
+        validate_cluster_layout=False,
     )
     ppu_count = max(int(resolved["ppu_count"]), calc_ppu_count)
 
@@ -2316,6 +2907,16 @@ def _validate_resolved_topology_and_placeholders(
                 f"must match {layout_desc} ({expected_multi_dpl}) for {topo_nodes} nodes "
                 f"(DP={dp_val}, replica world={world_within_dp})"
             )
+    if topo_nodes > 1:
+        _compute_parallel_dp_and_frontend(
+            entries,
+            server_env,
+            topo_nodes=topo_nodes,
+            context=context,
+            base_env=base_env,
+            http_port=http_port,
+            validate_cluster_layout=True,
+        )
     elif topo_kind == "pd_disagg":
         kv_raw = _flag_value(entries, "--kv-transfer-config")
         if kv_raw is None:
@@ -2356,78 +2957,43 @@ def _validate_resolved_topology_and_placeholders(
                 f"{context}: pd_disagg role {role!r} requires "
                 f"kv_role={expected_kv_role!r}, got {kv_obj.get('kv_role')!r}"
             )
-        if connector == "MooncakeConnector":
-            extra = kv_obj.get("kv_connector_extra_config")
-            if extra is not None and not isinstance(extra, dict):
+        leaves = _collect_kv_connector_leaves(kv_obj, server_env, context=context)
+        for leaf_spec, _leaf_role, _leaf_obj, leaf_ctx, _has_kv_port in leaves:
+            if leaf_spec[:2] == ("builtin", "DecodeBenchConnector"):
                 raise ValidationError(
-                    f"{context}: MooncakeConnector kv_connector_extra_config must be a JSON object"
+                    f"{leaf_ctx}: DecodeBenchConnector fills local dummy KV and cannot "
+                    f"transfer KV across disaggregated pd_prefill/pd_decode instances"
                 )
-            extra = extra or {}
-            if "kv_port" in kv_obj:
+        transfer_leaves = [
+            item
+            for item in leaves
+            if item[0][0] == "custom" or item[0][1] not in _NON_PD_TRANSFER_CONNECTORS
+        ]
+        if not transfer_leaves:
+            raise ValidationError(
+                f"{context}: pd_disagg requires at least one cross-instance KV transfer "
+                f"connector, got {[item[0] for item in leaves]}"
+            )
+        allowed_leaf_roles = (
+            {"kv_producer", "kv_both"}
+            if role == "prefill"
+            else ({"kv_consumer", "kv_both"} if role == "decode" else _ALLOWED_KV_ROLES)
+        )
+        for _leaf_spec, leaf_role, _leaf_obj, leaf_ctx, _has_kv_port in transfer_leaves:
+            if leaf_role not in allowed_leaf_roles:
                 raise ValidationError(
-                    f"{context}: MooncakeConnector does not read KVTransferConfig.kv_port; "
-                    f"wire {{kv_port}} via VLLM_MOONCAKE_BOOTSTRAP_PORT or "
-                    f"kv_connector_extra_config.bootstrap_server_address"
+                    f"{leaf_ctx}: pd_disagg role {role!r} requires effective connector "
+                    f"kv_role in {sorted(allowed_leaf_roles)}, got {leaf_role!r}"
                 )
-            if "kv_ip" in extra:
-                raise ValidationError(
-                    f"{context}: MooncakeConnector does not read kv_connector_extra_config.kv_ip; "
-                    f"wire {{kv_ip}} via VLLM_HOST_IP (and optional bootstrap_server_address)"
+        for leaf_spec, _leaf_role, leaf_obj, leaf_ctx, has_kv_port in leaves:
+            if leaf_spec[:2] == ("builtin", "MooncakeConnector"):
+                _validate_mooncake_pd_leaf(
+                    leaf_obj,
+                    server_env=server_env,
+                    role=role,
+                    context=leaf_ctx,
+                    has_inert_kv_port=has_kv_port,
                 )
-            dev_name = extra.get("device_name")
-            if not isinstance(dev_name, str) or "{ib_devices}" not in dev_name:
-                raise ValidationError(
-                    f"{context}: MooncakeConnector requires kv_connector_extra_config.device_name "
-                    f"to wire {{ib_devices}}"
-                )
-            host_ip_env = server_env.get("VLLM_HOST_IP")
-            if not isinstance(host_ip_env, str) or "{kv_ip}" not in host_ip_env:
-                raise ValidationError(
-                    f"{context}: MooncakeConnector requires env VLLM_HOST_IP to wire {{kv_ip}}"
-                )
-            bootstrap_addr = extra.get("bootstrap_server_address")
-            bootstrap_port_env = server_env.get("VLLM_MOONCAKE_BOOTSTRAP_PORT")
-            if role == "prefill":
-                if bootstrap_addr is not None and bootstrap_port_env is not None:
-                    raise ValidationError(
-                        f"{context}: MooncakeConnector prefill must not set both "
-                        f"bootstrap_server_address and VLLM_MOONCAKE_BOOTSTRAP_PORT"
-                    )
-                if bootstrap_addr is not None:
-                    if (
-                        not isinstance(bootstrap_addr, str)
-                        or "{kv_port}" not in bootstrap_addr
-                    ):
-                        raise ValidationError(
-                            f"{context}: MooncakeConnector bootstrap_server_address must "
-                            f"be a 'host:port' string wiring {{kv_port}}"
-                        )
-                    sub_addr = _substitute_placeholders_in_str(bootstrap_addr)
-                    _parse_mooncake_host_port(
-                        sub_addr,
-                        context=f"{context}.bootstrap_server_address",
-                    )
-                else:
-                    if (
-                        not isinstance(bootstrap_port_env, str)
-                        or "{kv_port}" not in bootstrap_port_env
-                    ):
-                        raise ValidationError(
-                            f"{context}: MooncakeConnector prefill requires env "
-                            f"VLLM_MOONCAKE_BOOTSTRAP_PORT (or kv_connector_extra_config."
-                            f"bootstrap_server_address) to wire {{kv_port}}"
-                        )
-                    _validate_port_value(
-                        _substitute_placeholders_in_str(bootstrap_port_env),
-                        context=f"{context}.VLLM_MOONCAKE_BOOTSTRAP_PORT",
-                    )
-            elif role == "decode":
-                if bootstrap_addr is not None or bootstrap_port_env is not None:
-                    raise ValidationError(
-                        f"{context}: MooncakeConnector decode (kv_consumer) does not read "
-                        f"bootstrap_server_address or VLLM_MOONCAKE_BOOTSTRAP_PORT; "
-                        f"decoders receive remote_bootstrap_addr via kv_transfer_params"
-                    )
 
     sub_flags, sub_env = substitute_validation_placeholders(flags, server_env)
     _validate_flag_list(sub_flags, context=context, allow_policy_flags=True)
@@ -2705,6 +3271,8 @@ def _resolve_recipe_from_doc(
         server_env,
         topo_nodes=int(eff_topology["nodes"]),
         context=recipe_label,
+        http_port=port,
+        validate_cluster_layout=False,
     )
 
     runtime_env: dict[str, str] = {}

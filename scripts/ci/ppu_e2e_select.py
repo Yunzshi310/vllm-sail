@@ -162,43 +162,12 @@ def _recipe_entries(
         rec_rel = Path(pol_doc["recipe"])
         rec_path = rec_rel if rec_rel.is_absolute() else (REPO_ROOT / rec_rel)
         resolved = ppu_recipe.resolve_recipe(rec_path, policy_path=pol_path, tier=tier)
-        topo = resolved["topology"]
-        if topo["nodes"] > 1 or topo["kind"] == "pd_disagg":
+        incompat_reason = ppu_recipe.check_single_node_sanity_compatibility(
+            resolved, hardware=hardware, max_devices=eff_max_devices
+        )
+        if incompat_reason is not None:
             if requested:
-                raise ValueError(
-                    f"recipe policy {slug!r} requires topology {topo['kind']!r} "
-                    f"(nodes={topo['nodes']}), which is not runnable on single-node CI"
-                )
-            continue
-        if hardware is not None and resolved["hardware"] != hardware:
-            if requested:
-                raise ValueError(
-                    f"recipe policy {slug!r} targets hardware {resolved['hardware']!r}, "
-                    f"which is not runnable on single-node {hardware!r} CI"
-                )
-            continue
-        if int(resolved.get("dp_size_local", 1)) != int(resolved.get("dp_size", 1)):
-            if requested:
-                raise ValueError(
-                    f"recipe policy {slug!r} has effective local DP size "
-                    f"{resolved['dp_size_local']} != global DP size {resolved['dp_size']}, "
-                    f"which cannot become ready in a single-server CI launch"
-                )
-            continue
-        if resolved.get("frontend_mode", "http") != "http":
-            if requested:
-                raise ValueError(
-                    f"recipe policy {slug!r} resolves to frontend_mode={resolved['frontend_mode']!r} "
-                    f"(api_server_count={resolved.get('api_server_count')}), "
-                    f"which does not expose an OpenAI HTTP server"
-                )
-            continue
-        if eff_max_devices is not None and int(resolved["ppu_count"]) > eff_max_devices:
-            if requested:
-                raise ValueError(
-                    f"recipe policy {slug!r} requires {resolved['ppu_count']} devices, "
-                    f"exceeding single-node {hardware or resolved['hardware']!r} CI runner limit ({eff_max_devices})"
-                )
+                raise ValueError(f"recipe policy {slug!r} {incompat_reason}")
             continue
         yield (
             {

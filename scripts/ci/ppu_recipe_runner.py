@@ -37,9 +37,8 @@ if str(REPO_ROOT) not in sys.path:
 
 from ppu_recipe import (  # noqa: E402
     ValidationError,
-    _compute_parallel_dp_and_frontend,
-    _parse_flag_entries,
     _validate_resolved_topology_and_placeholders,
+    check_single_node_sanity_compatibility,
     infer_fast_sanity_layer_override,
     redact_and_verify_public_payload,
     resolve_local_checkpoint_dir,
@@ -609,22 +608,10 @@ def _launch_resolved_server(
         _validate_resolved_topology_and_placeholders(
             resolved, context="launch_resolved_server", base_env=env
         )
-        *_, eff_frontend, eff_asc = _compute_parallel_dp_and_frontend(
-            _parse_flag_entries(list(resolved["flags"])),
-            dict(resolved.get("server_env", {})),
-            topo_nodes=int(resolved["topology"]["nodes"]),
-            context="launch_resolved_server",
-            base_env=env,
-        )
-    else:
-        eff_frontend = str(resolved.get("frontend_mode", "http"))
-        eff_asc = resolved.get("api_server_count", 1)
-    declared_frontend = str(resolved.get("frontend_mode", eff_frontend))
-    if eff_frontend != "http" or declared_frontend != "http":
-        bad_mode = eff_frontend if eff_frontend != "http" else declared_frontend
+    incompat_reason = check_single_node_sanity_compatibility(resolved, base_env=env)
+    if incompat_reason is not None:
         raise ValidationError(
-            f"launch_resolved_server requires OpenAI HTTP server (frontend_mode='http'), "
-            f"got frontend_mode={bad_mode!r} (api_server_count={eff_asc!r})"
+            f"launch_resolved_server requires OpenAI HTTP server: {incompat_reason}"
         )
     if (
         model_dir is not None
@@ -769,16 +756,19 @@ def run_fast_sanity(
         preset=preset,
         layer_override=None,
         assets_map_path=assets_map,
+        port=port,
     )
-    if base_resolved.get("frontend_mode", "http") != "http":
-        raise ValidationError(
-            f"run_fast_sanity requires OpenAI HTTP server (frontend_mode='http'), "
-            f"got frontend_mode={base_resolved.get('frontend_mode')!r}"
-        )
     effective_env = {
         **os.environ,
         **{k: str(v) for k, v in base_resolved.get("server_env", {}).items()},
     }
+    incompat_reason = check_single_node_sanity_compatibility(
+        base_resolved, base_env=effective_env
+    )
+    if incompat_reason is not None:
+        raise ValidationError(
+            f"run_fast_sanity requires OpenAI HTTP server: {incompat_reason}"
+        )
     model_dir = resolve_local_checkpoint_dir(
         base_resolved["resolved_model"], env=effective_env
     )
@@ -1022,6 +1012,17 @@ def run_model_sanity(
         port=port,
         served_model_name=f"recipe-ms-{secrets.token_hex(4)}",
     )
+    ms_effective_env = {
+        **os.environ,
+        **{k: str(v) for k, v in resolved.get("server_env", {}).items()},
+    }
+    ms_incompat = check_single_node_sanity_compatibility(
+        resolved, base_env=ms_effective_env
+    )
+    if ms_incompat is not None:
+        raise ValidationError(
+            f"run_model_sanity requires OpenAI HTTP server: {ms_incompat}"
+        )
     unique_served = resolved["served_name"]
     gsm8k_path = os.environ.get("GSM8K_DATASET_PATH", "")
     if not gsm8k_path:

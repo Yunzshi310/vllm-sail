@@ -185,10 +185,11 @@ presets:
       VLLM_HOST_IP: "{kv_ip}"
 notes: >-
   Reference #0 full-scenario serving recipe for zai-org/GLM-5.3 on Zhenwu M890
-  across public checkpoints (default mxfp4 and upstream native fp8), covering
-  prefill (TP4/TP8 without MTP), single-node decode (TP8 with MTP), 4-node
-  DP32+EP decode_ep, and paired Mooncake pd_prefill/pd_decode disaggregation
-  presets. Tool-call and reasoning parsers are unified on glm47, memory
-  utilization is cleaned to 0.9 (with 0.95 hardware override ready for Zhenwu
-  810E once public INT8 checkpoints are released), and prefix caching is
-  policy-owned.
+  (default mxfp4 requires a provisioned local checkpoint asset or authenticated
+  Hugging Face Hub access; upstream native fp8 zai-org/GLM-5.3 is publicly
+  accessible), covering prefill (TP4/TP8 without MTP), single-node decode (TP8
+  with MTP), 4-node DP32+EP decode_ep, and paired Mooncake
+  pd_prefill/pd_decode disaggregation presets. Tool-call and reasoning parsers
+  are unified on glm47, memory utilization is cleaned to 0.9 (with 0.95
+  hardware override ready for Zhenwu 810E once public INT8 checkpoints are
+  released), and prefix caching is policy-owned.
