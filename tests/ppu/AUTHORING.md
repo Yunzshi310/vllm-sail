@@ -21,11 +21,11 @@ Every CI execution and dataset switch belongs in `tests/ppu/policy/`.
 A serving recipe describes **only** how to launch `vllm serve` for a public model.
 `scripts/ci/ppu_recipe.py validate --all` fails closed on the following violations:
 
-- **No policy-owned runtime flags**: Never hardcode `--enable-prefix-caching`,
-  `--no-enable-prefix-caching`, `--disable-radix-cache`, `--load-format`,
-  `--model-path`, `--tokenizer-path`, `--served-model-name`, `--host`, or `--port`.
-  The executor injects prefix caching according to workload policy (enabled for
-  sanity/evaluation, disabled for clean benchmarks) and resolves model/endpoint
+- **No policy-owned runtime or auth flags**: Never hardcode `--api-key`,
+  `--enable-prefix-caching`, `--no-enable-prefix-caching`, `--disable-radix-cache`,
+  `--load-format`, `--model-path`, `--tokenizer-path`, `--served-model-name`, `--host`,
+  or `--port`. The executor injects prefix caching according to workload policy (enabled
+  for sanity/evaluation, disabled for clean benchmarks) and resolves model/endpoint
   flags at runtime.
 - **No invalid historical values**: Clean legacy parameters before onboarding. For
   example, `--gpu-memory-utilization` must be strictly in `(0.0, 1.0]` (never `0`),
@@ -33,11 +33,11 @@ A serving recipe describes **only** how to launch `vllm serve` for a public mode
   for the model family.
 - **No client workload settings**: Do not put input/output sequence lengths (ISL/OSL),
   concurrency lists, prompt counts, or sampling/dataset parameters in recipes.
-- **No runtime-mode or host-specific environment variables**: Variables such as
+- **No runtime-mode, auth, or host-specific environment variables**: Variables such as
   `HF_HOME`, `HF_HUB_OFFLINE`, `TRANSFORMERS_OFFLINE`, `CUDA_VISIBLE_DEVICES`,
-  `VLLM_SERVER_DEV_MODE`, or `VLLM_USE_MODELSCOPE` are forbidden in recipes. Lower-level
-  runtime/SDK variables (such as `DG_*` and `HGGC_*`) are allowed only when explicitly
-  declared in `ppu.external_env`.
+  `VLLM_API_KEY`, `VLLM_SERVER_DEV_MODE`, or `VLLM_USE_MODELSCOPE` are forbidden in
+  recipes. Lower-level runtime/SDK variables (such as `DG_*` and `HGGC_*`) are allowed
+  only when explicitly declared in `ppu.external_env`.
 - **No private infrastructure or unreleased models**: Public recipes must never
   contain local/shared filesystem paths, internal domains or mirrors, IPv4 literals,
   physical hostnames, physical RDMA/IB interface names, credentials, or unreleased /

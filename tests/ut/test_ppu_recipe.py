@@ -5684,7 +5684,7 @@ def test_pr462_r2_single_node_sanity_preset_override_and_probe_contracts(
         )
     assert len(popen_argvs) == 1 and "--port" in popen_argvs[0]
 
-    # 2. Static-valid non-probe endpoints (pooling/embed, TLS, --skip-tokenizer-init, API key)
+    # 2. Static-valid non-probe endpoints (pooling/embed, TLS, --skip-tokenizer-init)
     #    pass recipe catalog validation but are rejected by selector & runner before Popen.
     model_pol_path.unlink()
     for extra_args, extra_env, err_sub in (
@@ -5699,8 +5699,6 @@ def test_pr462_r2_single_node_sanity_preset_override_and_probe_contracts(
             "enables TLS",
         ),
         (["--skip-tokenizer-init"], {}, "sets --skip-tokenizer-init"),
-        (["--api-key", "example-only"], {}, "requires API key authentication"),
-        ([], {"VLLM_API_KEY": "example-only"}, "requires API key authentication"),
     ):
         doc = copy.deepcopy(orig_recipe)
         doc["presets"]["decode"]["args"].extend(extra_args)
@@ -5725,6 +5723,77 @@ def test_pr462_r2_single_node_sanity_preset_override_and_probe_contracts(
                 res_probe, log_path=tmp_path / "never_spawned.log"
             )
         assert popen_argvs == []
+
+    # 2b. Authentication fields (--api-key / VLLM_API_KEY) are forbidden in serving recipes
+    #     and public catalog rendering, while ambient VLLM_API_KEY or direct launch flags
+    #     still fail closed before Popen in selector/runner.
+    rec_path.write_text(yaml.safe_dump(orig_recipe, sort_keys=False), encoding="utf-8")
+    monkeypatch.setenv("VLLM_API_KEY", "example-only")
+    assert (
+        ppu_recipe.validate_paths([rec_path], vllm_parser_mode="skip")[
+            "checked_combinations"
+        ]
+        == 12
+    )
+    assert ppu_e2e_select.build_recipe_matrix("", "fast_sanity")["include"] == []
+    with pytest.raises(ValueError, match="requires API key authentication"):
+        ppu_e2e_select.build_recipe_matrix("glm-5.3-decode", "fast_sanity")
+    clean_decode_res = ppu_recipe.resolve_recipe(
+        rec_path, policy_path=fast_pol_path, tier="fast_sanity"
+    )
+    popen_argvs.clear()
+    with pytest.raises(
+        ppu_recipe.ValidationError, match="requires API key authentication"
+    ):
+        ppu_recipe_runner._launch_resolved_server(
+            clean_decode_res, log_path=tmp_path / "never_spawned_env_auth.log"
+        )
+    assert popen_argvs == []
+    monkeypatch.delenv("VLLM_API_KEY", raising=False)
+
+    direct_flag_auth = copy.deepcopy(clean_decode_res)
+    direct_flag_auth["flags"] = [
+        *clean_decode_res["flags"],
+        "--api-key",
+        "example-only",
+    ]
+    popen_argvs.clear()
+    with pytest.raises(ppu_recipe.ValidationError, match="api-key|API key"):
+        ppu_recipe_runner._launch_resolved_server(
+            direct_flag_auth, log_path=tmp_path / "never_spawned_flag_auth.log"
+        )
+    assert popen_argvs == []
+
+    kimi_orig = yaml.safe_load(
+        (RECIPES_DIR / "moonshotai" / "Kimi-K2.6.yaml").read_text(encoding="utf-8")
+    )
+    for base_doc, slot_name in (
+        (kimi_orig, "eval_longctx"),
+        (orig_recipe, "pd_decode"),
+    ):
+        for auth_args, auth_env in (
+            (["--api-key", "example-only"], {}),
+            ([], {"VLLM_API_KEY": "example-only"}),
+        ):
+            bad_auth_doc = copy.deepcopy(base_doc)
+            bad_auth_doc["presets"][slot_name].setdefault("args", []).extend(auth_args)
+            bad_auth_doc["presets"][slot_name].setdefault("env", {}).update(auth_env)
+            auth_rec_path = tmp_path / f"bad_auth_{slot_name}.yaml"
+            auth_rec_path.write_text(
+                yaml.safe_dump(bad_auth_doc, sort_keys=False), encoding="utf-8"
+            )
+            with pytest.raises(
+                ppu_recipe.ValidationError, match="--api-key|VLLM_API_KEY"
+            ):
+                ppu_recipe.validate_paths([auth_rec_path], vllm_parser_mode="skip")
+            with pytest.raises(
+                ppu_recipe.ValidationError, match="--api-key|VLLM_API_KEY"
+            ):
+                ppu_recipe.resolve_recipe(auth_rec_path, preset=slot_name)
+    with pytest.raises(ppu_recipe.ValidationError, match="--api-key|VLLM_API_KEY"):
+        ppu_recipe._format_flags_and_env(["--api-key", "example-only"], {})
+    with pytest.raises(ppu_recipe.ValidationError, match="--api-key|VLLM_API_KEY"):
+        ppu_recipe._format_flags_and_env([], {"VLLM_API_KEY": "example-only"})
 
     # 3. Loopback HTTP probe contract: health=200 alone fails /v1/models 401 when auth is enabled,
     #    whereas plain unauthenticated HTTP passes /health, /v1/models, and /v1/chat/completions.
@@ -6375,6 +6444,22 @@ def test_pr462_r3_dp_supervisor_child_device_slices_and_port_bounds(
         with pytest.raises(ppu_recipe.ValidationError, match="--device-ids|device"):
             ppu_recipe.resolve_recipe(rec_path, preset="decode_ep")
 
+    # Implicit multi-port allocation (omitted --device-ids) on 4 visible cards fails closed when
+    # local_dp * TP * PP == 8 (rank 4 would consume index 4), while 8 visible cards passes.
+    _write_multiport(1, 1, 8, [])
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1,2,3")
+    assert (
+        ppu_recipe.validate_paths([rec_path], vllm_parser_mode="skip")[
+            "checked_combinations"
+        ]
+        == 12
+    )
+    with pytest.raises(ppu_recipe.ValidationError, match="visible device"):
+        ppu_recipe.resolve_recipe(rec_path, preset="decode_ep")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1,2,3,4,5,6,7")
+    assert ppu_recipe.resolve_recipe(rec_path, preset="decode_ep")["ppu_count"] == 32
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+
 
 def test_pr462_r3_runner_device_quota_after_overrides_and_scoped_ambient_dp(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -6473,6 +6558,33 @@ def test_pr462_r3_runner_device_quota_after_overrides_and_scoped_ambient_dp(
                     ppu_recipe.ValidationError, match="requires 8 devices"
                 ):
                     ppu_recipe_runner.main(cli_args)
+                assert seen_launches == []
+
+                # Explicit --max-devices 8 cannot override a narrower 4-card job quota or visible set
+                monkeypatch.setenv("PPU_CI_DEVICE_COUNT", "4")
+                seen_launches.clear()
+                with pytest.raises(
+                    ppu_recipe.ValidationError, match="requires 8 devices"
+                ):
+                    ppu_recipe_runner.main([*cli_args, "--max-devices", "8"])
+                assert seen_launches == []
+
+                over_res = ppu_recipe.resolve_recipe(
+                    rec_path,
+                    policy_path=pol_path,
+                    tier=tier,
+                    preset=preset_ov,
+                    variant=variant_ov,
+                )
+                seen_launches.clear()
+                with pytest.raises(
+                    ppu_recipe.ValidationError, match="requires 8 devices"
+                ):
+                    ppu_recipe_runner._launch_resolved_server(
+                        over_res,
+                        log_path=tmp_path / f"launch_over_{tier}.log",
+                        max_devices=8,
+                    )
                 assert seen_launches == []
 
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)

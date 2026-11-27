@@ -602,15 +602,15 @@ def _resolve_runner_device_budget(
     max_devices: int | None = None,
     env: Mapping[str, str] | None = None,
 ) -> int | None:
-    """Resolve single-node job device quota from explicit arg, CI env, visible set, or hardware default."""
+    """Resolve single-node job device quota; explicit max_devices overrides hardware default, never narrower job/visible limits."""
+    limits: list[int] = []
     if max_devices is not None:
         if type(max_devices) is not int or max_devices <= 0:
             raise ValidationError(
                 f"max_devices must be a positive integer, got {max_devices!r}"
             )
-        return max_devices
+        limits.append(max_devices)
     eff_env = os.environ if env is None else env
-    limits: list[int] = []
     ci_count_raw = eff_env.get("PPU_CI_DEVICE_COUNT", "").strip()
     if ci_count_raw:
         try:

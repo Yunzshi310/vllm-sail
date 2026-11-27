@@ -76,6 +76,7 @@ FORBIDDEN_RECIPE_ENV = frozenset(
         "SGLANG_USE_MODELSCOPE",
         "SGLANG_WARMUP_TIMEOUT",
         "TRANSFORMERS_OFFLINE",
+        "VLLM_API_KEY",
         "VLLM_SERVER_DEV_MODE",
         "VLLM_USE_MODELSCOPE",
         "VLLM_USE_RUST_BENCH",
@@ -122,6 +123,7 @@ INVERSE_BOOLEAN_GROUPS: tuple[tuple[str, ...], ...] = (
 )
 FORBIDDEN_RECIPE_FLAGS = frozenset(
     {
+        "--api-key",
         "--disable-radix-cache",
         "--enable-prefix-caching",
         "--host",
@@ -2139,40 +2141,49 @@ def _eval_single_node_parallel_dp_and_frontend(
                 f"{context}: multi-port supervised ranks [{sup_start_rank}, "
                 f"{sup_start_rank + dpl_explicit - 1}] exceed --data-parallel-size ({cli_dp_val})"
             )
-        if parsed_device_ids is not None:
-            slice_width = tp_val * pp_val
-            seen_child_devs: dict[int | str, int] = {}
-            for local_rank in range(dpl_explicit):
-                start_idx = local_rank * slice_width
-                end_idx = start_idx + slice_width
-                child_slice = parsed_device_ids[start_idx:end_idx]
-                if len(child_slice) < slice_width:
+        slice_width = tp_val * pp_val
+        effective_device_ids: list[int | str] = (
+            parsed_device_ids
+            if parsed_device_ids is not None
+            else list(range(dpl_explicit * slice_width))
+        )
+        seen_child_devs: dict[int | str, int] = {}
+        for local_rank in range(dpl_explicit):
+            start_idx = local_rank * slice_width
+            end_idx = start_idx + slice_width
+            child_slice = effective_device_ids[start_idx:end_idx]
+            if len(child_slice) < slice_width:
+                raise ValidationError(
+                    f"{context}: --device-ids provides {len(effective_device_ids)} device(s), "
+                    f"but multi-port child rank {local_rank} requires slice [{start_idx}:{end_idx}] "
+                    f"of width TP*PP={slice_width} (need at least {dpl_explicit * slice_width})"
+                )
+            if len(set(child_slice)) != len(child_slice):
+                raise ValidationError(
+                    f"{context}: --device-ids slice {child_slice} for multi-port child rank "
+                    f"{local_rank} contains duplicate device IDs"
+                )
+            for dev in child_slice:
+                if dev in seen_child_devs:
                     raise ValidationError(
-                        f"{context}: --device-ids provides {len(parsed_device_ids)} device(s), "
-                        f"but multi-port child rank {local_rank} requires slice [{start_idx}:{end_idx}] "
-                        f"of width TP*PP={slice_width} (need at least {dpl_explicit * slice_width})"
+                        f"{context}: --device-ids reuses device {dev!r} across local DP child "
+                        f"ranks ({seen_child_devs[dev]} and {local_rank})"
                     )
-                if len(set(child_slice)) != len(child_slice):
+                seen_child_devs[dev] = local_rank
+                if (
+                    type(dev) is int
+                    and known_visible is not None
+                    and not (0 <= dev < known_visible)
+                ):
+                    source_desc = (
+                        "--device-ids index"
+                        if parsed_device_ids is not None
+                        else f"implicit multi-port child rank {local_rank} device index"
+                    )
                     raise ValidationError(
-                        f"{context}: --device-ids slice {child_slice} for multi-port child rank "
-                        f"{local_rank} contains duplicate device IDs"
+                        f"{context}: {source_desc} {dev} out of range for "
+                        f"{known_visible} visible device(s)"
                     )
-                for dev in child_slice:
-                    if dev in seen_child_devs:
-                        raise ValidationError(
-                            f"{context}: --device-ids reuses device {dev!r} across local DP child "
-                            f"ranks ({seen_child_devs[dev]} and {local_rank})"
-                        )
-                    seen_child_devs[dev] = local_rank
-                    if (
-                        type(dev) is int
-                        and known_visible is not None
-                        and not (0 <= dev < known_visible)
-                    ):
-                        raise ValidationError(
-                            f"{context}: --device-ids index {dev} out of range for "
-                            f"{known_visible} visible device(s)"
-                        )
     elif ssl_keyfile and not ssl_certfile:
         raise ValidationError(
             f"{context}: --ssl-keyfile requires --ssl-certfile "
@@ -4904,6 +4915,15 @@ def _format_features(resolved: dict[str, Any]) -> str:
 
 
 def _format_flags_and_env(flags: list[str], server_env: dict[str, str]) -> str:
+    for flag_name, _, _ in _parse_flag_entries(flags):
+        if flag_name == "--api-key":
+            raise ValidationError(
+                "public CI matrix cannot render authentication flag '--api-key'"
+            )
+    if "VLLM_API_KEY" in server_env:
+        raise ValidationError(
+            "public CI matrix cannot render authentication env 'VLLM_API_KEY'"
+        )
     parts: list[str] = []
     if flags:
         parts.append(_md_code(shlex.join(flags)))
@@ -5264,7 +5284,9 @@ def render_ci_matrix_markdown(*, base_dir: Path | None = None) -> str:
             "_None — all scheduled Nightly accuracy cases have migrated to recipes._"
         )
 
-    return "\n".join(lines) + "\n"
+    rendered = "\n".join(lines) + "\n"
+    redact_and_verify_public_payload(rendered, allow_loopback=True)
+    return rendered
 
 
 def _parse_layer_override_cli(raw: str) -> int | str | None:
