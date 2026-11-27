@@ -2894,7 +2894,13 @@ def test_hardware_precision_binding_contract(tmp_path: Path) -> None:
     )
 
     qwen_two_vars = copy.deepcopy(qwen_doc)
-    qwen_two_vars["variants"]["fp8"] = {"precision": "fp8"}
+    qwen_two_vars["variants"]["fp8"] = {
+        "precision": "fp8",
+        "assets": {"model": "qwen3.8-27b-fp8", "tokenizer": "qwen3.8-27b-fp8"},
+        "hf_model_id": "Qwen/Qwen3.8-27B-FP8",
+        "golden_model_key": "qwen3_8_27b_fp8",
+        "served_name": "qwen3.8-27b-fp8",
+    }
     ppu_recipe.validate_serving_recipe_structure(qwen_two_vars, context="qwen_two_vars")
 
     qwen_pol = yaml.safe_load((POLICY_DIR / "models" / "qwen3.8-27b.yaml").read_text())
@@ -4520,3 +4526,253 @@ def test_vllm_dp_env_fallback_crossnode_tp_and_hybrid_headless_contract(
         glm_rec_path.write_text(yaml.safe_dump(bad_ext_doc), encoding="utf-8")
         with pytest.raises(ppu_recipe.ValidationError, match=err_pat):
             ppu_recipe.resolve_recipe(glm_rec_path, preset="decode_ep")
+
+
+def test_multivariant_isolation_guard_and_allow_shared_fields() -> None:
+    glm_doc = yaml.safe_load((RECIPES_DIR / "zai-org" / "GLM-5.3.yaml").read_text())
+    ppu_recipe.validate_serving_recipe_structure(glm_doc, context="glm_control")
+
+    # 1. Silent inheritance (omitting any isolated field on a non-default variant) fails closed.
+    for missing_field in ("assets", "hf_model_id", "golden_model_key", "served_name"):
+        bad = copy.deepcopy(glm_doc)
+        bad["variants"]["fp8_channel"].pop(missing_field)
+        with pytest.raises(
+            ppu_recipe.ValidationError,
+            match=rf"requires explicit '{missing_field}' on non-default variant 'fp8_channel'",
+        ):
+            ppu_recipe.validate_serving_recipe_structure(bad, context="missing_field")
+
+    # 2. Explicit duplication of default/top-level values without allow_shared_fields fails closed.
+    dup_assets = copy.deepcopy(glm_doc)
+    dup_assets["variants"]["fp8_channel"]["assets"] = copy.deepcopy(
+        glm_doc["ppu"]["assets"]
+    )
+    with pytest.raises(ppu_recipe.ValidationError, match=r"assets\.model.*duplicates"):
+        ppu_recipe.validate_serving_recipe_structure(dup_assets, context="dup_assets")
+
+    for field, dup_val in (
+        ("hf_model_id", glm_doc["ppu"]["hf_model_id"]),
+        ("golden_model_key", glm_doc["ppu"]["golden_model_key"]),
+        ("served_name", glm_doc["ppu"]["served_name"]),
+    ):
+        dup = copy.deepcopy(glm_doc)
+        dup["variants"]["fp8_channel"][field] = dup_val
+        with pytest.raises(
+            ppu_recipe.ValidationError, match=rf"{field}.*duplicates default/top-level"
+        ):
+            ppu_recipe.validate_serving_recipe_structure(dup, context=f"dup_{field}")
+
+    # 3. Colliding values between two non-default variants fail closed.
+    sibling_dup = copy.deepcopy(glm_doc)
+    sibling_dup["variants"]["w8a8_int8"]["served_name"] = sibling_dup["variants"][
+        "fp8_channel"
+    ]["served_name"]
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"served_name.*duplicates variant 'fp8_channel'",
+    ):
+        ppu_recipe.validate_serving_recipe_structure(sibling_dup, context="sibling_dup")
+
+    # 4. Unsupported or duplicate allow_shared_fields fail closed.
+    bad_exempt = copy.deepcopy(glm_doc)
+    bad_exempt["variants"]["fp8_channel"]["allow_shared_fields"] = ["precision"]
+    with pytest.raises(
+        ppu_recipe.ValidationError, match="allow_shared_fields has unsupported field"
+    ):
+        ppu_recipe.validate_serving_recipe_structure(bad_exempt, context="bad_exempt")
+
+    dup_exempt = copy.deepcopy(glm_doc)
+    dup_exempt["variants"]["fp8_channel"]["allow_shared_fields"] = [
+        "served_name",
+        "served_name",
+    ]
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match="allow_shared_fields must not contain duplicates",
+    ):
+        ppu_recipe.validate_serving_recipe_structure(dup_exempt, context="dup_exempt")
+
+    # 5. Positive control: explicit allow_shared_fields permits intentional sharing only for listed fields.
+    shared_ok = copy.deepcopy(glm_doc)
+    shared_ok["variants"]["fp8_channel"].pop("served_name")
+    shared_ok["variants"]["fp8_channel"]["allow_shared_fields"] = ["served_name"]
+    ppu_recipe.validate_serving_recipe_structure(shared_ok, context="shared_ok")
+
+    # Still rejects unexempted fields when only served_name is exempted.
+    shared_ok["variants"]["fp8_channel"].pop("hf_model_id")
+    with pytest.raises(
+        ppu_recipe.ValidationError, match="requires explicit 'hf_model_id'"
+    ):
+        ppu_recipe.validate_serving_recipe_structure(
+            shared_ok, context="partial_exempt"
+        )
+
+
+def test_stray_serving_recipe_scan_blocks_wild_copies_and_allows_repo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shutil.copytree(ROOT / "tests/ppu", tmp_path / "tests/ppu")
+    (tmp_path / "configs").mkdir()
+    (tmp_path / "configs/other.yaml").write_text(
+        "schema_version: custom/v1\nfoo: bar\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(ppu_recipe, "REPO_ROOT", tmp_path)
+
+    # Positive control: clean tree passes validate --all and direct scan.
+    assert ppu_recipe.scan_stray_serving_recipes(tmp_path) == []
+    assert ppu_recipe.main(["validate", "--all", "--vllm-parser", "skip"]) == 0
+
+    valid_recipe = (tmp_path / "tests/ppu/recipes/Qwen/Qwen3.8-27B.yaml").read_text(
+        encoding="utf-8"
+    )
+
+    # 1. Stray ppu-serving/v1 under candidate_case/ fails validate --all & direct validate_paths.
+    stray = tmp_path / "tests/ppu/candidate_case/light_perf/Qwen3.8-27B.yaml"
+    stray.parent.mkdir(parents=True)
+    stray.write_text(valid_recipe, encoding="utf-8")
+    with pytest.raises(ppu_recipe.ValidationError, match="stray 'ppu-serving/v1'"):
+        ppu_recipe.validate_paths(
+            ppu_recipe._discover_default_paths(tmp_path),
+            vllm_parser_mode="skip",
+            check_repo_stray_recipes=True,
+        )
+    with pytest.raises(ppu_recipe.ValidationError, match="must reside under"):
+        ppu_recipe.validate_paths([stray], vllm_parser_mode="skip")
+    stray.unlink()
+
+    # 2. Multi-document YAML outside recipes/ containing ppu-serving/v1 fails closed.
+    multi = tmp_path / "configs/multi.yml"
+    multi.write_text("---\nfoo: 1\n---\n" + valid_recipe, encoding="utf-8")
+    with pytest.raises(ppu_recipe.ValidationError, match="configs/multi.yml"):
+        ppu_recipe.scan_stray_serving_recipes(tmp_path)
+    multi.unlink()
+
+    # 3. Misnamed .yml inside recipes/ is rejected so it cannot bypass *.yaml discovery.
+    bad_ext = tmp_path / "tests/ppu/recipes/Qwen/Stray.yml"
+    bad_ext.write_text(valid_recipe, encoding="utf-8")
+    with pytest.raises(ppu_recipe.ValidationError, match="Stray.yml"):
+        ppu_recipe.scan_stray_serving_recipes(tmp_path)
+    bad_ext.unlink()
+
+
+def test_resolved_command_diff_and_pr_template(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    base_dir = tmp_path / "base"
+    head_dir = tmp_path / "head"
+    shutil.copytree(ROOT / "tests/ppu", base_dir / "tests/ppu")
+    shutil.copytree(ROOT / "tests/ppu", head_dir / "tests/ppu")
+
+    # 1. Unchanged trees with --only-when-changed emit empty string.
+    assert (
+        ppu_recipe.render_resolved_diff_markdown(
+            base_root=base_dir,
+            head_root=head_dir,
+            only_when_changed=True,
+            include_signoff_hint=True,
+        )
+        == ""
+    )
+
+    # 2. Modify recipe flag/env and policy tier; verify diff table & sign-off checklist.
+    qwen_head = head_dir / "tests/ppu/recipes/Qwen/Qwen3.8-27B.yaml"
+    qwen_doc = yaml.safe_load(qwen_head.read_text(encoding="utf-8"))
+    qwen_doc["ppu"]["topology"]["devices_per_node"] = 4
+    qwen_doc["model"]["base_args"] = [
+        "--tensor-parallel-size",
+        "4",
+        "--max-model-len",
+        "32768",
+        "--trust-remote-code",
+    ]
+    qwen_doc["model"]["base_env"] = {"VLLM_ENGINE_READY_TIMEOUT_S": "4800"}
+    qwen_head.write_text(yaml.safe_dump(qwen_doc, sort_keys=False), encoding="utf-8")
+
+    qwen_pol_head = head_dir / "tests/ppu/policy/models/qwen3.8-27b.yaml"
+    qwen_pol_doc = yaml.safe_load(qwen_pol_head.read_text(encoding="utf-8"))
+    glm_pol_doc = yaml.safe_load(
+        (head_dir / "tests/ppu/policy/models/glm-5.3.yaml").read_text(encoding="utf-8")
+    )
+    qwen_pol_doc["accuracy_gate"] = copy.deepcopy(glm_pol_doc["accuracy_gate"])
+    qwen_pol_doc["tiers"]["model_sanity"] = copy.deepcopy(
+        glm_pol_doc["tiers"]["model_sanity"]
+    )
+    for stage in qwen_pol_doc["tiers"]["model_sanity"]["stages"]:
+        stage.pop("preset", None)
+    qwen_pol_head.write_text(
+        yaml.safe_dump(qwen_pol_doc, sort_keys=False), encoding="utf-8"
+    )
+
+    diff_md = ppu_recipe.render_resolved_diff_markdown(
+        base_root=base_dir,
+        head_root=head_dir,
+        only_when_changed=True,
+        include_signoff_hint=True,
+    )
+    assert "## Resolved Command Diff (base -> head)" in diff_md
+    assert "tests/ppu/recipes/Qwen/Qwen3.8-27B.yaml" in diff_md
+    assert "--tensor-parallel-size 2" in diff_md
+    assert "--tensor-parallel-size 4" in diff_md
+    assert "+ VLLM_ENGINE_READY_TIMEOUT_S=4800" in diff_md
+    assert "`—` -> `model_sanity`" in diff_md
+    assert "### Model Recipe Sign-off Checklist" in diff_md
+
+    # 3. Notes-only metadata edit reports no resolved changes without error.
+    meta_head = tmp_path / "meta_head"
+    shutil.copytree(ROOT / "tests/ppu", meta_head / "tests/ppu")
+    glm_meta = meta_head / "tests/ppu/recipes/zai-org/GLM-5.3.yaml"
+    glm_doc = yaml.safe_load(glm_meta.read_text(encoding="utf-8"))
+    glm_doc["notes"] = (glm_doc.get("notes", "") + " Updated note.").strip()
+    glm_meta.write_text(yaml.safe_dump(glm_doc, sort_keys=False), encoding="utf-8")
+    meta_md = ppu_recipe.render_resolved_diff_markdown(
+        base_root=base_dir,
+        head_root=meta_head,
+        only_when_changed=True,
+    )
+    assert "_No resolved argv, env, or tier changes" in meta_md
+
+    # 4. Real git commit comparison via CLI `diff --base-ref`.
+    git_repo = tmp_path / "git_repo"
+    shutil.copytree(ROOT / "tests/ppu", git_repo / "tests/ppu")
+    subprocess.run(["git", "init", "-q"], cwd=git_repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=git_repo, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"], cwd=git_repo, check=True
+    )
+    subprocess.run(["git", "add", "."], cwd=git_repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "--no-verify", "-m", "base"], cwd=git_repo, check=True
+    )
+    base_sha = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=git_repo, text=True
+    ).strip()
+    shutil.copy2(qwen_head, git_repo / "tests/ppu/recipes/Qwen/Qwen3.8-27B.yaml")
+    cli_md = ppu_recipe.render_resolved_diff_markdown(
+        base_ref=base_sha,
+        repo_root=git_repo,
+        only_when_changed=True,
+    )
+    assert "--tensor-parallel-size 4" in cli_md
+
+    rc = ppu_recipe.main(
+        [
+            "diff",
+            "--base-root",
+            str(base_dir),
+            "--head-root",
+            str(head_dir),
+            "--only-when-changed",
+        ]
+    )
+    assert rc == 0
+    assert "Resolved Command Diff" in capsys.readouterr().out
+
+    # 5. PR template contains the 3-item Model Recipe Sign-off checklist.
+    tpl = (ROOT / ".github/pull_request_template.md").read_text(encoding="utf-8")
+    for required in (
+        "Model Recipe Sign-off",
+        "Resolved Command Diff",
+        "HTTP 200",
+        "replaces_legacy_cases",
+    ):
+        assert required in tpl
