@@ -4683,6 +4683,58 @@ def test_multivariant_assets_map_runtime_collision_isolation(tmp_path: Path) -> 
                 assets_map_path=colliding_map,
             )
 
+    # Trailing slash, dot segments, nested `models:` format, and symlink aliases also collide.
+    slash_nested_map = tmp_path / "slash_nested_assets.yaml"
+    slash_nested_map.write_text(
+        yaml.safe_dump(
+            {
+                "models": {
+                    "glm-5.3-mxfp4": "/models/glm-5.3-mxfp4",
+                    "glm-5.3-fp8-channel": "/models/glm-5.3-fp8",
+                    "glm-5.3-w8a8-int8": "/models/./glm-5.3-fp8/",
+                }
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    for variant_name in ("default", "fp8_channel", "w8a8_int8"):
+        with pytest.raises(
+            ppu_recipe.ValidationError,
+            match=r"assets_map resolves model asset.*colliding with",
+        ):
+            ppu_recipe.resolve_recipe(
+                rec_path,
+                variant=variant_name,
+                assets_map_path=slash_nested_map,
+            )
+
+    real_fp8_dir = tmp_path / "real_fp8"
+    real_fp8_dir.mkdir()
+    symlink_int8_dir = tmp_path / "symlink_int8"
+    symlink_int8_dir.symlink_to(real_fp8_dir)
+    symlink_map = tmp_path / "symlink_assets.yaml"
+    symlink_map.write_text(
+        yaml.safe_dump(
+            {
+                "glm-5.3-mxfp4": "/models/glm-5.3-mxfp4",
+                "glm-5.3-fp8-channel": str(real_fp8_dir),
+                "glm-5.3-w8a8-int8": str(symlink_int8_dir),
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"assets_map resolves model asset.*colliding with",
+    ):
+        ppu_recipe.resolve_recipe(
+            rec_path,
+            variant="w8a8_int8",
+            assets_map_path=symlink_map,
+        )
+
     # 2. Distinct runtime paths pass as positive control.
     distinct_map = tmp_path / "distinct_assets.yaml"
     distinct_map.write_text(
@@ -4838,6 +4890,12 @@ def test_stray_serving_recipe_scan_blocks_wild_copies_and_allows_repo(
         '"schema_version": "ppu-serving\\u002fv1"',
         1,
     )
+    flow_doc = yaml.safe_load(valid_recipe)
+    flow_escaped = json.dumps(flow_doc, ensure_ascii=True).replace(
+        '"ppu-serving/v1"',
+        '"ppu-serving\\u002fv1"',
+        1,
+    )
     for rel, body in (
         (
             "configs/tag_unescaped.yml",
@@ -4848,6 +4906,10 @@ def test_stray_serving_recipe_scan_blocks_wild_copies_and_allows_repo(
             "---\nref: !Ref CommonSetting\n---\n" + quoted_escaped,
         ),
         ("configs/jinja_broken.yml", "---\nfoo: {{ broken }\n---\n" + quoted_escaped),
+        (
+            "configs/jinja_broken_inline_flow.yml",
+            "---\nfoo: {{ broken }\n--- " + flow_escaped + "\n",
+        ),
     ):
         target = tmp_path / rel
         target.write_text(body, encoding="utf-8")
@@ -4991,3 +5053,40 @@ def test_resolved_command_diff_and_pr_template(
         "replaces_legacy_cases",
     ):
         assert required in tpl
+
+    # 6. Redaction error never leaks raw private IP literals in diagnostics.
+    leak_base = tmp_path / "leak_base"
+    shutil.copytree(ROOT / "tests/ppu", leak_base / "tests/ppu")
+    qwen_leak = leak_base / "tests/ppu/recipes/Qwen/10.24.3.8.yaml"
+    qwen_leak.write_text(
+        (leak_base / "tests/ppu/recipes/Qwen/Qwen3.8-27B.yaml").read_text(
+            encoding="utf-8"
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ppu_recipe.ValidationError, match="ipv4_literal") as exc_info:
+        ppu_recipe.render_resolved_diff_markdown(
+            base_root=leak_base,
+            head_root=base_dir,
+            only_when_changed=True,
+        )
+    assert "10.24.3.8" not in str(exc_info.value)
+
+    args_leak_base = tmp_path / "args_leak_base"
+    shutil.copytree(ROOT / "tests/ppu", args_leak_base / "tests/ppu")
+    qwen_args_leak = args_leak_base / "tests/ppu/recipes/Qwen/Qwen3.8-27B.yaml"
+    qwen_args_doc = yaml.safe_load(qwen_args_leak.read_text(encoding="utf-8"))
+    qwen_args_doc["model"]["base_args"] = [
+        *qwen_args_doc["model"]["base_args"],
+        "--tokenizer-mode",
+        "http://10.24.3.8/models",
+    ]
+    qwen_args_leak.write_text(
+        yaml.safe_dump(qwen_args_doc, sort_keys=False), encoding="utf-8"
+    )
+    args_diff_md = ppu_recipe.render_resolved_diff_markdown(
+        base_root=args_leak_base,
+        head_root=base_dir,
+        only_when_changed=True,
+    )
+    assert "10.24.3.8" not in args_diff_md

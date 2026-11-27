@@ -13,6 +13,7 @@ import hashlib
 import importlib
 import json
 import os
+import posixpath
 import re
 import shlex
 import subprocess
@@ -43,7 +44,8 @@ VARIANT_ISOLATED_FIELDS: tuple[str, ...] = (
     "served_name",
 )
 _STRAY_SERVING_SCHEMA_RE = re.compile(
-    r"""(?m)^\s*['"]?schema_version['"]?\s*:\s*(['"]?)([^\r\n#]+?)\1\s*(?:#.*)?$"""
+    r"""(?:^\s*|[{\[,]\s*)['"]?schema_version['"]?\s*:\s*(['"]?)([^\r\n#,}\]]+?)\1(?=\s*(?:[,}\]]|#|$))""",
+    re.MULTILINE,
 )
 _YAML_ESCAPE_RE = re.compile(
     r"\\(?:u([0-9a-fA-F]{4})|U([0-9a-fA-F]{8})|x([0-9a-fA-F]{2}))"
@@ -2053,9 +2055,20 @@ def _validate_assets_map_variant_isolation(
         for vn, vc in variants_blk.items()
     }
 
+    def _canonicalize_ckpt_ref(raw: str) -> str:
+        val = raw.strip()
+        if not val:
+            return val
+        norm = posixpath.normpath(val)
+        if norm.startswith("//") and not norm.startswith("///"):
+            norm = "/" + norm.lstrip("/")
+        if os.path.exists(norm):
+            return os.path.realpath(norm)
+        return norm
+
     def _resolved_ckpt(ident: Mapping[str, Any]) -> str:
         asset_key = ident["assets"]["model"]
-        return assets_map.get(asset_key, ident["hf_model_id"])
+        return _canonicalize_ckpt_ref(assets_map.get(asset_key, ident["hf_model_id"]))
 
     top_asset = top_id["assets"]["model"]
     top_ckpt = _resolved_ckpt(top_id)
@@ -2478,7 +2491,7 @@ def _scan_text(text: str, *, context: str, allow_loopback: bool = False) -> list
         ip = match.group(0)
         if allow_loopback and ip == "127.0.0.1":
             continue
-        findings.append(f"{context}: matched ipv4_literal ({ip})")
+        findings.append(f"{context}: matched ipv4_literal")
     return findings
 
 
@@ -3727,7 +3740,7 @@ def scan_stray_serving_recipes(repo_root: Path | None = None) -> list[Path]:
                     matched = True
                     break
         except yaml.YAMLError:
-            for chunk in re.split(r"(?m)^---(?:\s*(?:#.*)?)$", text):
+            for chunk in re.split(r"(?m)^(?:---|\.\.\.)(?=$|[\s#])", text):
                 try:
                     doc_node = yaml.compose(chunk)
                 except yaml.YAMLError:
