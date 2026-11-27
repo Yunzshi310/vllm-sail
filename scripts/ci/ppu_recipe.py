@@ -2033,6 +2033,31 @@ def _validate_resolved_topology_and_placeholders(
     return sub_flags, sub_env
 
 
+def _effective_variant_identity(
+    ppu_blk: Mapping[str, Any],
+    model_blk: Mapping[str, Any],
+    var_blk: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Compute effective runtime asset/model identity using resolver fallback order."""
+    eff_assets = {**ppu_blk["assets"], **(var_blk.get("assets") or {})}
+    asset_name = eff_assets["model"]
+    hf_model_id = (
+        var_blk.get("hf_model_id")
+        or ppu_blk.get("hf_model_id")
+        or model_blk["model_id"]
+    )
+    served_name = var_blk.get("served_name") or ppu_blk.get("served_name") or asset_name
+    golden_model_key = (
+        var_blk.get("golden_model_key") or ppu_blk.get("golden_model_key") or asset_name
+    )
+    return {
+        "assets": eff_assets,
+        "hf_model_id": hf_model_id,
+        "served_name": served_name,
+        "golden_model_key": golden_model_key,
+    }
+
+
 def _resolve_recipe_from_doc(
     recipe: Mapping[str, Any],
     *,
@@ -2220,23 +2245,13 @@ def _resolve_recipe_from_doc(
 
     # 6. assets-map + runtime endpoint resolution
     assets_map = _load_assets_map(assets_map_path)
-    eff_assets = {**ppu_blk["assets"], **var_blk.get("assets", {})}
+    eff_identity = _effective_variant_identity(ppu_blk, model_blk, var_blk)
+    eff_assets = eff_identity["assets"]
     asset_name = eff_assets["model"]
-    hf_model_id = (
-        var_blk.get("hf_model_id")
-        or ppu_blk.get("hf_model_id")
-        or model_blk["model_id"]
-    )
+    hf_model_id = eff_identity["hf_model_id"]
     resolved_model = assets_map.get(asset_name, hf_model_id)
-    effective_served_name = (
-        served_model_name
-        or var_blk.get("served_name")
-        or ppu_blk.get("served_name")
-        or asset_name
-    )
-    golden_model_key = (
-        var_blk.get("golden_model_key") or ppu_blk.get("golden_model_key") or asset_name
-    )
+    effective_served_name = served_model_name or eff_identity["served_name"]
+    golden_model_key = eff_identity["golden_model_key"]
 
     # 7. policy switches (prefix cache, dummy load format, layer override)
     if eff_cache == "enabled":
@@ -2759,25 +2774,16 @@ def validate_serving_recipe_structure(
         )
 
     if len(variants_blk) > 1:
-        default_vcfg = variants_blk.get("default")
-        if not isinstance(default_vcfg, Mapping):
-            default_vcfg = {}
-        base_assets = default_vcfg.get("assets") or ppu["assets"]
-        base_values: dict[str, Any] = {
-            "hf_model_id": default_vcfg.get("hf_model_id") or ppu.get("hf_model_id"),
-            "golden_model_key": default_vcfg.get("golden_model_key")
-            or ppu.get("golden_model_key"),
-            "served_name": default_vcfg.get("served_name")
-            or ppu.get("served_name")
-            or model["model_id"],
-        }
-        seen_nondefault: dict[str, dict[str, str]] = {
-            field: {} for field in VARIANT_ISOLATED_FIELDS
+        top_id = _effective_variant_identity(ppu, model, {})
+        eff_ids = {
+            vn: _effective_variant_identity(ppu, model, vc)
+            for vn, vc in variants_blk.items()
         }
         for vname, vcfg in variants_blk.items():
             if vname == "default":
                 continue
             exempt = set(vcfg.get("allow_shared_fields", []))
+            vid = eff_ids[vname]
             if "assets" not in exempt:
                 if "assets" not in vcfg:
                     raise ValidationError(
@@ -2785,21 +2791,27 @@ def validate_serving_recipe_structure(
                         f"'assets' on non-default variant {vname!r} "
                         "(or declare allow_shared_fields: [assets])"
                     )
-                v_model_asset = vcfg["assets"]["model"]
-                if v_model_asset == base_assets["model"]:
+                v_model_asset = vid["assets"]["model"]
+                if v_model_asset == top_id["assets"]["model"]:
                     raise ValidationError(
                         f"{context}.variants.{vname}.assets.model ({v_model_asset!r}) "
                         "duplicates default/top-level value "
                         "(set distinct assets or declare allow_shared_fields: [assets])"
                     )
-                prior = seen_nondefault["assets"].get(v_model_asset)
-                if prior is not None:
-                    raise ValidationError(
-                        f"{context}.variants.{vname}.assets.model ({v_model_asset!r}) "
-                        f"duplicates variant {prior!r} "
-                        "(set distinct assets or declare allow_shared_fields: [assets])"
-                    )
-                seen_nondefault["assets"][v_model_asset] = vname
+                for other_name, other_id in eff_ids.items():
+                    if other_name == vname:
+                        continue
+                    if v_model_asset == other_id["assets"]["model"]:
+                        target = (
+                            "default/top-level value"
+                            if other_name == "default"
+                            else f"variant {other_name!r}"
+                        )
+                        raise ValidationError(
+                            f"{context}.variants.{vname}.assets.model ({v_model_asset!r}) "
+                            f"duplicates {target} "
+                            "(set distinct assets or declare allow_shared_fields: [assets])"
+                        )
 
             for field in ("hf_model_id", "golden_model_key", "served_name"):
                 if field in exempt:
@@ -2810,21 +2822,27 @@ def validate_serving_recipe_structure(
                         f"{field!r} on non-default variant {vname!r} "
                         f"(or declare allow_shared_fields: [{field}])"
                     )
-                val = vcfg[field]
-                if base_values[field] is not None and val == base_values[field]:
+                val = vid[field]
+                if val == top_id[field]:
                     raise ValidationError(
                         f"{context}.variants.{vname}.{field} ({val!r}) duplicates "
                         f"default/top-level value (set distinct {field} or declare "
                         f"allow_shared_fields: [{field}])"
                     )
-                prior = seen_nondefault[field].get(val)
-                if prior is not None:
-                    raise ValidationError(
-                        f"{context}.variants.{vname}.{field} ({val!r}) duplicates "
-                        f"variant {prior!r} (set distinct {field} or declare "
-                        f"allow_shared_fields: [{field}])"
-                    )
-                seen_nondefault[field][val] = vname
+                for other_name, other_id in eff_ids.items():
+                    if other_name == vname:
+                        continue
+                    if val == other_id[field]:
+                        target = (
+                            "default/top-level value"
+                            if other_name == "default"
+                            else f"variant {other_name!r}"
+                        )
+                        raise ValidationError(
+                            f"{context}.variants.{vname}.{field} ({val!r}) duplicates "
+                            f"{target} (set distinct {field} or declare "
+                            f"allow_shared_fields: [{field}])"
+                        )
 
     for hname, hcfg in recipe.get("hardware_overrides", {}).items():
         if hname not in SUPPORTED_HARDWARE:
@@ -3582,20 +3600,17 @@ def scan_stray_serving_recipes(repo_root: Path | None = None) -> list[Path]:
         if _is_canonical_recipe_path(path, repo_root=root):
             continue
         text = path.read_text(encoding="utf-8", errors="replace")
-        if SERVING_SCHEMA not in text:
-            continue
-        matched = bool(_STRAY_SERVING_SCHEMA_RE.search(text))
-        if not matched:
-            try:
-                for doc in yaml.safe_load_all(text):
-                    if (
-                        isinstance(doc, Mapping)
-                        and doc.get("schema_version") == SERVING_SCHEMA
-                    ):
-                        matched = True
-                        break
-            except yaml.YAMLError:
-                matched = True
+        matched = False
+        try:
+            for doc in yaml.safe_load_all(text):
+                if (
+                    isinstance(doc, Mapping)
+                    and doc.get("schema_version") == SERVING_SCHEMA
+                ):
+                    matched = True
+                    break
+        except yaml.YAMLError:
+            matched = bool(_STRAY_SERVING_SCHEMA_RE.search(text))
         if matched:
             stray.append(path)
     if stray:

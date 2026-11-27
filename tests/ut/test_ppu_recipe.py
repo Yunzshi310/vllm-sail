@@ -4569,7 +4569,7 @@ def test_multivariant_isolation_guard_and_allow_shared_fields() -> None:
     ]["served_name"]
     with pytest.raises(
         ppu_recipe.ValidationError,
-        match=r"served_name.*duplicates variant 'fp8_channel'",
+        match=r"served_name.*duplicates variant '(?:fp8_channel|w8a8_int8)'",
     ):
         ppu_recipe.validate_serving_recipe_structure(sibling_dup, context="sibling_dup")
 
@@ -4605,6 +4605,51 @@ def test_multivariant_isolation_guard_and_allow_shared_fields() -> None:
     ):
         ppu_recipe.validate_serving_recipe_structure(
             shared_ok, context="partial_exempt"
+        )
+
+    # 6. Fallback identity equivalence & exempted-sibling collision fail closed.
+    fallback_dup = copy.deepcopy(glm_doc)
+    fallback_dup["ppu"].pop("golden_model_key", None)
+    fallback_dup["ppu"].pop("served_name", None)
+    fallback_dup["ppu"].pop("hf_model_id", None)
+    fallback_dup["variants"]["fp8_channel"]["served_name"] = fallback_dup["ppu"][
+        "assets"
+    ]["model"]
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"served_name.*duplicates default/top-level value",
+    ):
+        ppu_recipe.validate_serving_recipe_structure(
+            fallback_dup, context="fallback_dup_served_name"
+        )
+
+    fallback_hf = copy.deepcopy(glm_doc)
+    fallback_hf["ppu"].pop("hf_model_id", None)
+    fallback_hf["variants"]["fp8_channel"]["hf_model_id"] = fallback_hf["model"][
+        "model_id"
+    ]
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"hf_model_id.*duplicates default/top-level value",
+    ):
+        ppu_recipe.validate_serving_recipe_structure(
+            fallback_hf, context="fallback_dup_hf"
+        )
+
+    exempt_collision = copy.deepcopy(glm_doc)
+    exempt_collision["variants"]["fp8_channel"]["allow_shared_fields"] = [
+        "served_name",
+        "assets",
+    ]
+    exempt_collision["variants"]["w8a8_int8"]["served_name"] = exempt_collision[
+        "variants"
+    ]["fp8_channel"]["served_name"]
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"w8a8_int8\.served_name.*duplicates variant 'fp8_channel'",
+    ):
+        ppu_recipe.validate_serving_recipe_structure(
+            exempt_collision, context="exempt_collision"
         )
 
 
@@ -4653,6 +4698,35 @@ def test_stray_serving_recipe_scan_blocks_wild_copies_and_allows_repo(
     with pytest.raises(ppu_recipe.ValidationError, match="Stray.yml"):
         ppu_recipe.scan_stray_serving_recipes(tmp_path)
     bad_ext.unlink()
+
+    # 4. Unicode-escaped schema_version outside recipes/ (in .yaml, .yml, and multi-doc) fails closed.
+    escaped_recipe = valid_recipe.replace(
+        "schema_version: ppu-serving/v1",
+        'schema_version: "ppu-serving\\u002fv1"',
+        1,
+    )
+    for rel in (
+        "configs/escaped.yaml",
+        "configs/escaped.yml",
+        "configs/escaped_multi.yml",
+    ):
+        target = tmp_path / rel
+        content = (
+            escaped_recipe
+            if "multi" not in rel
+            else "---\nfoo: 1\n---\n" + escaped_recipe
+        )
+        target.write_text(content, encoding="utf-8")
+        with pytest.raises(ppu_recipe.ValidationError, match=rel):
+            ppu_recipe.scan_stray_serving_recipes(tmp_path)
+        target.unlink()
+
+    # 5. Hidden dotfile inside recipes/ containing ppu-serving/v1 is also rejected.
+    hidden = tmp_path / "tests/ppu/recipes/Qwen/.hidden.yaml"
+    hidden.write_text(escaped_recipe, encoding="utf-8")
+    with pytest.raises(ppu_recipe.ValidationError, match=r"\.hidden\.yaml"):
+        ppu_recipe.scan_stray_serving_recipes(tmp_path)
+    hidden.unlink()
 
 
 def test_resolved_command_diff_and_pr_template(
