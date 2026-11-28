@@ -49,16 +49,99 @@ features:
       - deepseek_v41
       - --reasoning-parser
       - deepseek_v41
+  spec_decoding:
+    default_mode: dspark
+    modes:
+      dspark:
+        args:
+          - --speculative-config
+          - '{"method": "dspark", "num_speculative_tokens": 5, "draft_sample_method": "probabilistic"}'
 variants:
   default:
     precision: mxfp4
+    hardware: zhenwu_m890
+    assets:
+      model: deepseek-v4.1-flash-mxfp4
+      tokenizer: deepseek-v4.1-flash-mxfp4
+    hf_model_id: T-HEAD/DeepSeek-V4.1-Flash-1017-MXFP4-FP8-Engram-MXFP8
+    golden_model_key: deepseek_v4_1_flash_mxfp4
+    served_name: deepseek-v4.1-flash-mxfp4
     extra_args: []
+    extra_env: {}
+  w8a8_int8:
+    precision: w8a8_int8
+    hardware: zhenwu_810e
+    topology:
+      kind: single_node
+      nodes: 1
+      devices_per_node: 8
+    assets:
+      model: deepseek-v4.1-flash-w8a8-int8
+      tokenizer: deepseek-v4.1-flash-w8a8-int8
+    hf_model_id: T-HEAD/DeepSeek-V4.1-Flash-1017-W8A8-INT8
+    golden_model_key: deepseek_v4_1_flash_w8a8_int8
+    served_name: deepseek-v4.1-flash-w8a8-int8
+    extra_args:
+      - --kv-cache-dtype
+      - fp8
     extra_env: {}
 hardware_overrides:
   zhenwu_m890:
     extra_args: []
     extra_env: {}
 presets:
+  prefill:
+    select:
+      features:
+        spec_decoding: false
+    args: []
+  decode:
+    remove_args:
+      - --tensor-parallel-size
+    select:
+      features:
+        spec_decoding: true
+    args:
+      - --data-parallel-size
+      - "8"
+      - --enable-expert-parallel
+      - --all2all-backend
+      - deepep_low_latency
+      - --engram-config
+      - '{"cpu_offload":true,"dp_shared_memory":false}'
+      - --max-num-batched-tokens
+      - "1024"
+      - --max-num-seqs
+      - "128"
+      - --compilation-config
+      - '{"cudagraph_mode":"FULL_DECODE_ONLY","max_cudagraph_capture_size":768}'
+  decode_ep:
+    hardware: zhenwu_m890
+    topology:
+      kind: multi_node_ep
+      nodes: 2
+      devices_per_node: 8
+    remove_args:
+      - --tensor-parallel-size
+    select:
+      features:
+        spec_decoding: true
+    args:
+      - --data-parallel-size
+      - "16"
+      - --enable-expert-parallel
+      - --all2all-backend
+      - deepep_low_latency
+      - --engram-config
+      - '{"cpu_offload":true,"dp_shared_memory":false}'
+      - --max-model-len
+      - auto
+      - --nnodes
+      - "2"
+      - --node-rank
+      - "{node_rank}"
+      - --master-addr
+      - "{master_addr}"
   prefill_long:
     hardware: zhenwu_m890
     args: []
@@ -68,5 +151,6 @@ presets:
 notes: >-
   Default serving configuration aligns with the P0 single-node 8-card Zhenwu M890
   performance baseline (TP8, block size 128, Engram CPU offload, and DeepSeek
-  V4.1 tokenizer/reasoning/tool-call parsers). Prefix caching is controlled by
-  the test policy.
+  V4.1 tokenizer/reasoning/tool-call parsers). Static catalog entries cover
+  single-node prefill/decode slots, 2-node DP16+EP decode_ep, and the Zhenwu
+  810E w8a8_int8 variant. Prefix caching is controlled by the test policy.

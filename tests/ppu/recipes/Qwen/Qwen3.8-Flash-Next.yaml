@@ -59,13 +59,98 @@ features:
 variants:
   default:
     precision: mxfp4
+    hardware: zhenwu_m890
+    assets:
+      model: qwen3.8-flash-next-mxfp4
+      tokenizer: qwen3.8-flash-next-mxfp4
+    hf_model_id: T-HEAD/Qwen3.8-Flash-Next-MoE-Quant-W-MXFP4-A-MXFP4-Dense-Quant-W-FP8-PerChannel-A-FP8-PerToken
+    golden_model_key: qwen3.8-flash-next
+    served_name: Qwen3.8-Flash-Next
     extra_args: []
+    extra_env: {}
+  bf16:
+    precision: bf16
+    hardware: zhenwu_m890
+    topology:
+      kind: single_node
+      nodes: 1
+      devices_per_node: 4
+    assets:
+      model: qwen3.8-flash-next-bf16
+      tokenizer: qwen3.8-flash-next-bf16
+    hf_model_id: Qwen/Qwen3.8-Flash-Next
+    allow_shared_fields:
+      - hf_model_id
+    golden_model_key: qwen3.8-flash-next-bf16
+    served_name: qwen3.8-flash-next-bf16
+    extra_args: []
+    extra_env: {}
+  fp8:
+    precision: fp8
+    hardware: zhenwu_m890
+    topology:
+      kind: single_node
+      nodes: 1
+      devices_per_node: 4
+    assets:
+      model: qwen3.8-flash-next-fp8
+      tokenizer: qwen3.8-flash-next-fp8
+    hf_model_id: T-HEAD/Qwen3.8-Flash-Next-Quant-W-FP8-PerChannel-A-FP8-PerToken
+    golden_model_key: qwen3.8-flash-next-fp8
+    served_name: qwen3.8-flash-next-fp8
+    extra_args: []
+    extra_env: {}
+  w8a8_int8:
+    precision: w8a8_int8
+    hardware: zhenwu_810e
+    topology:
+      kind: single_node
+      nodes: 1
+      devices_per_node: 8
+    assets:
+      model: qwen3.8-flash-next-w8a8-int8
+      tokenizer: qwen3.8-flash-next-w8a8-int8
+    hf_model_id: T-HEAD/Qwen3.8-Flash-Next-W8A8-INT8
+    golden_model_key: qwen3.8-flash-next-w8a8-int8
+    served_name: qwen3.8-flash-next-w8a8-int8
+    extra_args:
+      - --tensor-parallel-size
+      - "8"
+    extra_env: {}
+  bf16_810e:
+    precision: bf16
+    hardware: zhenwu_810e
+    topology:
+      kind: single_node
+      nodes: 1
+      devices_per_node: 8
+    assets:
+      model: qwen3.8-flash-next-bf16-810e
+      tokenizer: qwen3.8-flash-next-bf16-810e
+    hf_model_id: Qwen/Qwen3.8-Flash-Next
+    allow_shared_fields:
+      - hf_model_id
+    golden_model_key: qwen3.8-flash-next-bf16-810e
+    served_name: qwen3.8-flash-next-bf16-810e
+    extra_args:
+      - --tensor-parallel-size
+      - "8"
     extra_env: {}
 hardware_overrides:
   zhenwu_m890:
     extra_args: []
     extra_env: {}
 presets:
+  prefill:
+    select:
+      features:
+        spec_decoding: false
+    args: []
+  decode:
+    select:
+      features:
+        spec_decoding: true
+    args: []
   dp_ep_low_latency:
     hardware: zhenwu_m890
     topology:
@@ -93,6 +178,8 @@ notes: >-
   Default baseline matches the qwen3.8-flash-next-tp4 catalog entry (TP4 on 4
   Zhenwu M890 cards with qwen3_xml tool-call and qwen3 reasoning parsers, MTP
   speculative decoding with 3 draft tokens, and the ppu-deep-gemm MoE
-  backend). Prefix caching is injected by the executor from the test policy.
-  Preset dp_ep_low_latency matches qwen3.8-flash-next-dp-ep on 8 Zhenwu M890
-  cards with DP8 and expert parallelism.
+  backend). Static catalog entries add M890 BF16/FP8, Zhenwu 810E W8A8
+  INT8/BF16 (TP8), and prefill/decode slots. Prefix caching is injected by the
+  executor from the test policy. Preset dp_ep_low_latency matches
+  qwen3.8-flash-next-dp-ep on 8 Zhenwu M890 cards with DP8 and expert
+  parallelism.

@@ -1,0 +1,205 @@
+schema_version: ppu-serving/v1
+ppu:
+  framework: vllm
+  visibility: public
+  upstream_schema: vllm-project/recipes@b08ad738
+  assets:
+    model: qwen3.8-2.4t-a95b-mxfp4
+    tokenizer: qwen3.8-2.4t-a95b-mxfp4
+  hf_model_id: T-HEAD/Qwen3.8-2.4T-A95B-MXFP4-FP8
+  golden_model_key: qwen3_8_2_4t_a95b_mxfp4
+  served_name: qwen3.8-2.4t-a95b-mxfp4
+  topology:
+    kind: multi_node_ep
+    nodes: 4
+    devices_per_node: 8
+  default_features:
+    - tool_calling
+    - reasoning
+  external_env:
+    - HGGC_EMBEDDED_COPY_THRESHOLD
+model:
+  model_id: Qwen/Qwen3.8-2.4T-A95B
+  base_args:
+    - --trust-remote-code
+    - --tensor-parallel-size
+    - "2"
+    - --data-parallel-size
+    - "16"
+    - --data-parallel-size-local
+    - "4"
+    - --enable-expert-parallel
+    - --all2all-backend
+    - deepep_low_latency
+    - --moe-backend
+    - ppu_deep_gemm
+    - --mm-encoder-tp-mode
+    - data
+    - --language-model-only
+    - --no-async-scheduling
+    - --gpu-memory-utilization
+    - "0.95"
+    - --max-model-len
+    - auto
+    - --max-num-seqs
+    - "20"
+    - --compilation-config
+    - '{"cudagraph_mode": "FULL_DECODE_ONLY", "max_cudagraph_capture_size": 20}'
+    - --distributed-timeout-seconds
+    - "3600"
+    - --cpu-distributed-timeout-seconds
+    - "60000"
+    - --nnodes
+    - "4"
+    - --node-rank
+    - "{node_rank}"
+    - --master-addr
+    - "{master_addr}"
+  base_env:
+    HGGC_EMBEDDED_COPY_THRESHOLD: "0x10000"
+    VLLM_ENGINE_READY_TIMEOUT_S: "60000"
+    VLLM_PROCESS_GROUP_TIMEOUT_M: "60"
+    VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: "0"
+features:
+  tool_calling:
+    args:
+      - --enable-auto-tool-choice
+      - --tool-call-parser
+      - qwen3_coder
+  reasoning:
+    args:
+      - --reasoning-parser
+      - qwen3
+  spec_decoding:
+    default_mode: mtp
+    modes:
+      mtp:
+        args:
+          - --speculative-config
+          - '{"method": "mtp", "num_speculative_tokens": 3}'
+variants:
+  default:
+    precision: mxfp4
+    hardware: zhenwu_m890
+    topology:
+      kind: multi_node_ep
+      nodes: 4
+      devices_per_node: 8
+    assets:
+      model: qwen3.8-2.4t-a95b-mxfp4
+      tokenizer: qwen3.8-2.4t-a95b-mxfp4
+    hf_model_id: T-HEAD/Qwen3.8-2.4T-A95B-MXFP4-FP8
+    golden_model_key: qwen3_8_2_4t_a95b_mxfp4
+    served_name: qwen3.8-2.4t-a95b-mxfp4
+    extra_args: []
+    extra_env:
+      NCCL_MNNVL_ENABLE: "1"
+      VLLM_DEEPEP_LOW_LATENCY_USE_MNNVL: "1"
+  fp8:
+    precision: fp8
+    hardware: zhenwu_m890
+    topology:
+      kind: multi_node_ep
+      nodes: 4
+      devices_per_node: 8
+    assets:
+      model: qwen3.8-2.4t-a95b-fp8
+      tokenizer: qwen3.8-2.4t-a95b-fp8
+    hf_model_id: T-HEAD/Qwen3.8-2.4T-A95B-FP8
+    golden_model_key: qwen3_8_2_4t_a95b_fp8
+    served_name: qwen3.8-2.4t-a95b-fp8
+    extra_args: []
+    extra_env: {}
+  w8a8_int8:
+    precision: w8a8_int8
+    hardware: zhenwu_810e
+    topology:
+      kind: multi_node_ep
+      nodes: 4
+      devices_per_node: 16
+    assets:
+      model: qwen3.8-2.4t-a95b-w8a8-int8
+      tokenizer: qwen3.8-2.4t-a95b-w8a8-int8
+    hf_model_id: T-HEAD/Qwen3.8-2.4T-A95B-W8A8-INT8
+    golden_model_key: qwen3_8_2_4t_a95b_w8a8_int8
+    served_name: qwen3.8-2.4t-a95b-w8a8-int8
+    extra_args:
+      - --data-parallel-size
+      - "32"
+      - --data-parallel-size-local
+      - "8"
+    extra_env:
+      VLLM_PPU_DENSE_BACKEND: triton
+      VLLM_MOE_SKIP_PADDING: "0"
+      VLLM_ENGINE_READY_TIMEOUT_S: "7200"
+hardware_overrides:
+  zhenwu_m890:
+    extra_args: []
+    extra_env: {}
+presets:
+  decode_ep:
+    hardware: zhenwu_m890
+    topology:
+      kind: multi_node_ep
+      nodes: 4
+      devices_per_node: 8
+    select:
+      features:
+        spec_decoding: true
+    args: []
+  pd_prefill:
+    hardware: zhenwu_m890
+    topology:
+      kind: pd_disagg
+      nodes: 2
+      devices_per_node: 8
+      role: prefill
+    remove_args:
+      - --data-parallel-size
+      - --data-parallel-size-local
+      - --enable-expert-parallel
+      - --all2all-backend
+      - --compilation-config
+    select:
+      features:
+        spec_decoding: false
+    args:
+      - --tensor-parallel-size
+      - "8"
+      - --pipeline-parallel-size
+      - "2"
+      - --nnodes
+      - "2"
+      - --node-rank
+      - "{node_rank}"
+      - --master-addr
+      - "{master_addr}"
+      - --kv-transfer-config
+      - '{"kv_connector":"MooncakeConnector","kv_role":"kv_producer","kv_connector_extra_config":{"mooncake_protocol":"rdma","device_name":"{ib_devices}"}}'
+    env:
+      MC_NUM_QP_PER_EP: "4"
+      MOONCAKE_PROTOCOL: rdma
+      VLLM_HOST_IP: "{kv_ip}"
+      VLLM_MOONCAKE_BOOTSTRAP_PORT: "{kv_port}"
+  pd_decode:
+    hardware: zhenwu_m890
+    topology:
+      kind: pd_disagg
+      nodes: 4
+      devices_per_node: 8
+      role: decode
+    select:
+      features:
+        spec_decoding: true
+    args:
+      - --kv-transfer-config
+      - '{"kv_connector":"MooncakeConnector","kv_role":"kv_consumer","kv_connector_extra_config":{"mooncake_protocol":"rdma","device_name":"{ib_devices}"}}'
+    env:
+      MC_NUM_QP_PER_EP: "4"
+      MOONCAKE_PROTOCOL: rdma
+      VLLM_HOST_IP: "{kv_ip}"
+notes: >-
+  Static catalog recipe for Qwen/Qwen3.8-2.4T-A95B covering 4-node multi-node
+  EP layouts on Zhenwu M890 (4x8 MXFP4/FP8, DP16+TP2+EP) and Zhenwu 810E (4x16
+  W8A8 INT8, DP32+TP2+EP), plus paired multi-node Mooncake pd_prefill/pd_decode
+  disaggregation presets.

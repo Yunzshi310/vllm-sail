@@ -23,3 +23,19 @@ model:
 variants:
   default:
     precision: bf16
+hardware_overrides:
+  zhenwu_810e:
+    extra_args:
+      - --tensor-parallel-size
+      - "1"
+      - --gpu-memory-utilization
+      - "0.95"
+      - --max-num-seqs
+      - "512"
+      - --compilation-config
+      - '{"cudagraph_mode": "PIECEWISE"}'
+    extra_env: {}
+notes: >-
+  Portable BF16 serving recipe across Zhenwu M890 (TP2 fast_sanity baseline)
+  and Zhenwu 810E (TP1, max_num_seqs=512, PIECEWISE CUDA graph via
+  hardware_overrides.zhenwu_810e).

@@ -1,0 +1,124 @@
+schema_version: ppu-serving/v1
+ppu:
+  framework: vllm
+  visibility: public
+  upstream_schema: vllm-project/recipes@b08ad738
+  assets:
+    model: qwen3.5-397b-a17b-mxfp4
+    tokenizer: qwen3.5-397b-a17b-mxfp4
+  hf_model_id: T-HEAD/Qwen3.5-397B-A17B-MXFP4-FP8
+  golden_model_key: qwen3_5_397b_a17b_mxfp4
+  served_name: qwen3.5-397b-a17b-mxfp4
+  topology:
+    kind: single_node
+    nodes: 1
+    devices_per_node: 8
+  default_features:
+    - tool_calling
+    - reasoning
+  external_env:
+    - HGGC_EMBEDDED_COPY_THRESHOLD
+model:
+  model_id: Qwen/Qwen3.5-397B-A17B
+  base_args:
+    - --trust-remote-code
+    - --tensor-parallel-size
+    - "8"
+    - --gpu-memory-utilization
+    - "0.9"
+    - --max-model-len
+    - "16384"
+    - --distributed-timeout-seconds
+    - "3600"
+    - --cpu-distributed-timeout-seconds
+    - "3600"
+  base_env: {}
+features:
+  tool_calling:
+    args:
+      - --enable-auto-tool-choice
+      - --tool-call-parser
+      - qwen3_coder
+  reasoning:
+    args:
+      - --reasoning-parser
+      - qwen3
+  spec_decoding:
+    default_mode: mtp
+    modes:
+      mtp:
+        args:
+          - --speculative-config
+          - '{"method": "mtp", "num_speculative_tokens": 2}'
+variants:
+  default:
+    precision: mxfp4
+    hardware: zhenwu_m890
+    assets:
+      model: qwen3.5-397b-a17b-mxfp4
+      tokenizer: qwen3.5-397b-a17b-mxfp4
+    hf_model_id: T-HEAD/Qwen3.5-397B-A17B-MXFP4-FP8
+    golden_model_key: qwen3_5_397b_a17b_mxfp4
+    served_name: qwen3.5-397b-a17b-mxfp4
+    extra_args: []
+    extra_env: {}
+  fp8:
+    precision: fp8
+    hardware: zhenwu_m890
+    assets:
+      model: qwen3.5-397b-a17b-fp8
+      tokenizer: qwen3.5-397b-a17b-fp8
+    hf_model_id: T-HEAD/Qwen3.5-397B-A17B-Quant-W-FP8-PerChannel-A-FP8-PerToken
+    golden_model_key: qwen3_5_397b_a17b_fp8
+    served_name: qwen3.5-397b-a17b-fp8
+    extra_args: []
+    extra_env: {}
+  w8a8_int8:
+    precision: w8a8_int8
+    hardware: zhenwu_810e
+    assets:
+      model: qwen3.5-397b-a17b-w8a8-int8
+      tokenizer: qwen3.5-397b-a17b-w8a8-int8
+    hf_model_id: T-HEAD/Qwen3.5-397B-A17B-W8A8-INT8
+    golden_model_key: qwen3_5_397b_a17b_w8a8_int8
+    served_name: qwen3.5-397b-a17b-w8a8-int8
+    extra_args: []
+    extra_env: {}
+hardware_overrides:
+  zhenwu_m890:
+    extra_args: []
+    extra_env: {}
+presets:
+  prefill:
+    select:
+      features:
+        spec_decoding: false
+    args: []
+  decode:
+    select:
+      features:
+        spec_decoding: true
+    args: []
+  dp_ep_low_latency:
+    hardware: zhenwu_m890
+    remove_args:
+      - --tensor-parallel-size
+    select:
+      features:
+        spec_decoding: true
+    args:
+      - --data-parallel-size
+      - "8"
+      - --enable-expert-parallel
+      - --all2all-backend
+      - deepep_low_latency
+      - --max-model-len
+      - auto
+    env:
+      HGGC_EMBEDDED_COPY_THRESHOLD: "0x10000"
+      VLLM_ENGINE_READY_TIMEOUT_S: "60000"
+      VLLM_PROCESS_GROUP_TIMEOUT_M: "60"
+notes: >-
+  Static catalog recipe for Qwen/Qwen3.5-397B-A17B covering Zhenwu M890 MXFP4
+  and FP8 alongside Zhenwu 810E W8A8 INT8, with prefill (TP8 without MTP),
+  decode (TP8 with MTP), and single-node DP8+EP dp_ep_low_latency presets.
