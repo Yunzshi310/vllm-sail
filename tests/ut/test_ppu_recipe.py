@@ -584,7 +584,7 @@ def test_model_sanity_policy_selects_eight_card_dp_ep_preset() -> None:
         else:
             assert effective[key] == value
     fast_matrix = ppu_e2e_select.build_recipe_matrix("", "fast_sanity")
-    assert slug not in {item["key"] for item in fast_matrix["include"]}
+    assert slug in {item["key"] for item in fast_matrix["include"]}
 
 
 def test_resolve_and_validate_variant_overrides_and_policy_variant(
@@ -1921,7 +1921,7 @@ def test_checked_in_recipe_matrix_doc_is_up_to_date() -> None:
         "## Registered Serving Presets (Benchmark & Disagg Catalog)", 1
     )[1].split("## Nightly CI — Remaining Legacy Accuracy Cases", 1)[0]
     assert "`glm-5.3-decode`" in fast_section
-    assert "`glm-5.3-decode`" not in nightly_section
+    assert "`glm-5.3-decode`" in nightly_section
     for token in (
         "`fp8` (`fp8`)",
         "`decode_ep`",
@@ -2941,7 +2941,7 @@ def test_qwen38_flash_next_tp4_and_dp_ep_match_legacy_contracts() -> None:
     fast_matrix = ppu_e2e_select.build_recipe_matrix("", "fast_sanity")["include"]
     fast_keys = {item["key"] for item in fast_matrix}
     assert "qwen3.8-flash-next" in fast_keys
-    assert "qwen3.8-flash-next-dp8-ep" not in fast_keys
+    assert "qwen3.8-flash-next-dp8-ep" in fast_keys
 
 
 def test_hardware_precision_binding_contract(tmp_path: Path) -> None:
@@ -3275,7 +3275,9 @@ def test_single_node_selector_skips_multinode_pd_and_810e_policies(
     nightly_checked = ppu_e2e_select.build_recipe_matrix("", "model_sanity")["include"]
     nightly_by_key = {item["key"]: item for item in nightly_checked}
     assert nightly_by_key["glm-5.3"]["preset"] == "prefill"
-    assert "glm-5.3-decode" not in nightly_by_key
+    assert "glm-5.3-decode" in nightly_by_key
+    assert nightly_by_key["glm-5.3-decode"]["ppu_count"] == 8
+    assert nightly_by_key["glm-5.3-decode"]["preset"] == "decode"
 
     # Synthetic multi-node, PD disagg, and 810E policies in an isolated tree
     shutil.copytree(ROOT / "tests/ppu", tmp_path / "tests/ppu")
@@ -3299,6 +3301,8 @@ def test_single_node_selector_skips_multinode_pd_and_810e_policies(
     )
     policy_dir = tmp_path / "tests/ppu/policy/models"
     base_fs = yaml.safe_load((policy_dir / "glm-5.3-decode.yaml").read_text())
+    base_fs["tiers"].pop("model_sanity", None)
+    base_fs.pop("accuracy_gate", None)
 
     ep_pol = copy.deepcopy(base_fs)
     ep_pol["tiers"]["fast_sanity"]["preset"] = "decode_ep"
@@ -4759,6 +4763,8 @@ def test_pr462_p1_selector_and_runner_require_http_frontend_mode(
     policy_rel = Path("tests/ppu/policy/models/glm-5.3-decode.yaml")
     orig_recipe = yaml.safe_load((ROOT / recipe_rel).read_text(encoding="utf-8"))
     orig_policy = yaml.safe_load((ROOT / policy_rel).read_text(encoding="utf-8"))
+    orig_policy["tiers"].pop("model_sanity", None)
+    orig_policy.pop("accuracy_gate", None)
 
     rec_path = tmp_path / recipe_rel
     pol_path = tmp_path / policy_rel
@@ -8101,3 +8107,36 @@ def test_pr462_r4_uuid_visible_devices_cross_child_and_worker_visibility(
                     ]
                 )
         assert popen_calls == 0
+
+
+def test_all_model_sanity_policies_match_committed_890p_goldens() -> None:
+    from tests.e2e.models import _accuracy_gate as accuracy_gate
+
+    matrix = ppu_e2e_select.build_recipe_matrix("", "model_sanity")["include"]
+    assert len(matrix) >= 21
+    for item in matrix:
+        policy_path = ROOT / item["policy_path"]
+        recipe_path = ROOT / item["recipe_path"]
+        pol_doc = yaml.safe_load(policy_path.read_text(encoding="utf-8"))
+        resolved = ppu_recipe.resolve_recipe(
+            recipe_path, policy_path=policy_path, tier="model_sanity"
+        )
+        stages = {st["kind"]: st for st in pol_doc["tiers"]["model_sanity"]["stages"]}
+        golden_file = (
+            ROOT
+            / "tests"
+            / "e2e"
+            / "models"
+            / "_golden"
+            / accuracy_gate.golden_filename(resolved["golden_model_key"], "890p")
+        )
+        assert golden_file.is_file(), (
+            f"Missing 890p golden for {item['key']}: {golden_file}"
+        )
+        golden = accuracy_gate.read_golden(golden_file)
+        assert accuracy_gate.check_golden_identity(
+            golden, chip="890p", checkpoint_tail=resolved["hf_model_id"]
+        ) == (True, None)
+        assert accuracy_gate.check_generation_config(
+            golden, stages["evalscope"]["generation"]
+        ) == (True, None)
