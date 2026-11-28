@@ -32,6 +32,8 @@ model:
     - auto
     - --max-num-seqs
     - "256"
+    - --moe-backend
+    - ppu_deep_gemm_w4a8
     - --distributed-timeout-seconds
     - "3600"
     - --cpu-distributed-timeout-seconds
@@ -39,7 +41,11 @@ model:
   base_env:
     DG_USE_MOE_DYNAMIC_TILE: "1"
     HGGC_EMBEDDED_COPY_THRESHOLD: "0x10000"
+    VLLM_ENGINE_READY_TIMEOUT_S: "3600"
     VLLM_PROCESS_GROUP_TIMEOUT_M: "60"
+    VLLM_SAIL_DEEPGEMM_MOE_FUSED_ACT_QUANT: "1"
+    VLLM_SAIL_DEEPGEMM_MOE_TP_FUSED: "1"
+    VLLM_SAIL_DENSE_BF16_DEEPGEMM: "1"
 features:
   tool_calling:
     args:
@@ -60,34 +66,8 @@ variants:
     hf_model_id: T-HEAD/Kimi-K3.1-MXFP4-FP8
     golden_model_key: kimi_k3_1_mxfp4
     served_name: kimi-k3.1-mxfp4
-    extra_args:
-      - --moe-backend
-      - ppu_deep_gemm_w4a8
-    extra_env:
-      VLLM_ENGINE_READY_TIMEOUT_S: "3600"
-      VLLM_SAIL_DEEPGEMM_MOE_FUSED_ACT_QUANT: "1"
-      VLLM_SAIL_DEEPGEMM_MOE_TP_FUSED: "1"
-      VLLM_SAIL_DENSE_BF16_DEEPGEMM: "1"
-  w4a16:
-    precision: w4a8_int8
-    hardware: zhenwu_810e
-    topology:
-      kind: single_node
-      nodes: 1
-      devices_per_node: 16
-    assets:
-      model: kimi-k3.1-w4a16
-      tokenizer: kimi-k3.1-w4a16
-    hf_model_id: T-HEAD/Kimi-K3.1-W4A16
-    golden_model_key: kimi_k3_1_w4a16
-    served_name: kimi-k3.1-w4a16
-    extra_args:
-      - --tensor-parallel-size
-      - "16"
-      - --moe-backend
-      - ppu_deep_gemm_w4a16
-    extra_env:
-      VLLM_ENGINE_READY_TIMEOUT_S: "60000"
+    extra_args: []
+    extra_env: {}
 hardware_overrides:
   zhenwu_m890:
     extra_args: []
@@ -95,7 +75,7 @@ hardware_overrides:
 presets:
   prefill:
     args: []
-  decode:
+  decode_ep:
     hardware: zhenwu_m890
     topology:
       kind: multi_node_ep
@@ -120,27 +100,9 @@ presets:
     env:
       VLLM_DEEPEPLL_RECV_HOOK: "0"
       VLLM_DEEPEP_LOW_LATENCY_USE_MNNVL: "1"
-  decode_ep:
-    hardware: zhenwu_810e
-    topology:
-      kind: multi_node_ep
-      nodes: 2
-      devices_per_node: 16
-    args:
-      - --data-parallel-size
-      - "2"
-      - --tensor-parallel-size
-      - "16"
-      - --enable-expert-parallel
-      - --nnodes
-      - "2"
-      - --node-rank
-      - "{node_rank}"
-      - --master-addr
-      - "{master_addr}"
 notes: >-
   Static catalog recipe for moonshotai/Kimi-K3.1 (aligned with Kimi-K3.1 and
-  Kimi-K3.1-Pro serving parameters) covering Zhenwu M890 MXFP4 (TP8 prefill
-  and 4-node DP4+TP8+EP decode) and Zhenwu 810E W4A16 (via ppu_deep_gemm_w4a16
-  under the w4a8_int8 4-bit schema category, TP16 prefill and 2-node DP2+TP16+EP
-  decode_ep) without disaggregated PD presets.
+  Kimi-K3.1-Pro serving parameters) covering Zhenwu M890 MXFP4 (single-node
+  TP8 prefill and 4-node DP4+TP8+EP decode_ep) without disaggregated PD
+  presets. Zhenwu 810E W4A16 is deferred pending w4a16 precision support in the
+  recipe schema.
