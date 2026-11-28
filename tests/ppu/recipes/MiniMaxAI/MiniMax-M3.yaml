@@ -48,6 +48,7 @@ features:
 variants:
   default:
     precision: fp8
+    hardware: zhenwu_m890
     assets:
       model: minimax-m3-fp8
       tokenizer: minimax-m3-fp8
@@ -58,6 +59,7 @@ variants:
     extra_env: {}
   mxfp4_fp8:
     precision: mxfp4
+    hardware: zhenwu_m890
     assets:
       model: minimax-m3-mxfp4-fp8
       tokenizer: minimax-m3-mxfp4-fp8
@@ -66,11 +68,86 @@ variants:
     served_name: minimax-m3-mxfp4-fp8
     extra_args: []
     extra_env: {}
+  bf16:
+    precision: bf16
+    hardware: zhenwu_m890
+    topology:
+      kind: single_node
+      nodes: 1
+      devices_per_node: 8
+    assets:
+      model: minimax-m3-bf16
+      tokenizer: minimax-m3-bf16
+    hf_model_id: MiniMaxAI/MiniMax-M3
+    allow_shared_fields:
+      - hf_model_id
+    golden_model_key: minimax-m3-bf16
+    served_name: minimax-m3-bf16
+    extra_args: []
+    extra_env:
+      VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: "0"
+  bf16_810e:
+    precision: bf16
+    hardware: zhenwu_810e
+    topology:
+      kind: single_node
+      nodes: 1
+      devices_per_node: 16
+    assets:
+      model: minimax-m3-bf16-810e
+      tokenizer: minimax-m3-bf16-810e
+    hf_model_id: MiniMaxAI/MiniMax-M3
+    allow_shared_fields:
+      - hf_model_id
+    golden_model_key: minimax-m3-bf16-810e
+    served_name: minimax-m3-bf16-810e
+    extra_args:
+      - --tensor-parallel-size
+      - "16"
+    extra_env: {}
+  w8a8_int8:
+    precision: w8a8_int8
+    hardware: zhenwu_810e
+    topology:
+      kind: single_node
+      nodes: 1
+      devices_per_node: 16
+    assets:
+      model: minimax-m3-w8a8-int8
+      tokenizer: minimax-m3-w8a8-int8
+    hf_model_id: T-HEAD/MiniMax-M3-W8A8-INT8
+    golden_model_key: minimax-m3-w8a8-int8
+    served_name: minimax-m3-w8a8-int8
+    extra_args:
+      - --tensor-parallel-size
+      - "16"
+      - --gpu-memory-utilization
+      - "0.95"
+    extra_env:
+      VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: "0"
 hardware_overrides:
   zhenwu_m890:
     extra_args: []
     extra_env: {}
 presets:
+  prefill:
+    args: []
+  decode:
+    hardware: zhenwu_m890
+    remove_args:
+      - --tensor-parallel-size
+    args:
+      - --data-parallel-size
+      - "8"
+      - --enable-expert-parallel
+      - --all2all-backend
+      - deepep_low_latency
+      - --max-model-len
+      - auto
+    env:
+      HGGC_EMBEDDED_COPY_THRESHOLD: "0x10000"
+      VLLM_ENGINE_READY_TIMEOUT_S: "60000"
+      VLLM_PROCESS_GROUP_TIMEOUT_M: "60"
   dp_ep_low_latency:
     hardware: zhenwu_m890
     remove_args:
@@ -96,6 +173,7 @@ presets:
 notes: >-
   Default serving configuration aligns with the P0 single-node 8-card Zhenwu M890
   performance baseline (TP8, FP8 KV cache, block size 128, and MiniMax M3
-  tool-call/reasoning parsers). Variants select the FP8 (default) or MXFP4-FP8
-  checkpoint; preset dp_ep_low_latency matches the P0 8-card DP+EP decode
-  layout. Prefix caching is controlled by the test policy.
+  tool-call/reasoning parsers). Variants cover M890 FP8 (default), MXFP4-FP8,
+  and BF16 alongside Zhenwu 810E BF16 and W8A8 INT8 (TP16); preset
+  dp_ep_low_latency matches the P0 8-card DP+EP decode layout. Prefix caching is
+  controlled by the test policy.
