@@ -92,7 +92,7 @@ hardware_overrides:
 presets:
   prefill:
     args: []
-  decode:
+  decode_ep:
     hardware: zhenwu_m890
     topology:
       kind: multi_node_ep
@@ -118,30 +118,7 @@ presets:
       VLLM_DEEPEPLL_RECV_HOOK: "0"
       VLLM_DEEPEP_LOW_LATENCY_USE_MNNVL: "1"
       VLLM_ENABLE_K3_LATENT_MOE_TAIL_FUSION: "0"
-  decode_ep:
-    hardware: zhenwu_810e
-    topology:
-      kind: multi_node_ep
-      nodes: 2
-      devices_per_node: 16
-    args:
-      - --data-parallel-size
-      - "2"
-      - --tensor-parallel-size
-      - "16"
-      - --enable-expert-parallel
-      - --all2all-backend
-      - deepep_low_latency
-      - --max-num-seqs
-      - "32"
-      - --nnodes
-      - "2"
-      - --node-rank
-      - "{node_rank}"
-      - --master-addr
-      - "{master_addr}"
 notes: >-
   Static catalog recipe for moonshotai/Kimi-K3 covering Zhenwu M890 MXFP4
-  (single-node TP8 prefill and 4-node DP4+TP8+EP decode) and Zhenwu 810E
-  W4A8 INT8 (TP16 prefill and 2-node DP2+TP16+EP decode_ep) without
-  disaggregated PD presets.
+  (single-node TP8 prefill and 4-node DP4+TP8+EP decode_ep) and Zhenwu 810E
+  W4A8 INT8 (TP16 prefill) without disaggregated PD presets.
